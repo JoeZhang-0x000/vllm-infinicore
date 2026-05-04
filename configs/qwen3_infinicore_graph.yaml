@@ -1,8 +1,8 @@
 # Conservative Qwen3 routing declaration for vllm-infinicore.
 #
-# This file documents the first operator scope. It is not consumed by the
-# skeleton plugin yet; future implementations should parse it with a structured
-# YAML parser and keep the defaults graph-safe.
+# This file documents the first operator scope. Tooling parses it with a
+# structured YAML loader and validates it against the in-code registry. The vLLM
+# plugin registration path does not load this file by default.
 
 plugin:
   name: vllm-infinicore
@@ -10,6 +10,9 @@ plugin:
   entry_point_name: vllm_infinicore
   mode: observe
   patch_enable_env: VLLM_INFINICORE_ENABLE_PATCHES
+  route_select_env: VLLM_INFINICORE_ROUTES
+  route_disable_env: VLLM_INFINICORE_DISABLED_ROUTES
+  force_native_fallback_env: VLLM_INFINICORE_FORCE_NATIVE_FALLBACK
 
 target:
   machine: MetaX C550
@@ -33,46 +36,64 @@ routes:
     implementation: torch_custom_op
     default_enabled: false
     graph_policy: requires_explicit_graph_safety_proof
+    native_fallback: vLLM RMSNorm forward_native
+    validation: unit_numeric_compare; qwen3_exact_token_smoke
   - name: SiluAndMul
     category: mlp
     implementation: torch_custom_op
     default_enabled: false
     graph_policy: requires_explicit_graph_safety_proof
+    native_fallback: vLLM native SiluAndMul activation
+    validation: qwen3_exact_token_smoke before any route enablement
   - name: RoPE
     category: attention
     implementation: torch_custom_op
     default_enabled: false
     graph_policy: requires_explicit_graph_safety_proof
+    native_fallback: vLLM native rotary embedding
+    validation: qwen3_exact_token_smoke and graph evidence
   - name: Embedding
     category: embedding
     implementation: torch_custom_op
     default_enabled: false
     graph_policy: avoid_from_blob_or_from_torch_inside_capture
+    native_fallback: vLLM native token embedding
+    validation: qwen3_exact_token_smoke and graph capture probe
   - name: MatMul
     category: linear
     implementation: torch_custom_op
     default_enabled: false
     graph_policy: requires_explicit_graph_safety_proof
+    native_fallback: vLLM native linear layers
+    validation: operator numeric compare and qwen3_exact_token_smoke
   - name: LMHead
     category: linear
     implementation: torch_custom_op
     default_enabled: false
     graph_policy: requires_explicit_graph_safety_proof
+    native_fallback: vLLM native LMHead/logits projection
+    validation: logits numeric compare and qwen3_exact_token_smoke
   - name: StoreKVCache
     category: kv-cache
     implementation: deferred_pa_kv
     default_enabled: false
     graph_policy: deferred_no_explicit_graph_path
+    native_fallback: vLLM native KV cache store path
+    validation: descriptor dump plus qwen3_exact_token_smoke
   - name: PagedAttentionPrefill
     category: paged-attention
     implementation: deferred_pa_kv
     default_enabled: false
     graph_policy: deferred_keep_native_vllm_cudagraph_baseline
+    native_fallback: vLLM native paged attention prefill backend
+    validation: attention output compare, descriptor dump, graph evidence
   - name: PagedAttentionDecode
     category: paged-attention
     implementation: deferred_pa_kv
     default_enabled: false
     graph_policy: deferred_keep_native_vllm_cudagraph_baseline
+    native_fallback: vLLM native paged attention decode backend
+    validation: decode health, descriptor dump, graph evidence
 
 benchmark_rules:
   prompt_ids: generate_once_and_reuse

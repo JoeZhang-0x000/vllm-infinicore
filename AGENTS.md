@@ -99,4 +99,16 @@ PY
 
 ## Notifications
 
-After task completion, benchmark completion, new findings, or resolved errors, send the configured Feishu task update webhook from the parent benchmark project instructions.
+Use the configured Feishu task update webhook from the parent benchmark project
+only for important conclusions or data.
+
+Send a notification for:
+
+- Formal benchmark completion with result data or artifact paths.
+- Important correctness, graph-safety, or performance conclusions.
+- Blocking failures that need human attention.
+- Resolution of a previously reported blocking failure.
+
+Do not send Feishu notifications for routine file edits, ordinary task
+completion, small refactors, dry imports, compile checks, intermediate progress,
+or non-blocking findings. Prefer a concise final chat update for those cases.
