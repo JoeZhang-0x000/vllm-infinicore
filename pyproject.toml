@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-infinicore"
+version = "0.1.0"
+description = "Conservative InfiniCore operator plugin skeleton for vLLM Qwen3 inference"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+vllm_infinicore = "vllm_infinicore:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vllm_infinicore"]
+include = [
+    "AGENTS.md",
+    "configs/*.yaml",
+    "docs/*.md",
+]

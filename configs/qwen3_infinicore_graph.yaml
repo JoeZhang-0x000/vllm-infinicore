@@ -1,0 +1,90 @@
+# Conservative Qwen3 routing declaration for vllm-infinicore.
+#
+# This file documents the first operator scope. It is not consumed by the
+# skeleton plugin yet; future implementations should parse it with a structured
+# YAML parser and keep the defaults graph-safe.
+
+plugin:
+  name: vllm-infinicore
+  entry_point_group: vllm.general_plugins
+  entry_point_name: vllm_infinicore
+  mode: observe
+  patch_enable_env: VLLM_INFINICORE_ENABLE_PATCHES
+
+target:
+  machine: MetaX C550
+  maca: 3.5.3
+  model_family: Qwen3
+  audit_model_path: /mnt/geogpt-doc-new/default/xb/qwen3-8B
+
+cuda_graph:
+  default_policy: conservative
+  vllm_compilation_config:
+    cudagraph_mode: PIECEWISE
+    cudagraph_capture_sizes: [1, 2, 4, 8]
+    cudagraph_num_of_warmups: 1
+    backend: eager
+  enforce_eager: false
+  avoid_vllm_compile_inductor_by_default: true
+
+routes:
+  - name: RMSNorm
+    category: normalization
+    implementation: torch_custom_op
+    default_enabled: false
+    graph_policy: requires_explicit_graph_safety_proof
+  - name: SiluAndMul
+    category: mlp
+    implementation: torch_custom_op
+    default_enabled: false
+    graph_policy: requires_explicit_graph_safety_proof
+  - name: RoPE
+    category: attention
+    implementation: torch_custom_op
+    default_enabled: false
+    graph_policy: requires_explicit_graph_safety_proof
+  - name: Embedding
+    category: embedding
+    implementation: torch_custom_op
+    default_enabled: false
+    graph_policy: avoid_from_blob_or_from_torch_inside_capture
+  - name: MatMul
+    category: linear
+    implementation: torch_custom_op
+    default_enabled: false
+    graph_policy: requires_explicit_graph_safety_proof
+  - name: LMHead
+    category: linear
+    implementation: torch_custom_op
+    default_enabled: false
+    graph_policy: requires_explicit_graph_safety_proof
+  - name: StoreKVCache
+    category: kv-cache
+    implementation: deferred_pa_kv
+    default_enabled: false
+    graph_policy: deferred_no_explicit_graph_path
+  - name: PagedAttentionPrefill
+    category: paged-attention
+    implementation: deferred_pa_kv
+    default_enabled: false
+    graph_policy: deferred_keep_native_vllm_cudagraph_baseline
+  - name: PagedAttentionDecode
+    category: paged-attention
+    implementation: deferred_pa_kv
+    default_enabled: false
+    graph_policy: deferred_keep_native_vllm_cudagraph_baseline
+
+benchmark_rules:
+  prompt_ids: generate_once_and_reuse
+  metric: output_only_tps
+  sampling:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 1
+    eos: disabled
+  vllm_tokens:
+    min_tokens_equals_max_tokens: true
+  validation:
+    require_output_token_count: true
+    require_decoded_preview_health: true
+    require_warmup_and_repeats: true
