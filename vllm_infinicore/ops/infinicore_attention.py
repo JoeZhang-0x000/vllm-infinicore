@@ -440,26 +440,18 @@ class InfiniCoreFlashAttentionImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Unsupported paths → fallback eagerly
+        # Unsupported paths → raise
         if attn_metadata.use_cascade:
-            return self._metax_fallback_forward(
-                layer, query, key, value, kv_cache, attn_metadata, output
-            )
+            raise RuntimeError("InfiniCore attention does not support cascade attention")
 
         if self.attn_type not in (AttentionType.DECODER,):
-            return self._metax_fallback_forward(
-                layer, query, key, value, kv_cache, attn_metadata, output
-            )
+            raise RuntimeError(f"InfiniCore does not support attention type {self.attn_type}")
 
         if output_scale is not None or output_block_scale is not None:
-            return self._metax_fallback_forward(
-                layer, query, key, value, kv_cache, attn_metadata, output
-            )
+            raise RuntimeError("InfiniCore does not support output scaling")
 
         if not infinicore_backend.real_backend_enabled(query):
-            return self._metax_fallback_forward(
-                layer, query, key, value, kv_cache, attn_metadata, output
-            )
+            raise RuntimeError("InfiniCore backend not available")
 
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_decodes = attn_metadata.num_decodes
@@ -499,29 +491,7 @@ class InfiniCoreFlashAttentionImpl(AttentionImpl):
             _INFINI_CALL_COUNT += 1
             return output
         except Exception as exc:
-            if infinicore_backend.strict_backend_enabled():
-                raise
-            global _FALLBACK_COUNT
-            _FALLBACK_COUNT += 1
-            logger.warning(
-                "InfiniCore attention kernel failed (fallback #%d): %s",
-                _FALLBACK_COUNT, exc,
-            )
-            return self._metax_fallback_forward(
-                layer, query, key, value, kv_cache, attn_metadata, output,
-                output_scale, output_block_scale,
-            )
-
-
-_INFINI_CALL_COUNT = 0
-_FALLBACK_COUNT = 0
-
-
-def reset_attention_counts() -> None:
-    global _INFINI_CALL_COUNT, _FALLBACK_COUNT
-    _INFINI_CALL_COUNT = 0
-    _FALLBACK_COUNT = 0
-
+            raise RuntimeError(f"InfiniCore attention kernel failed: {exc}") from exc
 
     def do_kv_cache_update(
         self,
@@ -532,88 +502,28 @@ def reset_attention_counts() -> None:
         kv_cache: torch.Tensor,
     ) -> None:
         if self.attn_type not in (AttentionType.DECODER,):
-            return
+            raise RuntimeError(f"InfiniCore KV cache update does not support attention type {self.attn_type}")
         if self.kv_sharing_target_layer_name is not None:
-            return
+            raise RuntimeError("InfiniCore KV cache update does not support KV sharing")
         if not isinstance(slot_mapping, torch.Tensor):
-            return
+            raise RuntimeError("InfiniCore KV cache update requires slot_mapping tensor")
         if not infinicore_backend.real_backend_enabled(key):
-            return
+            raise RuntimeError("InfiniCore backend not available for KV cache update")
         try:
             infinicore_backend.store_kv_cache(
                 kv_cache, key, value, slot_mapping
             )
         except Exception:
-            if infinicore_backend.strict_backend_enabled():
-                raise
-
-    def _metax_fallback_forward(
-        self,
-        layer: torch.nn.Module,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: InfiniCoreFlashAttentionMetadata,
-        output: torch.Tensor,
-        output_scale: torch.Tensor | None = None,
-        output_block_scale: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        from vllm_metax.v1.attention.backends.fa_utils import (
-            flash_attn_varlen_func,
-            flash_attn_with_kvcache,
-        )
-        from vllm.v1.attention.backends.utils import (
-            reshape_attn_output_for_spec_decode,
-            reshape_query_for_spec_decode,
-        )
-
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        key_cache, value_cache = kv_cache.unbind(0)
-
-        if attn_metadata.num_prefills > 0:
-            q = query[attn_metadata.num_decode_tokens:num_actual_tokens]
-            output[attn_metadata.num_decode_tokens:num_actual_tokens] = (
-                flash_attn_varlen_func(
-                    q=q,
-                    k=key_cache,
-                    v=value_cache,
-                    cu_seqlens_q=attn_metadata.prefill_query_start_loc,
-                    cu_seqlens_k=attn_metadata.cu_prefix_kv_lens,
-                    max_seqlen_q=attn_metadata.max_query_len,
-                    max_seqlen_k=attn_metadata.prefill_max_seq_len,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=self.sliding_window,
-                    block_table=attn_metadata.prefill_block_table,
-                    softcap=self.logits_soft_cap,
-                )
-            )
-
-        if attn_metadata.num_decodes > 0:
-            decode_query = reshape_query_for_spec_decode(
-                query[:attn_metadata.num_decode_tokens],
-                attn_metadata.num_decodes,
-            )
-            output_unreshaped = flash_attn_with_kvcache(
-                q=decode_query,
-                k_cache=key_cache,
-                v_cache=value_cache,
-                block_table=attn_metadata.decode_block_table,
-                cache_seqlens=attn_metadata.decode_seq_lens,
-                softmax_scale=self.scale,
-                causal=True,
-                window_size=self.sliding_window,
-                alibi_slopes=self.alibi_slopes,
-                softcap=self.logits_soft_cap,
-            )
-            output[:attn_metadata.num_decode_tokens] = (
-                reshape_attn_output_for_spec_decode(output_unreshaped)
-            )
-
-        return output
+            raise RuntimeError("InfiniCore KV cache store failed")
 
 
-def attention_counts() -> tuple[int, int]:
-    return (_INFINI_CALL_COUNT, _FALLBACK_COUNT)
+_INFINI_CALL_COUNT = 0
+
+
+def reset_attention_counts() -> None:
+    global _INFINI_CALL_COUNT
+    _INFINI_CALL_COUNT = 0
+
+
+def attention_counts() -> tuple[int]:
+    return (_INFINI_CALL_COUNT,)

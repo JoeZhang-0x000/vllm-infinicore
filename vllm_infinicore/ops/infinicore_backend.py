@@ -2,48 +2,33 @@
 
 These helpers bridge torch tensors to the installed ``infinicore`` Python
 package, whose public functional APIs call the underlying ``_infinicore``
-extension. CPU tensors intentionally use PyTorch fallbacks because the local
-InfiniCore build is device-oriented and can crash on CPU ``from_torch`` paths.
+extension. Every function either succeeds via InfiniCore or raises.
 """
 
 from __future__ import annotations
 
-from collections import OrderedDict
 import ctypes
 import logging
-import os
 from typing import Any, Callable
 
 import torch
-import torch.nn.functional as F
-
-REAL_BACKEND_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_REAL_BACKEND"
-STRICT_BACKEND_ENV = "VLLM_INFINICORE_STRICT_BACKEND"
 
 logger = logging.getLogger(__name__)
 _CALL_COUNTS: dict[str, int] = {}
 _PY_CAPSULE_GET_POINTER: Any | None = None
 _EXTERNAL_STREAMS: dict[int, torch.cuda.ExternalStream] = {}
-_INFINI_TENSOR_CACHE_MAX = 4096
-_INFINI_TENSOR_CACHE: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
 
 
 def rms_norm(input_tensor: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    return _route_or_fallback(
-        "rms_norm",
-        input_tensor,
-        lambda: _rms_norm_infinicore(input_tensor, weight, eps),
-        lambda: _rms_norm_torch(input_tensor, weight, eps),
-    )
+    result = _rms_norm_infinicore(input_tensor, weight, eps)
+    _record_call("rms_norm")
+    return result
 
 
 def silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
-    return _route_or_fallback(
-        "silu_and_mul",
-        input_tensor,
-        lambda: _silu_and_mul_infinicore(input_tensor),
-        lambda: _silu_and_mul_torch(input_tensor),
-    )
+    result = _silu_and_mul_infinicore(input_tensor)
+    _record_call("silu_and_mul")
+    return result
 
 
 def linear(
@@ -51,12 +36,9 @@ def linear(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return _route_or_fallback(
-        "linear",
-        input_tensor,
-        lambda: _linear_infinicore(input_tensor, weight, bias),
-        lambda: F.linear(input_tensor, weight, bias),
-    )
+    result = _linear_infinicore(input_tensor, weight, bias)
+    _record_call("linear")
+    return result
 
 
 def lm_head(
@@ -64,21 +46,15 @@ def lm_head(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return _route_or_fallback(
-        "lm_head",
-        input_tensor,
-        lambda: _linear_infinicore(input_tensor, weight, bias),
-        lambda: F.linear(input_tensor, weight, bias),
-    )
+    result = _linear_infinicore(input_tensor, weight, bias)
+    _record_call("lm_head")
+    return result
 
 
 def embedding(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return _route_or_fallback(
-        "embedding",
-        input_tensor,
-        lambda: _embedding_infinicore(input_tensor, weight),
-        lambda: F.embedding(input_tensor.long(), weight),
-    )
+    result = _embedding_infinicore(input_tensor, weight)
+    _record_call("embedding")
+    return result
 
 
 def rotary_embedding(
@@ -90,28 +66,17 @@ def rotary_embedding(
     cos_sin_cache: torch.Tensor,
     is_neox_style: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    return _route_or_fallback(
-        "rotary_embedding",
+    result = _rotary_embedding_infinicore(
+        positions,
         query,
-        lambda: _rotary_embedding_infinicore(
-            positions,
-            query,
-            key,
-            head_size,
-            rotary_dim,
-            cos_sin_cache,
-            is_neox_style,
-        ),
-        lambda: _rotary_embedding_torch(
-            positions,
-            query,
-            key,
-            head_size,
-            rotary_dim,
-            cos_sin_cache,
-            is_neox_style,
-        ),
+        key,
+        head_size,
+        rotary_dim,
+        cos_sin_cache,
+        is_neox_style,
     )
+    _record_call("rotary_embedding")
+    return result
 
 
 def store_kv_cache(
@@ -120,12 +85,8 @@ def store_kv_cache(
     value: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
-    _route_or_fallback(
-        "store_kv_cache",
-        key,
-        lambda: _store_kv_cache_infinicore(kv_cache, key, value, slot_mapping),
-        lambda: _store_kv_cache_torch(kv_cache, key, value, slot_mapping),
-    )
+    _store_kv_cache_infinicore(kv_cache, key, value, slot_mapping)
+    _record_call("store_kv_cache")
 
 
 def paged_attention_prefill(
@@ -137,22 +98,10 @@ def paged_attention_prefill(
     attn_metadata: Any,
     output: torch.Tensor,
 ) -> None:
-    _route_or_fallback(
-        "paged_attention_prefill",
-        query,
-        lambda: _paged_attention_prefill_infinicore(
-            attn_layer.impl, query, key, kv_cache, attn_metadata, output
-        ),
-        lambda: attn_layer.impl.forward(
-            attn_layer,
-            query,
-            key,
-            value,
-            kv_cache,
-            attn_metadata,
-            output=output,
-        ),
+    _paged_attention_prefill_infinicore(
+        attn_layer.impl, query, key, kv_cache, attn_metadata, output
     )
+    _record_call("paged_attention_prefill")
 
 
 def paged_attention_decode(
@@ -164,26 +113,18 @@ def paged_attention_decode(
     attn_metadata: Any,
     output: torch.Tensor,
 ) -> None:
-    _route_or_fallback(
-        "paged_attention_decode",
-        query,
-        lambda: _paged_attention_decode_infinicore(
-            attn_layer.impl, query, key, kv_cache, attn_metadata, output
-        ),
-        lambda: attn_layer.impl.forward(
-            attn_layer,
-            query,
-            key,
-            value,
-            kv_cache,
-            attn_metadata,
-            output=output,
-        ),
+    _paged_attention_decode_infinicore(
+        attn_layer.impl, query, key, kv_cache, attn_metadata, output
     )
+    _record_call("paged_attention_decode")
 
 
 def real_backend_enabled(reference_tensor: torch.Tensor) -> bool:
-    return _should_use_infinicore(reference_tensor)
+    return reference_tensor.is_cuda
+
+
+def strict_backend_enabled() -> bool:
+    return True
 
 
 def backend_call_counts() -> dict[str, int]:
@@ -195,7 +136,7 @@ def reset_backend_call_counts() -> None:
 
 
 def clear_tensor_wrapper_cache() -> None:
-    _INFINI_TENSOR_CACHE.clear()
+    pass
 
 
 def paged_attention_prefill_infinicore_only(
@@ -206,8 +147,6 @@ def paged_attention_prefill_infinicore_only(
     attn_metadata: Any,
     output: torch.Tensor,
 ) -> None:
-    if not _should_use_infinicore(query):
-        raise RuntimeError("InfiniCore paged attention prefill backend is disabled")
     _paged_attention_prefill_infinicore(
         attn_impl,
         query,
@@ -227,8 +166,6 @@ def paged_attention_decode_infinicore_only(
     attn_metadata: Any,
     output: torch.Tensor,
 ) -> None:
-    if not _should_use_infinicore(query):
-        raise RuntimeError("InfiniCore paged attention decode backend is disabled")
     _paged_attention_decode_infinicore(
         attn_impl,
         query,
@@ -248,8 +185,6 @@ def paged_attention_decode_as_prefill_infinicore_only(
     attn_metadata: Any,
     output: torch.Tensor,
 ) -> None:
-    if not _should_use_infinicore(query):
-        raise RuntimeError("InfiniCore paged attention prefill backend is disabled")
     _paged_attention_decode_as_prefill_infinicore(
         attn_impl,
         query,
@@ -261,40 +196,8 @@ def paged_attention_decode_as_prefill_infinicore_only(
     _record_call("paged_attention_prefill")
 
 
-def _route_or_fallback(
-    op_name: str,
-    reference_tensor: torch.Tensor,
-    call_infinicore: Callable[[], Any],
-    call_torch: Callable[[], Any],
-) -> Any:
-    if not _should_use_infinicore(reference_tensor):
-        return call_torch()
-
-    try:
-        result = call_infinicore()
-        _record_call(op_name)
-        return result
-    except Exception as exc:
-        if strict_backend_enabled():
-            raise RuntimeError(f"InfiniCore {op_name} failed") from exc
-        logger.warning(
-            "InfiniCore %s failed; falling back to PyTorch/vLLM native path: %s",
-            op_name,
-            exc,
-        )
-        return call_torch()
-
-
 def _record_call(op_name: str) -> None:
     _CALL_COUNTS[op_name] = _CALL_COUNTS.get(op_name, 0) + 1
-
-
-def _should_use_infinicore(tensor: torch.Tensor) -> bool:
-    return tensor.is_cuda and not _env_truthy(REAL_BACKEND_DISABLE_ENV)
-
-
-def strict_backend_enabled() -> bool:
-    return _env_truthy(STRICT_BACKEND_ENV)
 
 
 def _as_infini(tensor: torch.Tensor) -> Any:
@@ -303,12 +206,6 @@ def _as_infini(tensor: torch.Tensor) -> Any:
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
     return infinicore.from_torch(tensor)
-
-
-def _as_infini_cached(tensor: torch.Tensor) -> Any:
-    if not tensor.is_contiguous():
-        return _as_infini(tensor)
-    return _cached_infini_tensor(("contiguous",) + _tensor_cache_key(tensor), tensor)
 
 
 def _as_infini_strided(tensor: torch.Tensor) -> Any:
@@ -322,37 +219,6 @@ def _as_infini_strided(tensor: torch.Tensor) -> Any:
         list(tensor.stride()),
         dtype=to_infinicore_dtype(tensor.dtype),
         device=infinicore.device(tensor.device.type, device_index),
-    )
-
-
-def _as_infini_strided_cached(tensor: torch.Tensor) -> Any:
-    return _cached_infini_tensor(("strided",) + _tensor_cache_key(tensor), tensor)
-
-
-def _cached_infini_tensor(cache_key: tuple[Any, ...], tensor: torch.Tensor) -> Any:
-    cached = _INFINI_TENSOR_CACHE.get(cache_key)
-    if cached is not None:
-        _INFINI_TENSOR_CACHE.move_to_end(cache_key)
-        return cached
-
-    wrapped = _as_infini_strided(tensor)
-    # Keep the torch tensor/view alive for wrappers created from raw data_ptr.
-    wrapped._torch_ref = tensor
-    _INFINI_TENSOR_CACHE[cache_key] = wrapped
-    if len(_INFINI_TENSOR_CACHE) > _INFINI_TENSOR_CACHE_MAX:
-        _INFINI_TENSOR_CACHE.popitem(last=False)
-    return wrapped
-
-
-def _tensor_cache_key(tensor: torch.Tensor) -> tuple[Any, ...]:
-    device_index = tensor.device.index if tensor.device.index is not None else 0
-    return (
-        tensor.data_ptr(),
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
-        str(tensor.dtype),
-        tensor.device.type,
-        device_index,
     )
 
 
@@ -441,17 +307,6 @@ def _rms_norm_infinicore(
     return out
 
 
-def _rms_norm_torch(
-    input_tensor: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    input_float = input_tensor.float()
-    variance = input_float.pow(2).mean(dim=-1, keepdim=True)
-    output = input_float * torch.rsqrt(variance + float(eps))
-    return output.to(dtype=input_tensor.dtype) * weight
-
-
 def _silu_and_mul_infinicore(input_tensor: torch.Tensor) -> torch.Tensor:
     import infinicore.nn.functional as IF
 
@@ -460,17 +315,11 @@ def _silu_and_mul_infinicore(input_tensor: torch.Tensor) -> torch.Tensor:
     out = torch.empty(output_shape, dtype=input_tensor.dtype, device=input_tensor.device)
     gate = input_tensor[..., :d].contiguous()
     up = input_tensor[..., d:].contiguous()
-    # InfiniCore swiglu(a, b) computes a * silu(b).
     _run_on_infinicore_stream(
         input_tensor,
         lambda: IF.swiglu(_as_infini(up), _as_infini(gate), out=_as_infini(out)),
     )
     return out
-
-
-def _silu_and_mul_torch(input_tensor: torch.Tensor) -> torch.Tensor:
-    d = input_tensor.shape[-1] // 2
-    return F.silu(input_tensor[..., :d]) * input_tensor[..., d:]
 
 
 def _linear_infinicore(
@@ -559,53 +408,15 @@ def _rotary_embedding_infinicore(
     return apply_one(query), apply_one(key) if key is not None else None
 
 
-def _rotary_embedding_torch(
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor | None,
-    head_size: int,
-    rotary_dim: int,
-    cos_sin_cache: torch.Tensor,
-    is_neox_style: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    positions = positions.flatten()
-    cos_sin = cos_sin_cache.index_select(0, positions)
-    cos, sin = cos_sin.chunk(2, dim=-1)
-
-    def apply_one(tensor: torch.Tensor) -> torch.Tensor:
-        original_shape = tensor.shape
-        view = tensor.view(positions.shape[0], -1, head_size)
-        rot = view[..., :rotary_dim]
-        passthrough = view[..., rotary_dim:]
-        cos_view = cos.unsqueeze(-2).to(rot.dtype)
-        sin_view = sin.unsqueeze(-2).to(rot.dtype)
-        if is_neox_style:
-            first, second = torch.chunk(rot, 2, dim=-1)
-            out_rot = torch.cat(
-                (first * cos_view - second * sin_view, second * cos_view + first * sin_view),
-                dim=-1,
-            )
-        else:
-            first = rot[..., ::2]
-            second = rot[..., 1::2]
-            out_rot = torch.stack(
-                (first * cos_view - second * sin_view, second * cos_view + first * sin_view),
-                dim=-1,
-            ).flatten(-2)
-        return torch.cat((out_rot, passthrough), dim=-1).reshape(original_shape)
-
-    return apply_one(query), apply_one(key) if key is not None else None
-
-
 def _cache_views(kv_cache: torch.Tensor, key: torch.Tensor) -> tuple[Any, Any]:
     key_cache, value_cache = _split_kv_cache(kv_cache)
     num_kv_heads = key.shape[1]
     if key_cache.shape[1] == num_kv_heads:
-        return _as_infini_strided_cached(key_cache), _as_infini_strided_cached(value_cache)
+        return _as_infini_strided(key_cache), _as_infini_strided(value_cache)
     if key_cache.shape[2] == num_kv_heads:
-        return _as_infini_strided_cached(
+        return _as_infini_strided(
             key_cache.permute(0, 2, 1, 3)
-        ), _as_infini_strided_cached(value_cache.permute(0, 2, 1, 3))
+        ), _as_infini_strided(value_cache.permute(0, 2, 1, 3))
     raise RuntimeError(f"cannot infer KV cache layout from key={key.shape}, cache={kv_cache.shape}")
 
 
@@ -619,14 +430,12 @@ def _cache_views_bshd(kv_cache: torch.Tensor, key: torch.Tensor) -> tuple[Any, A
     """
     key_cache, value_cache = _split_kv_cache(kv_cache)
     num_kv_heads = key.shape[1]
-    # HND  → already (blocks, kv_heads, block_size, dim)
     if key_cache.shape[1] == num_kv_heads:
-        return _as_infini_strided_cached(key_cache), _as_infini_strided_cached(value_cache)
-    # NHD → permute to (blocks, kv_heads, block_size, dim)
+        return _as_infini_strided(key_cache), _as_infini_strided(value_cache)
     if key_cache.shape[2] == num_kv_heads:
         return (
-            _as_infini_strided_cached(key_cache.permute(0, 2, 1, 3)),
-            _as_infini_strided_cached(value_cache.permute(0, 2, 1, 3)),
+            _as_infini_strided(key_cache.permute(0, 2, 1, 3)),
+            _as_infini_strided(value_cache.permute(0, 2, 1, 3)),
         )
     raise RuntimeError(f"cannot infer KV cache layout from key={key.shape}, cache={kv_cache.shape}")
 
@@ -662,32 +471,6 @@ def _store_kv_cache_infinicore(
             _as_infini(slot_mapping.flatten()),
         ),
     )
-
-
-def _store_kv_cache_torch(
-    kv_cache: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    slot_mapping: torch.Tensor,
-) -> None:
-    key_cache, value_cache = _split_kv_cache(kv_cache)
-    flat_slots = slot_mapping.flatten().long()
-    num_kv_heads = key.shape[1]
-    if key_cache.shape[1] == num_kv_heads:
-        block_size = key_cache.shape[2]
-        cache_layout = "hnd"
-    else:
-        block_size = key_cache.shape[1]
-        cache_layout = "nhd"
-    for token_idx, slot in enumerate(flat_slots.tolist()):
-        block = slot // block_size
-        offset = slot % block_size
-        if cache_layout == "hnd":
-            key_cache[block, :, offset, :].copy_(key[token_idx])
-            value_cache[block, :, offset, :].copy_(value[token_idx])
-        else:
-            key_cache[block, offset].copy_(key[token_idx])
-            value_cache[block, offset].copy_(value[token_idx])
 
 
 def _prefill_total_lens(attn_metadata: Any) -> torch.Tensor:
@@ -743,17 +526,17 @@ def _paged_attention_prefill_infinicore(
             _as_infini(q),
             key_cache,
             value_cache,
-            _as_infini_cached(attn_metadata.prefill_query_start_loc),
-            _as_infini_cached(total_lens),
-            _as_infini_cached(attn_metadata.prefill_block_table),
+            _as_infini(attn_metadata.prefill_query_start_loc),
+            _as_infini(total_lens),
+            _as_infini(attn_metadata.prefill_block_table),
             max_query_len,
             max_seq_len,
-            _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
+            _as_infini(alibi_slopes) if alibi_slopes is not None else None,
             attn_impl.scale,
             out=_as_infini(out_buffer),
         ),
     )
-    output[num_decode_tokens:num_actual_tokens] = out_buffer.reshape(n_tokens, -1)
+    output[num_decode_tokens:num_actual_tokens].view_as(out_buffer).copy_(out_buffer)
 
 
 def _paged_attention_decode_infinicore(
@@ -774,8 +557,8 @@ def _paged_attention_decode_infinicore(
         raise RuntimeError("InfiniCore paged attention wrapper does not support speculative decode")
     key_cache, value_cache = _cache_views_bshd(kv_cache, key)
     q = query[:num_decode_tokens].reshape(num_decode_tokens, 1,
-                                          attn_impl.num_heads,
-                                          attn_impl.head_size).contiguous()
+                                           attn_impl.num_heads,
+                                           attn_impl.head_size).contiguous()
     out_buffer = torch.empty(num_decode_tokens, 1, attn_impl.num_heads,
                              attn_impl.head_size, dtype=output.dtype, device=output.device)
     alibi_slopes = attn_impl.alibi_slopes
@@ -785,14 +568,14 @@ def _paged_attention_decode_infinicore(
             _as_infini(q),
             key_cache,
             value_cache,
-            _as_infini_cached(attn_metadata.decode_seq_lens),
-            _as_infini_cached(attn_metadata.decode_block_table),
-            _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
+            _as_infini(attn_metadata.decode_seq_lens),
+            _as_infini(attn_metadata.decode_block_table),
+            _as_infini(alibi_slopes) if alibi_slopes is not None else None,
             attn_impl.scale,
             out=_as_infini(out_buffer),
         ),
     )
-    output[:num_decode_tokens] = out_buffer.reshape(num_decode_tokens, -1)
+    output[:num_decode_tokens].view_as(out_buffer).copy_(out_buffer)
 
 
 def _paged_attention_decode_as_prefill_infinicore(
@@ -827,17 +610,13 @@ def _paged_attention_decode_as_prefill_infinicore(
             _as_infini(q),
             key_cache,
             value_cache,
-            _as_infini_cached(attn_metadata.decode_block_table[:1]),
-            _as_infini_cached(total_lens),
-            _as_infini_cached(query_start_loc),
-            _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
+            _as_infini(attn_metadata.decode_block_table[:1]),
+            _as_infini(total_lens),
+            _as_infini(query_start_loc),
+            _as_infini(alibi_slopes) if alibi_slopes is not None else None,
             attn_impl.scale,
             out=_as_infini(out_buffer),
         ),
     )
-    output[:num_actual_tokens] = out_buffer.reshape(n_tokens, -1)
+    output[:num_actual_tokens].view_as(out_buffer).copy_(out_buffer)
 
-
-def _env_truthy(name: str) -> bool:
-    value = os.environ.get(name, "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}

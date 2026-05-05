@@ -32,7 +32,7 @@ export LD_LIBRARY_PATH=/opt/conda/lib:$TORCH_LIB:$INFINI_ROOT/lib:$MACA_PATH/lib
 export XMAKE_ROOT=y
 
 # Include both the MetaX platform plugin and this general plugin when testing after installation.
-export VLLM_PLUGINS=metax,vllm_infinicore
+export VLLM_PLUGINS=infinicore,vllm_infinicore
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 ```
 

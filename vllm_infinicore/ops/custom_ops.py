@@ -1,12 +1,10 @@
-"""Default-off InfiniCore-backed PyTorch custom op wrappers."""
+"""InfiniCore-backed PyTorch custom op wrappers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from typing import Any
 
-CUSTOM_OP_ENABLE_ENV = "VLLM_INFINICORE_ENABLE_CUSTOM_OPS"
 RMS_NORM_OP = "vllm_infinicore::rms_norm"
 SILU_AND_MUL_OP = "vllm_infinicore::silu_and_mul"
 LINEAR_OP = "vllm_infinicore::linear"
@@ -36,13 +34,13 @@ class CustomOpStatus:
 
 def load_custom_ops(
     *,
-    force: bool = False,
     required_ops: tuple[str, ...] | None = None,
+    **__kwargs: object,
 ) -> CustomOpStatus:
-    """Register custom op prototypes only when explicitly requested.
+    """Register custom op prototypes.
 
-    The default path intentionally avoids importing torch so dry plugin
-    registration remains cheap and graph-conservative.
+    If *required_ops* is specified, only those ops are registered.
+    Otherwise all ops are registered.
     """
 
     requested_ops = required_ops or ALL_CUSTOM_OPS
@@ -51,13 +49,6 @@ def load_custom_ops(
         return CustomOpStatus(
             available=False,
             reason=f"unsupported custom op request: {', '.join(unknown_ops)}",
-            registered_ops=_REGISTERED_OPS,
-        )
-
-    if not force and not _env_truthy(CUSTOM_OP_ENABLE_ENV):
-        return CustomOpStatus(
-            available=False,
-            reason=f"{CUSTOM_OP_ENABLE_ENV} is unset or false; custom ops disabled",
             registered_ops=_REGISTERED_OPS,
         )
 
@@ -88,7 +79,7 @@ def load_custom_ops(
 
     return CustomOpStatus(
         available=True,
-        reason="InfiniCore custom op wrappers registered; vLLM patches remain disabled",
+        reason="InfiniCore custom op wrappers registered",
         registered_ops=_REGISTERED_OPS,
     )
 
@@ -98,7 +89,7 @@ def is_available() -> bool:
 
 
 def rms_norm(input_tensor: Any, weight: Any, eps: float = 1e-6) -> Any:
-    """Run the default-off RMSNorm custom op wrapper."""
+    """Run the RMSNorm custom op wrapper."""
 
     _ensure_direct_api_enabled((RMS_NORM_OP,))
     import torch
@@ -107,7 +98,7 @@ def rms_norm(input_tensor: Any, weight: Any, eps: float = 1e-6) -> Any:
 
 
 def silu_and_mul(input_tensor: Any) -> Any:
-    """Run the default-off SiluAndMul custom op wrapper."""
+    """Run the SiluAndMul custom op wrapper."""
 
     _ensure_direct_api_enabled((SILU_AND_MUL_OP,))
     import torch
@@ -116,7 +107,7 @@ def silu_and_mul(input_tensor: Any) -> Any:
 
 
 def linear(input_tensor: Any, weight: Any, bias: Any | None = None) -> Any:
-    """Run the default-off Linear/MatMul custom op wrapper."""
+    """Run the Linear/MatMul custom op wrapper."""
 
     _ensure_direct_api_enabled((LINEAR_OP,))
     import torch
@@ -125,7 +116,7 @@ def linear(input_tensor: Any, weight: Any, bias: Any | None = None) -> Any:
 
 
 def lm_head(input_tensor: Any, weight: Any, bias: Any | None = None) -> Any:
-    """Run the default-off LMHead custom op wrapper."""
+    """Run the LMHead custom op wrapper."""
 
     _ensure_direct_api_enabled((LM_HEAD_OP,))
     import torch
@@ -134,7 +125,7 @@ def lm_head(input_tensor: Any, weight: Any, bias: Any | None = None) -> Any:
 
 
 def embedding(input_tensor: Any, weight: Any) -> Any:
-    """Run the default-off Embedding custom op wrapper."""
+    """Run the Embedding custom op wrapper."""
 
     _ensure_direct_api_enabled((EMBEDDING_OP,))
     import torch
@@ -151,7 +142,7 @@ def rotary_embedding(
     cos_sin_cache: Any,
     is_neox_style: bool,
 ) -> tuple[Any, Any | None]:
-    """Run the default-off RoPE custom op wrapper."""
+    """Run the RoPE custom op wrapper."""
 
     _ensure_direct_api_enabled((ROTARY_EMBEDDING_OP,))
     import torch
@@ -181,7 +172,11 @@ def _register_rms_norm(torch: Any) -> None:
 
         return infinicore_backend.rms_norm(input_tensor, weight, float(eps))
 
+    def _rms_norm_fake(input_tensor: Any, weight: Any, eps: float) -> Any:
+        return torch.empty_like(input_tensor)
+
     library.impl("rms_norm", _rms_norm_impl, "CompositeExplicitAutograd")
+    torch.library.register_fake("vllm_infinicore::rms_norm", _rms_norm_fake)
 
     _REGISTERED_OPS = (*_REGISTERED_OPS, RMS_NORM_OP)
 
@@ -200,7 +195,11 @@ def _register_silu_and_mul(torch: Any) -> None:
 
         return infinicore_backend.silu_and_mul(input_tensor)
 
+    def _silu_and_mul_fake(input_tensor: Any) -> Any:
+        return torch.empty_like(input_tensor)
+
     library.impl("silu_and_mul", _silu_and_mul_impl, "CompositeExplicitAutograd")
+    torch.library.register_fake("vllm_infinicore::silu_and_mul", _silu_and_mul_fake)
     _REGISTERED_OPS = (*_REGISTERED_OPS, SILU_AND_MUL_OP)
 
 
@@ -218,7 +217,12 @@ def _register_linear(torch: Any) -> None:
 
         return infinicore_backend.linear(input_tensor, weight, bias)
 
+    def _linear_fake(input_tensor: Any, weight: Any, bias: Any | None = None) -> Any:
+        return torch.empty(input_tensor.shape[:-1] + (weight.shape[0],),
+                           dtype=input_tensor.dtype, device=input_tensor.device)
+
     library.impl("linear", _linear_impl, "CompositeExplicitAutograd")
+    torch.library.register_fake("vllm_infinicore::linear", _linear_fake)
     _REGISTERED_OPS = (*_REGISTERED_OPS, LINEAR_OP)
 
 
@@ -236,7 +240,12 @@ def _register_lm_head(torch: Any) -> None:
 
         return infinicore_backend.lm_head(input_tensor, weight, bias)
 
+    def _lm_head_fake(input_tensor: Any, weight: Any, bias: Any | None = None) -> Any:
+        return torch.empty(input_tensor.shape[:-1] + (weight.shape[0],),
+                           dtype=input_tensor.dtype, device=input_tensor.device)
+
     library.impl("lm_head", _lm_head_impl, "CompositeExplicitAutograd")
+    torch.library.register_fake("vllm_infinicore::lm_head", _lm_head_fake)
     _REGISTERED_OPS = (*_REGISTERED_OPS, LM_HEAD_OP)
 
 
@@ -254,7 +263,12 @@ def _register_embedding(torch: Any) -> None:
 
         return infinicore_backend.embedding(input_tensor, weight)
 
+    def _embedding_fake(input_tensor: Any, weight: Any) -> Any:
+        return torch.empty(input_tensor.shape + (weight.shape[1],),
+                           dtype=weight.dtype, device=input_tensor.device)
+
     library.impl("embedding", _embedding_impl, "CompositeExplicitAutograd")
+    torch.library.register_fake("vllm_infinicore::embedding", _embedding_fake)
     _REGISTERED_OPS = (*_REGISTERED_OPS, EMBEDDING_OP)
 
 
@@ -292,11 +306,19 @@ def _register_rotary_embedding(torch: Any) -> None:
             bool(is_neox_style),
         )
 
-    library.impl(
-        "rotary_embedding",
-        _rotary_embedding_impl,
-        "CompositeExplicitAutograd",
-    )
+    def _rotary_embedding_fake(
+        positions: Any,
+        query: Any,
+        key: Any | None,
+        head_size: int,
+        rotary_dim: int,
+        cos_sin_cache: Any,
+        is_neox_style: bool,
+    ) -> tuple[Any, Any | None]:
+        return (torch.empty_like(query), torch.empty_like(key) if key is not None else None)
+
+    library.impl("rotary_embedding", _rotary_embedding_impl, "CompositeExplicitAutograd")
+    torch.library.register_fake("vllm_infinicore::rotary_embedding", _rotary_embedding_fake)
     _REGISTERED_OPS = (*_REGISTERED_OPS, ROTARY_EMBEDDING_OP)
 
 
@@ -309,19 +331,9 @@ def _library(torch: Any) -> Any:
 
 
 def _ensure_direct_api_enabled(required_ops: tuple[str, ...]) -> None:
-    if not _env_truthy(CUSTOM_OP_ENABLE_ENV):
-        raise RuntimeError(
-            f"{CUSTOM_OP_ENABLE_ENV} is unset or false; custom ops disabled"
-        )
-
     status = load_custom_ops(required_ops=required_ops)
     if not status.available:
         raise RuntimeError(status.reason)
-
-
-def _env_truthy(name: str) -> bool:
-    value = os.environ.get(name, "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 _REGISTERERS = {

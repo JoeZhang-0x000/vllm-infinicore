@@ -2,7 +2,6 @@
 
 from .custom_ops import (
     ALL_CUSTOM_OPS,
-    CUSTOM_OP_ENABLE_ENV,
     EMBEDDING_OP,
     LINEAR_OP,
     LM_HEAD_OP,
@@ -22,7 +21,6 @@ from .custom_ops import (
 
 __all__ = [
     "ALL_CUSTOM_OPS",
-    "CUSTOM_OP_ENABLE_ENV",
     "EMBEDDING_OP",
     "LINEAR_OP",
     "LM_HEAD_OP",

@@ -555,7 +555,7 @@ def _worker_env(manifest: dict[str, Any], engine: str) -> dict[str, str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ROOT) + ":" + str(Path(manifest["infinilm_root"]) / "python") + ":" + env.get("PYTHONPATH", "")
     env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    env["VLLM_PLUGINS"] = "metax,vllm_infinicore" if engine == "vllm-infinicore" else "metax"
+    env["VLLM_PLUGINS"] = "infinicore,vllm_infinicore" if engine == "vllm-infinicore" else "metax"
     return env
 
 
@@ -564,9 +564,9 @@ def _registration_dict(registration: Any) -> dict[str, Any] | None:
         return None
     return {
         "installed_routes": list(registration.installed_routes),
-        "native_fallback_routes": list(registration.native_fallback_routes),
+        "failed_routes": list(getattr(registration, "failed_routes", ())),
         "skipped_routes": list(registration.skipped_routes),
-        "failure_reason": registration.failure_reason,
+        "reason": getattr(registration, "reason", getattr(registration, "failure_reason", "")),
     }
 
 
@@ -581,15 +581,8 @@ def _vllm_graph_count() -> int:
 
 def _reset_infinicore_counts() -> None:
     try:
-        from vllm_infinicore.ops import (
-            infinicore_backend,
-            vllm_attention,
-            vllm_attention_backend,
-        )
-
+        from vllm_infinicore.ops import infinicore_backend
         infinicore_backend.reset_backend_call_counts()
-        vllm_attention.reset_attention_route_counts()
-        vllm_attention_backend.reset_attention_backend_route_counts()
     except Exception:
         return
 
@@ -604,21 +597,11 @@ def _infinicore_backend_counts() -> dict[str, int]:
 
 
 def _infinicore_attention_counts() -> dict[str, int]:
-    try:
-        from vllm_infinicore.ops import vllm_attention
-
-        return vllm_attention.attention_route_counts()
-    except Exception:
-        return {}
+    return {}
 
 
 def _infinicore_attention_backend_counts() -> dict[str, int]:
-    try:
-        from vllm_infinicore.ops import vllm_attention_backend
-
-        return vllm_attention_backend.attention_backend_route_counts()
-    except Exception:
-        return {}
+    return {}
 
 
 def _vllm_attention_backend_path() -> str:
