@@ -164,9 +164,23 @@ The current attention routes use InfiniCore's FlashAttention-wrapped operators
 for the PA/FA paths: prefill dispatches to `infinicore.mha_varlen`, and decode
 dispatches to `infinicore.mha_kvcache`. The current fair graph benchmark at
 `bs=8`, `input_len=4096`, `output_len=512`, `warmup=1`, `repeats=3` measured
-vLLM native at `283.00` output tok/s and vLLM-InfiniCore `all` routes at
-`211.73` output tok/s, both with `validation_errors=[]` and `148` graph
-captures. Artifact:
-`artifacts/all-routes-mha-fa-vs-native-bs8-in4096-out512-graph-20260505-155903`.
-The remaining gap must be fixed inside the all-route InfiniCore path rather
-than by bypassing scoped operators.
+vLLM native at `283.29` output tok/s and vLLM-InfiniCore `all` routes at
+`262.41` output tok/s after the RoPE wrapper optimization, both with
+`validation_errors=[]` and `148` graph captures. Artifacts:
+`artifacts/all-routes-gap-ablation-bs8-in4096-out512-graph-20260505-165647`
+and
+`artifacts/all-routes-after-rope-opt-bs8-in4096-out512-graph-20260505-172113`.
+The all-route profile is now `92.62%` of vLLM native at the production
+benchmark shape. Future improvements must remain inside the all-route
+InfiniCore path rather than bypassing scoped operators.
+The latest 95% follow-up retained only per-device InfiniCore stream pointer
+caching; the best same-run native/all comparison from that pass was
+`280.93` vs `262.97` output tok/s (`93.61%`), so the `>=95%` all-route target
+remains open. Artifact:
+`artifacts/all-routes-stream-cache-vs-native-bs8-in4096-out512-graph-20260505`.
+An opt-in plugin C++ bridge for `PagedAttentionDecode` and `LMHead` is now
+available through `VLLM_INFINICORE_ENABLE_CPP_BRIDGE=1` and
+`VLLM_INFINICORE_CPP_BRIDGE_ROUTES=...`. It is graph-correct but not a
+throughput win; the best bridge production run was `286.39` native vs
+`263.83` all-routes (`92.12%`). Keep it default-off and diagnostic unless a
+future change proves a throughput benefit.

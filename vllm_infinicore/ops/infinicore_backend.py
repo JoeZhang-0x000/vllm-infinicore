@@ -23,7 +23,8 @@ STRICT_BACKEND_ENV = "VLLM_INFINICORE_STRICT_BACKEND"
 logger = logging.getLogger(__name__)
 _CALL_COUNTS: dict[str, int] = {}
 _PY_CAPSULE_GET_POINTER: Any | None = None
-_EXTERNAL_STREAMS: dict[int, torch.cuda.ExternalStream] = {}
+_INFINICORE_STREAM_PTRS: dict[tuple[str, int], int] = {}
+_EXTERNAL_STREAMS: dict[tuple[str, int, int], torch.cuda.ExternalStream] = {}
 _INFINI_TENSOR_CACHE_MAX = 4096
 _INFINI_TENSOR_CACHE: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
 
@@ -67,7 +68,7 @@ def lm_head(
     return _route_or_fallback(
         "lm_head",
         input_tensor,
-        lambda: _linear_infinicore(input_tensor, weight, bias),
+        lambda: _lm_head_infinicore(input_tensor, weight, bias),
         lambda: F.linear(input_tensor, weight, bias),
     )
 
@@ -192,10 +193,21 @@ def backend_call_counts() -> dict[str, int]:
 
 def reset_backend_call_counts() -> None:
     _CALL_COUNTS.clear()
+    try:
+        from . import cpp_bridge
+
+        cpp_bridge.reset_bridge_call_counts()
+    except Exception:
+        pass
 
 
 def clear_tensor_wrapper_cache() -> None:
     _INFINI_TENSOR_CACHE.clear()
+
+
+def clear_stream_cache() -> None:
+    _INFINICORE_STREAM_PTRS.clear()
+    _EXTERNAL_STREAMS.clear()
 
 
 def paged_attention_prefill_infinicore_only(
@@ -275,6 +287,8 @@ def _route_or_fallback(
         _record_call(op_name)
         return result
     except Exception as exc:
+        if _is_non_fallback_error(exc):
+            raise
         if strict_backend_enabled():
             raise RuntimeError(f"InfiniCore {op_name} failed") from exc
         logger.warning(
@@ -297,6 +311,14 @@ def strict_backend_enabled() -> bool:
     return _env_truthy(STRICT_BACKEND_ENV)
 
 
+def _is_non_fallback_error(exc: Exception) -> bool:
+    try:
+        from .cpp_bridge import CppBridgeError
+    except Exception:
+        return False
+    return isinstance(exc, CppBridgeError)
+
+
 def _as_infini(tensor: torch.Tensor) -> Any:
     import infinicore
 
@@ -309,6 +331,24 @@ def _as_infini_cached(tensor: torch.Tensor) -> Any:
     if not tensor.is_contiguous():
         return _as_infini(tensor)
     return _cached_infini_tensor(("contiguous",) + _tensor_cache_key(tensor), tensor)
+
+
+def _as_infini_contiguous_copy_cached(tensor: torch.Tensor) -> Any:
+    if tensor.is_contiguous():
+        return _as_infini_cached(tensor)
+    cache_key = ("contiguous_copy",) + _tensor_cache_key(tensor)
+    cached = _INFINI_TENSOR_CACHE.get(cache_key)
+    if cached is not None:
+        _INFINI_TENSOR_CACHE.move_to_end(cache_key)
+        return cached
+
+    contiguous = tensor.contiguous()
+    wrapped = _as_infini(contiguous)
+    wrapped._torch_ref = contiguous
+    _INFINI_TENSOR_CACHE[cache_key] = wrapped
+    if len(_INFINI_TENSOR_CACHE) > _INFINI_TENSOR_CACHE_MAX:
+        _INFINI_TENSOR_CACHE.popitem(last=False)
+    return wrapped
 
 
 def _as_infini_strided(tensor: torch.Tensor) -> Any:
@@ -382,21 +422,28 @@ def _run_on_infinicore_stream(
 def _infinicore_external_stream(
     reference_tensor: torch.Tensor,
 ) -> torch.cuda.ExternalStream | None:
-    try:
-        import infinicore
+    device_index = reference_tensor.device.index if reference_tensor.device.index is not None else 0
+    device_key = (reference_tensor.device.type, device_index)
+    ptr = _INFINICORE_STREAM_PTRS.get(device_key)
+    if ptr is None:
+        try:
+            import infinicore
 
-        ptr = _capsule_pointer(infinicore.get_stream())
-    except Exception:
-        return None
+            with torch.cuda.device(reference_tensor.device):
+                ptr = _capsule_pointer(infinicore.get_stream())
+        except Exception:
+            return None
+        _INFINICORE_STREAM_PTRS[device_key] = ptr
 
     if not ptr:
         return None
 
-    stream = _EXTERNAL_STREAMS.get(ptr)
+    stream_key = device_key + (ptr,)
+    stream = _EXTERNAL_STREAMS.get(stream_key)
     if stream is None:
         with torch.cuda.device(reference_tensor.device):
             stream = torch.cuda.ExternalStream(ptr)
-        _EXTERNAL_STREAMS[ptr] = stream
+        _EXTERNAL_STREAMS[stream_key] = stream
     return stream
 
 
@@ -497,6 +544,34 @@ def _linear_infinicore(
     return out
 
 
+def _lm_head_infinicore(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    from . import cpp_bridge
+
+    if cpp_bridge.enabled_for(cpp_bridge.LM_HEAD_ROUTE):
+        return _run_on_infinicore_stream(
+            input_tensor,
+            lambda: _lm_head_cpp_bridge(input_tensor, weight, bias),
+        )
+    return _linear_infinicore(input_tensor, weight, bias)
+
+
+def _lm_head_cpp_bridge(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    from . import cpp_bridge
+
+    module = cpp_bridge.module()
+    result = module.lm_head(input_tensor, weight, bias)
+    cpp_bridge.record_call(cpp_bridge.LM_HEAD_ROUTE)
+    return result
+
+
 def _embedding_infinicore(
     input_tensor: torch.Tensor,
     weight: torch.Tensor,
@@ -535,26 +610,32 @@ def _rotary_embedding_infinicore(
     max_position = int(cos_sin_cache.shape[0]) - 1
     if max_position >= 0:
         positions = positions.clamp(0, max_position)
+    sin_infini = _as_infini_contiguous_copy_cached(sin)
+    cos_infini = _as_infini_contiguous_copy_cached(cos)
+    algo = IF.RopeAlgo.GPT_NEOX if is_neox_style else IF.RopeAlgo.GPT_J
 
     def apply_one(tensor: torch.Tensor) -> torch.Tensor:
         original_shape = tensor.shape
         view = tensor.view(positions.shape[0], -1, head_size)
         rot = view[..., :rotary_dim]
-        passthrough = view[..., rotary_dim:]
         out_rot = torch.empty_like(rot)
-        algo = IF.RopeAlgo.GPT_NEOX if is_neox_style else IF.RopeAlgo.GPT_J
         _run_on_infinicore_stream(
             tensor,
             lambda: IF.rope(
                 _as_infini(rot),
                 _as_infini(positions),
-                _as_infini(sin),
-                _as_infini(cos),
+                sin_infini,
+                cos_infini,
                 algo,
                 out=_as_infini(out_rot),
             ),
         )
-        return torch.cat((out_rot, passthrough), dim=-1).reshape(original_shape)
+        if rotary_dim == head_size:
+            return out_rot.reshape(original_shape)
+        out = torch.empty_like(view)
+        out[..., :rotary_dim].copy_(out_rot)
+        out[..., rotary_dim:].copy_(view[..., rotary_dim:])
+        return out.reshape(original_shape)
 
     return apply_one(query), apply_one(key) if key is not None else None
 
@@ -756,6 +837,24 @@ def _paged_attention_decode_infinicore(
         return
     if num_decode_tokens != num_decodes:
         raise RuntimeError("InfiniCore paged attention wrapper does not support speculative decode")
+    from . import cpp_bridge
+
+    if cpp_bridge.enabled_for(cpp_bridge.DECODE_ROUTE):
+        _run_on_infinicore_stream(
+            query,
+            lambda: _paged_attention_decode_cpp_bridge(
+                query,
+                key,
+                kv_cache,
+                attn_metadata,
+                output,
+                attn_impl.alibi_slopes,
+                attn_impl.scale,
+                num_decode_tokens,
+                num_decodes,
+            ),
+        )
+        return
     key_cache, value_cache = _cache_views_bshd(kv_cache, key)
     q = query[:num_decode_tokens]
     q_for_fa = q.view(num_decode_tokens, 1, q.shape[1], q.shape[2])
@@ -774,6 +873,35 @@ def _paged_attention_decode_infinicore(
             out=_as_infini(out),
         ),
     )
+
+
+def _paged_attention_decode_cpp_bridge(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: Any,
+    output: torch.Tensor,
+    alibi_slopes: torch.Tensor | None,
+    scale: float,
+    num_decode_tokens: int,
+    num_decodes: int,
+) -> None:
+    from . import cpp_bridge
+
+    module = cpp_bridge.module()
+    module.paged_attention_decode_out(
+        query,
+        key,
+        kv_cache,
+        attn_metadata.decode_seq_lens,
+        attn_metadata.decode_block_table,
+        alibi_slopes,
+        float(scale),
+        int(num_decode_tokens),
+        int(num_decodes),
+        output,
+    )
+    cpp_bridge.record_call(cpp_bridge.DECODE_ROUTE)
 
 
 def _paged_attention_decode_as_prefill_infinicore(

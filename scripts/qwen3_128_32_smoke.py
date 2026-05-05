@@ -89,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--single-case", choices=sorted(CASE_SPECS), default=None)
     parser.add_argument("--custom-routes", default="")
     parser.add_argument("--disabled-routes", default="")
+    parser.add_argument("--cpp-bridge-routes", default="")
     parser.add_argument("--force-native-fallback", action="store_true")
     parser.add_argument("--prompt-json", default="")
     parser.add_argument("--output-json", default=DEFAULT_OUTPUT_JSON)
@@ -161,6 +162,12 @@ def configure_case_environment(case_name: str, args: argparse.Namespace) -> None
         os.environ["VLLM_INFINICORE_DISABLED_ROUTES"] = args.disabled_routes
     else:
         os.environ.pop("VLLM_INFINICORE_DISABLED_ROUTES", None)
+    if args.cpp_bridge_routes:
+        os.environ["VLLM_INFINICORE_ENABLE_CPP_BRIDGE"] = "1"
+        os.environ["VLLM_INFINICORE_CPP_BRIDGE_ROUTES"] = args.cpp_bridge_routes
+    else:
+        os.environ.pop("VLLM_INFINICORE_ENABLE_CPP_BRIDGE", None)
+        os.environ.pop("VLLM_INFINICORE_CPP_BRIDGE_ROUTES", None)
 
 
 def build_prompt_ids(tokenizer: Any, input_len: int) -> list[int]:
@@ -412,6 +419,9 @@ def run_single_case(args: argparse.Namespace) -> int:
         "infinicore_backend_call_counts": _infinicore_backend_call_counts(),
         "infinicore_attention_route_counts": _infinicore_attention_route_counts(),
         "infinicore_attention_backend_route_counts": _infinicore_attention_backend_route_counts(),
+        "infinicore_cpp_bridge_call_counts": _infinicore_cpp_bridge_call_counts(),
+        "cpp_bridge_enabled": bool(args.cpp_bridge_routes),
+        "cpp_bridge_routes": args.cpp_bridge_routes,
         "vllm_attention_backend": _vllm_attention_backend_path(),
         "measurements": measurements,
         "first_decoded_preview": (
@@ -520,11 +530,13 @@ def _read_vllm_graph_capture_count() -> int:
 def _reset_infinicore_backend_counts() -> None:
     try:
         from vllm_infinicore.ops import infinicore_backend
+        from vllm_infinicore.ops import cpp_bridge
         from vllm_infinicore.ops import vllm_attention
         from vllm_infinicore.ops import vllm_attention_backend
     except Exception:
         return
     infinicore_backend.reset_backend_call_counts()
+    cpp_bridge.reset_bridge_call_counts()
     vllm_attention.reset_attention_route_counts()
     vllm_attention_backend.reset_attention_backend_route_counts()
 
@@ -551,6 +563,14 @@ def _infinicore_attention_backend_route_counts() -> dict[str, int]:
     except Exception:
         return {}
     return vllm_attention_backend.attention_backend_route_counts()
+
+
+def _infinicore_cpp_bridge_call_counts() -> dict[str, int]:
+    try:
+        from vllm_infinicore.ops import cpp_bridge
+    except Exception:
+        return {}
+    return cpp_bridge.bridge_call_counts()
 
 
 def _vllm_attention_backend_path() -> str:
@@ -602,6 +622,8 @@ def _child_command(
         command.extend(["--custom-routes", args.custom_routes])
     if args.disabled_routes:
         command.extend(["--disabled-routes", args.disabled_routes])
+    if args.cpp_bridge_routes:
+        command.extend(["--cpp-bridge-routes", args.cpp_bridge_routes])
     if args.force_native_fallback:
         command.append("--force-native-fallback")
     return command

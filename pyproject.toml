@@ -20,4 +20,5 @@ include = [
     "AGENTS.md",
     "configs/*.yaml",
     "docs/*.md",
+    "vllm_infinicore/csrc/*.cpp",
 ]

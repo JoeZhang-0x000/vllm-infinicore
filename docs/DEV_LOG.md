@@ -610,3 +610,200 @@ Artifact:
 All nine scoped routes were still installed, and runtime counters remained
 nonzero for every route family. The full-route profile improved from `43.17`
 to `211.73` output tok/s, reaching `74.8%` of vLLM native graph throughput.
+
+## 2026-05-05 All-Route Gap Ablation And RoPE Optimization
+
+Added an ablation-matrix mode to `scripts/qwen3_three_engine_throughput.py`.
+The mode generates one prompt ID manifest and reuses it across graph cases at
+`bs=8`, `input_len=4096`, `output_len=512`, `warmup=1`, `repeats=3`.
+
+Ablation artifact:
+`artifacts/all-routes-gap-ablation-bs8-in4096-out512-graph-20260505-165647`
+
+| Case | Output TPS | Recovered gap |
+|---|---:|---:|
+| vLLM native | 283.29 | 100.00% |
+| vLLM-InfiniCore `all` | 212.49 | 0.00% |
+| `all-minus-matmul-lmhead` | 215.84 | 4.74% |
+| `all-minus-rope` | 247.66 | 49.67% |
+| `attention-only` | 261.62 | 69.39% |
+| `light-known-good` | 266.34 | 76.05% |
+
+Conclusion from the deterministic order:
+
+- Disabling `MatMul,LMHead` recovered only `3.35` tok/s, so Linear/LMHead was
+  not the first optimization target.
+- The attention-only path was `7.65%` below native, below the `15%` threshold.
+- Disabling `RoPE` recovered `35.16` tok/s, so RoPE was the first optimization
+  target.
+
+Implemented RoPE wrapper optimizations:
+
+- Cache stable contiguous InfiniCore wrappers for the sin/cos RoPE tables.
+- Avoid `torch.cat` reconstruction when `rotary_dim == head_size`; Qwen3-8B
+  rotates the full head, so the InfiniCore output can be reshaped directly.
+- Keep strict InfiniCore routing active; no scoped route is bypassed in the
+  final all-routes benchmark.
+
+Validation after the RoPE optimization:
+
+- `python -m compileall vllm_infinicore scripts tests`
+- `python -m unittest discover -s tests` (`28` tests passed, `2` skipped)
+- `git diff --check`
+- Targeted `all` with `RoPE` disabled:
+  `artifacts/target-all-minus-rope-after-rope-opt-bs8-in4096-out512-graph-20260505-171740`
+  - Output TPS: `254.32`
+  - `graph_capture_count=148`
+  - `validation_errors=[]`
+- Full all-routes production benchmark:
+  `artifacts/all-routes-after-rope-opt-bs8-in4096-out512-graph-20260505-172113`
+  - Output TPS: `262.41`
+  - Native baseline from the same ablation manifest: `283.29`
+  - Ratio: `92.62%` of vLLM native
+  - `graph_capture_count=148`
+  - `validation_errors=[]`
+  - Installed all nine scoped routes.
+  - Backend counters were nonzero for Embedding, RMSNorm, MatMul/Linear, RoPE,
+    StoreKVCache, PagedAttentionPrefill, SiluAndMul, LMHead, and
+    PagedAttentionDecode.
+- `128/32` all-routes strict graph smoke:
+  `artifacts/qwen3_128_32_all_routes_after_rope_opt_graph.json`
+  - `graph_capture_count=148`
+  - `validation_errors=[]`
+  - Installed all nine scoped routes with nonzero route-family counters.
+
+Current status: vLLM-InfiniCore all-routes graph mode now exceeds the
+`>=90%` vLLM-native acceptance target at the production benchmark shape.
+
+## 2026-05-05 95% All-Routes Follow-Up
+
+Attempted to close the remaining all-route gap against same-manifest vLLM
+native graph throughput at `bs=8`, `input_len=4096`, `output_len=512`,
+`warmup=1`, `repeats=3`.
+
+Implemented and kept:
+
+- Cached the InfiniCore runtime stream pointer per device before constructing
+  `torch.cuda.ExternalStream`, avoiding repeated capsule lookup on every
+  backend launch.
+- Added `--ablation-cases` to `scripts/qwen3_three_engine_throughput.py` so
+  focused production ablations can reuse one manifest without running the full
+  historical matrix.
+
+Focused post-RoPE ablation artifact:
+`artifacts/all-routes-decode-opt-ablation-bs8-in4096-out512-graph-20260505`
+
+| Case | Output TPS | Graph captures | Validation |
+|---|---:|---:|---|
+| `native` | 283.48 | 148 | `validation_errors=[]` |
+| `all` | 257.55 | 148 | `validation_errors=[]` |
+| `attention-only` | 264.15 | 148 | `validation_errors=[]` |
+| `non-attn-only` | 271.03 | 148 | `validation_errors=[]` |
+| `all-minus-rope` | 248.22 | 148 | `validation_errors=[]` |
+| `light-known-good` | 268.01 | 148 | `validation_errors=[]` |
+
+Best retained native/all production comparison from this pass:
+`artifacts/all-routes-stream-cache-vs-native-bs8-in4096-out512-graph-20260505`
+
+| Engine/routes | Output TPS | Graph captures | Validation |
+|---|---:|---:|---|
+| vLLM native | 280.93 | 148 | `validation_errors=[]` |
+| vLLM-InfiniCore `all` | 262.97 | 148 | `validation_errors=[]` |
+
+This is `93.61%` of same-run vLLM native and does not meet the new `>=95%`
+target. All nine scoped routes were installed with no native fallbacks, and
+runtime counters were nonzero for every route family:
+`embedding`, `rms_norm`, `linear`, `rotary_embedding`, `store_kv_cache`,
+`paged_attention_prefill`, `silu_and_mul`, `lm_head`, and
+`paged_attention_decode`.
+
+Rejected variants from this pass:
+
+- Decode `q/out` uncached raw-stride wrappers regressed the focused all-route
+  case to `257.55` tok/s.
+- A non-retaining alias cache for decode `q/out` wrappers was graph-correct but
+  regressed production throughput to `258.43` tok/s.
+- Reusing retained wrappers for stable linear/LMHead/embedding/RMSNorm weights
+  was graph-correct but regressed production throughput to `256.89` tok/s.
+- Saturating Python route counters kept nonzero evidence but did not improve
+  throughput (`256.90` tok/s), so exact counters were preserved.
+- The non-in-place `mha_kvcache` API plus copy-back was graph-correct in the
+  `128/32` smoke but slower than the in-place decode path and was not retained.
+
+Conclusion: the `>=95%` all-routes target remains open. The current best
+evidence still points to the combined attention decode/LMHead Python/backend
+boundary rather than simple wrapper cache misses. Future work should avoid the
+rejected descriptor/cache variants above and focus on reducing per-token
+attention decode and logits projection call overhead without disabling scoped
+routes.
+
+## 2026-05-05 Plugin C++ Bridge Probe
+
+Implemented an opt-in plugin-owned C++ bridge for the hottest remaining route
+families without changing InfiniCore or InfiniLM:
+
+- `VLLM_INFINICORE_ENABLE_CPP_BRIDGE=1`
+- `VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode,LMHead`
+- The bridge is built on demand through `torch.utils.cpp_extension.load`.
+- `PagedAttentionDecode` calls `infinicore::op::mha_kvcache_` from C++ with
+  torch tensor raw-pointer views.
+- `LMHead` calls `infinicore::op::linear_` from C++.
+- The existing Python stream bridge still wraps the C++ launch to preserve
+  graph ordering.
+- Bridge call counters are now recorded in smoke and throughput artifacts.
+
+Validation:
+
+- `python -m compileall vllm_infinicore scripts tests`
+- `python -m unittest discover -s tests`
+- `git diff --check`
+- C++ bridge load probe succeeded:
+  `vllm_infinicore_cpp_bridge.so` built under torch extension cache.
+- `128/32` all-routes strict graph smoke with `PagedAttentionDecode` bridged:
+  `artifacts/qwen3_128_32_all_routes_cpp_decode_graph.json`
+  - `graph_capture_count=148`
+  - `validation_errors=[]`
+  - all nine routes installed; bridge counter `PagedAttentionDecode=1116`
+- `128/32` all-routes strict graph smoke with `PagedAttentionDecode,LMHead`
+  bridged:
+  `artifacts/qwen3_128_32_all_routes_cpp_decode_lmhead_graph.json`
+  - `graph_capture_count=148`
+  - `validation_errors=[]`
+  - all nine routes installed; bridge counters `PagedAttentionDecode=1116`,
+    `LMHead=32`
+
+Production benchmark results at `bs=8`, `input_len=4096`, `output_len=512`,
+`warmup=1`, `repeats=3`:
+
+| Bridge routes | Native TPS | All-routes TPS | Ratio | Artifact |
+|---|---:|---:|---:|---|
+| `PagedAttentionDecode` | 286.35 | 262.20 | 91.57% | `artifacts/all-routes-cpp-decode-vs-native-bs8-in4096-out512-graph-20260505` |
+| `PagedAttentionDecode,LMHead` | 286.39 | 263.83 | 92.12% | `artifacts/all-routes-cpp-decode-lmhead-vs-native-bs8-in4096-out512-graph-20260505` |
+
+The bridge path is correct and remains available as an opt-in diagnostic path,
+but it is not a throughput win over the previous best retained all-routes run
+(`262.97 / 280.93 = 93.61%`). It is therefore not enabled by default and does
+not close the `>=95%` target.
+
+Focused bridge-enabled ablation:
+
+- Partial matrix artifact:
+  `artifacts/all-routes-cpp-bridge-ablation-bs8-in4096-out512-graph-20260505`
+- Separate light-known-good artifact:
+  `artifacts/all-routes-cpp-bridge-ablation-light-known-good-bs8-in4096-out512-graph-20260505`
+
+| Case | Output TPS | Graph captures | Validation |
+|---|---:|---:|---|
+| `native` | 281.13 | 148 | `validation_errors=[]` |
+| `all` | 259.09 | 148 | `validation_errors=[]` |
+| `attention-only` | 261.22 | 148 | `validation_errors=[]` |
+| `non-attn-only` | 271.13 | 148 | `validation_errors=[]` |
+| `all-minus-rope` | 254.46 | 148 | `validation_errors=[]` |
+| `light-known-good` | 267.80 | 148 | `validation_errors=[]` |
+
+Conclusion: moving only the Python descriptor construction for decode/LMHead
+into a C++ extension is insufficient. The remaining gap is more likely in the
+underlying InfiniCore decode/logits kernel/API behavior, vLLM scheduling around
+attention/logits, or stream synchronization granularity. Further work should
+profile kernel time versus stream-wait time and compare the exact InfiniLM C++
+execution context before adding more bridge code.

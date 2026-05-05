@@ -167,8 +167,8 @@ The latest full-route benchmark at `bs=8`, `input_len=4096`,
 
 | Engine/routes | Output TPS | Graph captures | Artifact |
 |---|---:|---:|---|
-| vLLM native | 283.00 | 148 | `artifacts/all-routes-mha-fa-vs-native-bs8-in4096-out512-graph-20260505-155903` |
-| vLLM-InfiniCore `all` | 211.73 | 148 | `artifacts/all-routes-mha-fa-vs-native-bs8-in4096-out512-graph-20260505-155903` |
+| vLLM native | 283.29 | 148 | `artifacts/all-routes-gap-ablation-bs8-in4096-out512-graph-20260505-165647` |
+| vLLM-InfiniCore `all` | 262.41 | 148 | `artifacts/all-routes-after-rope-opt-bs8-in4096-out512-graph-20260505-172113` |
 
 The `all` run installed all nine scoped routes and recorded nonzero InfiniCore
 calls for Embedding, RMSNorm, MatMul/Linear, RoPE, StoreKVCache,
@@ -176,10 +176,30 @@ PagedAttentionPrefill, SiluAndMul, LMHead, and PagedAttentionDecode.
 `PagedAttentionPrefill` now dispatches to InfiniCore's FlashAttention-wrapped
 `mha_varlen`, and `PagedAttentionDecode` dispatches to `mha_kvcache`. This keeps
 the all-scoped-operators requirement while reducing the full-route result from
-`43.17` to `211.73` output tok/s at the production benchmark shape. The
-remaining gap is still open; bypassing `PagedAttentionPrefill`,
-`PagedAttentionDecode`, or `MatMul` is not an acceptable throughput fix under
-the all-scoped-operators requirement.
+`43.17` to `211.73`, then to `262.41` output tok/s at the production benchmark
+shape after the RoPE wrapper optimization. The current all-route profile is
+`92.62%` of vLLM native and exceeds the `>=90%` acceptance target. Future
+improvements must stay within the all-scoped-operators requirement; bypassing
+`PagedAttentionPrefill`, `PagedAttentionDecode`, `MatMul`, or `RoPE` is not an
+acceptable throughput fix.
+
+The latest 95% follow-up retained per-device InfiniCore stream pointer caching
+and measured `262.97` output tok/s for `VLLM_INFINICORE_ROUTES=all` against
+`280.93` same-run vLLM native (`93.61%`). The stricter `>=95%` target remains
+open. Artifact:
+`artifacts/all-routes-stream-cache-vs-native-bs8-in4096-out512-graph-20260505`.
+
+An opt-in C++ bridge can route `PagedAttentionDecode` and `LMHead` below the
+Python InfiniCore wrapper layer with:
+
+```text
+VLLM_INFINICORE_ENABLE_CPP_BRIDGE=1
+VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode,LMHead
+```
+
+This path is graph-correct and records bridge counters, but the best production
+run was `263.83` output tok/s against `286.39` same-run native (`92.12%`), so
+it is diagnostic and default-off.
 
 ## Attention Backend Status
 

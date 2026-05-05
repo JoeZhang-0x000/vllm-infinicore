@@ -12,9 +12,13 @@ from vllm_infinicore.ops import infinicore_backend
 class InfiniCoreBackendTests(unittest.TestCase):
     def setUp(self) -> None:
         infinicore_backend.clear_tensor_wrapper_cache()
+        infinicore_backend.clear_stream_cache()
+        infinicore_backend.reset_backend_call_counts()
 
     def tearDown(self) -> None:
         infinicore_backend.clear_tensor_wrapper_cache()
+        infinicore_backend.clear_stream_cache()
+        infinicore_backend.reset_backend_call_counts()
 
     def test_tensor_wrapper_cache_reuses_matching_views(self) -> None:
         base = torch.arange(32, dtype=torch.float32).view(4, 8)
@@ -49,7 +53,6 @@ class InfiniCoreBackendTests(unittest.TestCase):
         self.assertEqual(first.name, "row-major")
         self.assertEqual(second.name, "strided")
         self.assertEqual(create.call_count, 2)
-
 
 if __name__ == "__main__":
     unittest.main()

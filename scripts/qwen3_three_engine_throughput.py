@@ -25,6 +25,86 @@ DEFAULT_MODEL = "/mnt/geogpt-doc-new/default/xb/qwen3-8B"
 DEFAULT_INFINILM_ROOT = "/root/InfiniLM"
 ENGINES = ("infinilm", "vllm-native", "vllm-infinicore")
 DEFAULT_INFINICORE_THROUGHPUT_ROUTES = "all"
+ALL_ROUTE_NAMES = (
+    "RMSNorm",
+    "SiluAndMul",
+    "RoPE",
+    "Embedding",
+    "MatMul",
+    "LMHead",
+    "StoreKVCache",
+    "PagedAttentionPrefill",
+    "PagedAttentionDecode",
+)
+ATTENTION_ROUTE_NAMES = (
+    "StoreKVCache",
+    "PagedAttentionPrefill",
+    "PagedAttentionDecode",
+)
+ABLATION_CASE_SPECS = (
+    {
+        "case_name": "native",
+        "engine": "vllm-native",
+        "routes": "",
+        "disabled_routes": "",
+    },
+    {
+        "case_name": "all",
+        "engine": "vllm-infinicore",
+        "routes": "all",
+        "disabled_routes": "",
+    },
+    {
+        "case_name": "attention-only",
+        "engine": "vllm-infinicore",
+        "routes": ",".join(ATTENTION_ROUTE_NAMES),
+        "disabled_routes": "",
+    },
+    {
+        "case_name": "non-attn-only",
+        "engine": "vllm-infinicore",
+        "routes": ",".join(
+            route for route in ALL_ROUTE_NAMES if route not in ATTENTION_ROUTE_NAMES
+        ),
+        "disabled_routes": "",
+    },
+    {
+        "case_name": "all-minus-matmul",
+        "engine": "vllm-infinicore",
+        "routes": "all",
+        "disabled_routes": "MatMul",
+    },
+    {
+        "case_name": "all-minus-lmhead",
+        "engine": "vllm-infinicore",
+        "routes": "all",
+        "disabled_routes": "LMHead",
+    },
+    {
+        "case_name": "all-minus-rope",
+        "engine": "vllm-infinicore",
+        "routes": "all",
+        "disabled_routes": "RoPE",
+    },
+    {
+        "case_name": "all-minus-matmul-lmhead",
+        "engine": "vllm-infinicore",
+        "routes": "all",
+        "disabled_routes": "MatMul,LMHead",
+    },
+    {
+        "case_name": "all-minus-matmul-lmhead-rope",
+        "engine": "vllm-infinicore",
+        "routes": "all",
+        "disabled_routes": "MatMul,LMHead,RoPE",
+    },
+    {
+        "case_name": "light-known-good",
+        "engine": "vllm-infinicore",
+        "routes": "RMSNorm,SiluAndMul,Embedding,StoreKVCache",
+        "disabled_routes": "",
+    },
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,6 +126,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--infinicore-routes", default=DEFAULT_INFINICORE_THROUGHPUT_ROUTES)
     parser.add_argument("--infinicore-disabled-routes", default="")
+    parser.add_argument("--cpp-bridge-routes", default="")
+    parser.add_argument(
+        "--ablation-matrix",
+        action="store_true",
+        help=(
+            "Run the production all-route gap ablation matrix instead of the "
+            "generic engine list."
+        ),
+    )
+    parser.add_argument(
+        "--ablation-cases",
+        default="",
+        help=(
+            "Comma-separated case_name filter for --ablation-matrix. "
+            "Defaults to the full built-in matrix."
+        ),
+    )
     parser.add_argument("--trust-remote-code", action="store_true", default=True)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--manifest", default="", help=argparse.SUPPRESS)
@@ -159,18 +256,44 @@ def build_manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
     prompt_path = run_dir / f"prompt-in{args.input_len}.json"
     write_json(prompt_path, prompt_payload)
 
-    requested = [item.strip() for item in args.engines.split(",") if item.strip()]
-    unknown = sorted(set(requested) - set(ENGINES))
-    if unknown:
-        raise ValueError(f"unknown engine(s): {unknown}")
-
     cases = []
-    for engine in requested:
-        case_id = f"{engine}-graph-bs{args.batch_size}-in{args.input_len}-out{args.output_len}"
+    if args.ablation_matrix:
+        case_specs = list(ABLATION_CASE_SPECS)
+        if args.ablation_cases:
+            requested_cases = [
+                case.strip() for case in args.ablation_cases.split(",") if case.strip()
+            ]
+            by_name = {spec["case_name"]: spec for spec in case_specs}
+            unknown = sorted(set(requested_cases) - set(by_name))
+            if unknown:
+                raise ValueError(f"unknown ablation case(s): {unknown}")
+            case_specs = [by_name[case] for case in requested_cases]
+    else:
+        requested = [item.strip() for item in args.engines.split(",") if item.strip()]
+        unknown = sorted(set(requested) - set(ENGINES))
+        if unknown:
+            raise ValueError(f"unknown engine(s): {unknown}")
+        case_specs = [
+            {
+                "case_name": engine,
+                "engine": engine,
+                "routes": args.infinicore_routes,
+                "disabled_routes": args.infinicore_disabled_routes,
+            }
+            for engine in requested
+        ]
+
+    for spec in case_specs:
+        engine = spec["engine"]
+        case_name = spec["case_name"]
+        case_id = f"{case_name}-graph-bs{args.batch_size}-in{args.input_len}-out{args.output_len}"
         cases.append(
             {
                 "case_id": case_id,
+                "case_name": case_name,
                 "engine": engine,
+                "infinicore_routes": spec["routes"],
+                "infinicore_disabled_routes": spec["disabled_routes"],
                 "result_path": str(run_dir / "results" / f"{case_id}.json"),
                 "log_path": str(run_dir / "logs" / f"{case_id}.log"),
             }
@@ -200,6 +323,10 @@ def build_manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
         "block_size": args.block_size,
         "infinicore_routes": args.infinicore_routes,
         "infinicore_disabled_routes": args.infinicore_disabled_routes,
+        "cpp_bridge_routes": args.cpp_bridge_routes,
+        "ablation_matrix": args.ablation_matrix,
+        "all_route_names": list(ALL_ROUTE_NAMES),
+        "attention_route_names": list(ATTENTION_ROUTE_NAMES),
         "cases": cases,
     }
 
@@ -250,8 +377,11 @@ def parent_main(args: argparse.Namespace) -> int:
         results.append(result)
         print(_result_line(result), flush=True)
 
-    write_json(run_dir / "summary.json", {"results": results})
-    _write_summary_md(run_dir, results)
+    summary = {"results": results}
+    if manifest.get("ablation_matrix"):
+        summary["gap_table"] = _gap_table(results)
+    write_json(run_dir / "summary.json", summary)
+    _write_summary_md(run_dir, results, ablation_matrix=bool(manifest.get("ablation_matrix")))
     valid = sum(1 for result in results if result.get("valid"))
     print(f"summary: {valid}/{len(results)} valid; run_dir={run_dir}", flush=True)
     return 0 if valid == len(results) else 1
@@ -290,11 +420,24 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
 
     if case["engine"] == "vllm-infinicore":
         os.environ["VLLM_INFINICORE_ENABLE_PATCHES"] = "1"
-        os.environ["VLLM_INFINICORE_ROUTES"] = manifest["infinicore_routes"]
+        os.environ["VLLM_INFINICORE_ROUTES"] = (
+            case.get("infinicore_routes") or manifest["infinicore_routes"]
+        )
         os.environ["VLLM_INFINICORE_FORCE_NATIVE_FALLBACK"] = "0"
         os.environ["VLLM_INFINICORE_STRICT_BACKEND"] = "1"
         os.environ["VLLM_INFINICORE_DISABLE_REAL_BACKEND"] = "0"
-        disabled_routes = manifest.get("infinicore_disabled_routes") or ""
+        cpp_bridge_routes = manifest.get("cpp_bridge_routes") or ""
+        if cpp_bridge_routes:
+            os.environ["VLLM_INFINICORE_ENABLE_CPP_BRIDGE"] = "1"
+            os.environ["VLLM_INFINICORE_CPP_BRIDGE_ROUTES"] = cpp_bridge_routes
+        else:
+            os.environ.pop("VLLM_INFINICORE_ENABLE_CPP_BRIDGE", None)
+            os.environ.pop("VLLM_INFINICORE_CPP_BRIDGE_ROUTES", None)
+        disabled_routes = (
+            case.get("infinicore_disabled_routes")
+            if "infinicore_disabled_routes" in case
+            else manifest.get("infinicore_disabled_routes")
+        ) or ""
         if disabled_routes:
             os.environ["VLLM_INFINICORE_DISABLED_ROUTES"] = disabled_routes
         else:
@@ -379,6 +522,9 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
             "infinicore_backend_call_counts": _infinicore_backend_counts(),
             "infinicore_attention_route_counts": _infinicore_attention_counts(),
             "infinicore_attention_backend_route_counts": _infinicore_attention_backend_counts(),
+            "infinicore_cpp_bridge_call_counts": _infinicore_cpp_bridge_counts(),
+            "cpp_bridge_enabled": bool(manifest.get("cpp_bridge_routes")),
+            "cpp_bridge_routes": manifest.get("cpp_bridge_routes", ""),
             "vllm_attention_backend": _vllm_attention_backend_path(),
             "graph_capture_count": _vllm_graph_count(),
         }
@@ -503,7 +649,10 @@ def _iteration_result(
 def _base_result(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "case_id": case["case_id"],
+        "case_name": case.get("case_name", case["engine"]),
         "engine": case["engine"],
+        "infinicore_routes": case.get("infinicore_routes", ""),
+        "infinicore_disabled_routes": case.get("infinicore_disabled_routes", ""),
         "model": manifest["model"],
         "batch_size": manifest["batch_size"],
         "input_len": manifest["input_len"],
@@ -583,11 +732,13 @@ def _reset_infinicore_counts() -> None:
     try:
         from vllm_infinicore.ops import (
             infinicore_backend,
+            cpp_bridge,
             vllm_attention,
             vllm_attention_backend,
         )
 
         infinicore_backend.reset_backend_call_counts()
+        cpp_bridge.reset_bridge_call_counts()
         vllm_attention.reset_attention_route_counts()
         vllm_attention_backend.reset_attention_backend_route_counts()
     except Exception:
@@ -621,6 +772,15 @@ def _infinicore_attention_backend_counts() -> dict[str, int]:
         return {}
 
 
+def _infinicore_cpp_bridge_counts() -> dict[str, int]:
+    try:
+        from vllm_infinicore.ops import cpp_bridge
+
+        return cpp_bridge.bridge_call_counts()
+    except Exception:
+        return {}
+
+
 def _vllm_attention_backend_path() -> str:
     try:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -639,22 +799,85 @@ def _result_line(result: dict[str, Any]) -> str:
     )
 
 
-def _write_summary_md(run_dir: Path, results: list[dict[str, Any]]) -> None:
+def _write_summary_md(
+    run_dir: Path,
+    results: list[dict[str, Any]],
+    *,
+    ablation_matrix: bool = False,
+) -> None:
     lines = [
-        "# Qwen3 Three Engine Throughput",
+        "# Qwen3 Throughput",
         "",
-        "| Engine | Valid | Output TPS | Median Iter TPS | Graph Captures | Result |",
-        "|---|---|---:|---:|---:|---|",
+        "| Case | Engine | Routes | Disabled | Valid | Output TPS | Median | Min | Max | Stdev | Graph Captures | Result |",
+        "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for result in results:
         stats_ = result.get("iteration_tps_stats") or {}
         result_path = Path("results") / f"{result.get('case_id')}.json"
         lines.append(
-            f"| {result.get('engine')} | {result.get('valid')} | "
+            f"| {result.get('case_name', result.get('engine'))} | "
+            f"{result.get('engine')} | "
+            f"{result.get('infinicore_routes', '')} | "
+            f"{result.get('infinicore_disabled_routes', '')} | "
+            f"{result.get('valid')} | "
             f"{_fmt(result.get('output_tps'))} | {_fmt(stats_.get('median'))} | "
+            f"{_fmt(stats_.get('min'))} | {_fmt(stats_.get('max'))} | "
+            f"{_fmt(stats_.get('stdev'))} | "
             f"{result.get('graph_capture_count', '')} | {result_path} |"
         )
+    if ablation_matrix:
+        lines.extend(_gap_table_md(results))
     (run_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _gap_table(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_name = {result.get("case_name"): result for result in results}
+    native_tps = _numeric(by_name.get("native", {}).get("output_tps"))
+    all_tps = _numeric(by_name.get("all", {}).get("output_tps"))
+    gap = native_tps - all_tps if native_tps is not None and all_tps is not None else None
+    table = []
+    for result in results:
+        tps = _numeric(result.get("output_tps"))
+        recovered = tps - all_tps if tps is not None and all_tps is not None else None
+        recovered_pct = (
+            (recovered / gap) * 100.0
+            if recovered is not None and gap is not None and gap > 0
+            else None
+        )
+        table.append(
+            {
+                "case_name": result.get("case_name"),
+                "engine": result.get("engine"),
+                "output_tps": tps,
+                "native_gap_tps": gap,
+                "recovered_tps_vs_all": recovered,
+                "recovered_gap_percent": recovered_pct,
+                "valid": result.get("valid"),
+            }
+        )
+    return table
+
+
+def _gap_table_md(results: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "",
+        "## Gap Table",
+        "",
+        "| Case | Valid | Output TPS | Recovered TPS vs all | Recovered Gap % |",
+        "|---|---|---:|---:|---:|",
+    ]
+    for row in _gap_table(results):
+        lines.append(
+            f"| {row.get('case_name')} | {row.get('valid')} | "
+            f"{_fmt(row.get('output_tps'))} | "
+            f"{_fmt(row.get('recovered_tps_vs_all'))} | "
+            f"{_fmt(row.get('recovered_gap_percent'))} |"
+        )
+    return lines
+
+
+def _numeric(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 def _fmt(value: Any) -> str:
