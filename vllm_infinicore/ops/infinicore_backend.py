@@ -610,14 +610,24 @@ def _cache_views(kv_cache: torch.Tensor, key: torch.Tensor) -> tuple[Any, Any]:
 
 
 def _cache_views_bshd(kv_cache: torch.Tensor, key: torch.Tensor) -> tuple[Any, Any]:
+    """Return InfiniCore wrappers for key/value cache in BHSD layout.
+
+    InfiniCore's ``mha_varlen`` / ``mha_kvcache`` expect
+    ``(num_blocks, num_kv_heads, block_size, head_dim)``, so we permute
+    when the cache is in the standard vLLM ``(num_blocks, block_size,
+    num_kv_heads, head_dim)`` layout.
+    """
     key_cache, value_cache = _split_kv_cache(kv_cache)
     num_kv_heads = key.shape[1]
+    # HND  → already (blocks, kv_heads, block_size, dim)
     if key_cache.shape[1] == num_kv_heads:
-        return _as_infini_strided_cached(
-            key_cache.permute(0, 2, 1, 3)
-        ), _as_infini_strided_cached(value_cache.permute(0, 2, 1, 3))
-    if key_cache.shape[2] == num_kv_heads:
         return _as_infini_strided_cached(key_cache), _as_infini_strided_cached(value_cache)
+    # NHD → permute to (blocks, kv_heads, block_size, dim)
+    if key_cache.shape[2] == num_kv_heads:
+        return (
+            _as_infini_strided_cached(key_cache.permute(0, 2, 1, 3)),
+            _as_infini_strided_cached(value_cache.permute(0, 2, 1, 3)),
+        )
     raise RuntimeError(f"cannot infer KV cache layout from key={key.shape}, cache={kv_cache.shape}")
 
 
@@ -710,18 +720,23 @@ def _paged_attention_prefill_infinicore(
     num_decode_tokens = int(getattr(attn_metadata, "num_decode_tokens", 0))
     num_actual_tokens = int(attn_metadata.num_actual_tokens)
     q = query[num_decode_tokens:num_actual_tokens]
+    n_tokens = q.shape[0]
     if q.numel() == 0:
         return
-    out = output[num_decode_tokens:num_actual_tokens].view(q.shape)
+    q = q.reshape(n_tokens, attn_impl.num_heads, attn_impl.head_size).contiguous()
     total_lens = getattr(attn_metadata, "cu_prefix_kv_lens", None)
     if total_lens is None:
         total_lens = _prefill_total_lens(attn_metadata)
         total_lens = torch.nn.functional.pad(total_lens, (1, 0), value=0).cumsum(
             dim=0, dtype=torch.int32
         )
-    max_query_len = int(getattr(attn_metadata, "max_query_len", q.shape[0]))
+    max_query_len = int(getattr(attn_metadata, "max_query_len", n_tokens))
     max_seq_len = int(getattr(attn_metadata, "prefill_max_seq_len", max_query_len))
     alibi_slopes = attn_impl.alibi_slopes
+    out_buffer = torch.empty(
+        n_tokens, attn_impl.num_heads, attn_impl.head_size,
+        dtype=output.dtype, device=output.device,
+    )
     _run_on_infinicore_stream(
         query,
         lambda: infinicore.mha_varlen(
@@ -735,9 +750,10 @@ def _paged_attention_prefill_infinicore(
             max_seq_len,
             _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
             attn_impl.scale,
-            out=_as_infini(out),
+            out=_as_infini(out_buffer),
         ),
     )
+    output[num_decode_tokens:num_actual_tokens] = out_buffer.reshape(n_tokens, -1)
 
 
 def _paged_attention_decode_infinicore(
@@ -757,23 +773,26 @@ def _paged_attention_decode_infinicore(
     if num_decode_tokens != num_decodes:
         raise RuntimeError("InfiniCore paged attention wrapper does not support speculative decode")
     key_cache, value_cache = _cache_views_bshd(kv_cache, key)
-    q = query[:num_decode_tokens]
-    q_for_fa = q.view(num_decode_tokens, 1, q.shape[1], q.shape[2])
-    out = output[:num_decode_tokens].view(q_for_fa.shape)
+    q = query[:num_decode_tokens].reshape(num_decode_tokens, 1,
+                                          attn_impl.num_heads,
+                                          attn_impl.head_size).contiguous()
+    out_buffer = torch.empty(num_decode_tokens, 1, attn_impl.num_heads,
+                             attn_impl.head_size, dtype=output.dtype, device=output.device)
     alibi_slopes = attn_impl.alibi_slopes
     _run_on_infinicore_stream(
         query,
         lambda: infinicore.mha_kvcache(
-            _as_infini(q_for_fa),
+            _as_infini(q),
             key_cache,
             value_cache,
             _as_infini_cached(attn_metadata.decode_seq_lens),
             _as_infini_cached(attn_metadata.decode_block_table),
             _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
             attn_impl.scale,
-            out=_as_infini(out),
+            out=_as_infini(out_buffer),
         ),
     )
+    output[:num_decode_tokens] = out_buffer.reshape(num_decode_tokens, -1)
 
 
 def _paged_attention_decode_as_prefill_infinicore(
@@ -788,16 +807,19 @@ def _paged_attention_decode_as_prefill_infinicore(
 
     num_actual_tokens = int(attn_metadata.num_actual_tokens)
     q = query[:num_actual_tokens]
+    n_tokens = q.shape[0]
     if q.numel() == 0:
         return
+    q = q.reshape(n_tokens, attn_impl.num_heads, attn_impl.head_size).contiguous()
     key_cache, value_cache = _cache_views(kv_cache, key)
     query_start_loc = torch.tensor(
-        [0, num_actual_tokens],
+        [0, n_tokens],
         dtype=torch.int32,
         device=query.device,
     )
     total_lens = attn_metadata.decode_seq_lens[:1].to(torch.int64)
-    out = output[:num_actual_tokens].view(q.shape)
+    out_buffer = torch.empty(n_tokens, attn_impl.num_heads, attn_impl.head_size,
+                             dtype=output.dtype, device=output.device)
     alibi_slopes = attn_impl.alibi_slopes
     _run_on_infinicore_stream(
         query,
@@ -810,9 +832,10 @@ def _paged_attention_decode_as_prefill_infinicore(
             _as_infini_cached(query_start_loc),
             _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
             attn_impl.scale,
-            out=_as_infini(out),
+            out=_as_infini(out_buffer),
         ),
     )
+    output[:num_actual_tokens] = out_buffer.reshape(n_tokens, -1)
 
 
 def _env_truthy(name: str) -> bool:
