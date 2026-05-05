@@ -13,6 +13,8 @@ plugin:
   route_select_env: VLLM_INFINICORE_ROUTES
   route_disable_env: VLLM_INFINICORE_DISABLED_ROUTES
   force_native_fallback_env: VLLM_INFINICORE_FORCE_NATIVE_FALLBACK
+  route_profiles:
+    throughput: [RMSNorm, SiluAndMul, Embedding]
 
 target:
   machine: MetaX C550
@@ -35,65 +37,65 @@ routes:
     category: normalization
     implementation: torch_custom_op
     default_enabled: false
-    graph_policy: requires_explicit_graph_safety_proof
+    graph_policy: stream_bridge_graph_validated
     native_fallback: vLLM RMSNorm forward_native
-    validation: unit_numeric_compare; qwen3_exact_token_smoke
+    validation: unit_numeric_compare; qwen3_exact_token_smoke; graph_smoke
   - name: SiluAndMul
     category: mlp
     implementation: torch_custom_op
     default_enabled: false
-    graph_policy: requires_explicit_graph_safety_proof
+    graph_policy: stream_bridge_graph_validated
     native_fallback: vLLM native SiluAndMul activation
-    validation: qwen3_exact_token_smoke before any route enablement
+    validation: qwen3_exact_token_smoke and graph_smoke
   - name: RoPE
     category: attention
     implementation: torch_custom_op
     default_enabled: false
-    graph_policy: requires_explicit_graph_safety_proof
+    graph_policy: stream_bridge_graph_validated
     native_fallback: vLLM native rotary embedding
     validation: qwen3_exact_token_smoke and graph evidence
   - name: Embedding
     category: embedding
     implementation: torch_custom_op
     default_enabled: false
-    graph_policy: avoid_from_blob_or_from_torch_inside_capture
+    graph_policy: stream_bridge_graph_validated
     native_fallback: vLLM native token embedding
     validation: qwen3_exact_token_smoke and graph capture probe
   - name: MatMul
     category: linear
     implementation: torch_custom_op
     default_enabled: false
-    graph_policy: requires_explicit_graph_safety_proof
+    graph_policy: stream_bridge_graph_validated
     native_fallback: vLLM native linear layers
-    validation: operator numeric compare and qwen3_exact_token_smoke
+    validation: operator numeric compare; qwen3_exact_token_smoke; graph_smoke
   - name: LMHead
     category: linear
     implementation: torch_custom_op
     default_enabled: false
-    graph_policy: requires_explicit_graph_safety_proof
+    graph_policy: stream_bridge_graph_validated
     native_fallback: vLLM native LMHead/logits projection
-    validation: logits numeric compare and qwen3_exact_token_smoke
+    validation: logits numeric compare; qwen3_exact_token_smoke; graph_smoke
   - name: StoreKVCache
     category: kv-cache
-    implementation: deferred_pa_kv
+    implementation: infinicore_attention_backend
     default_enabled: false
-    graph_policy: deferred_no_explicit_graph_path
+    graph_policy: stream_bridge_graph_validated
     native_fallback: vLLM native KV cache store path
-    validation: descriptor dump plus qwen3_exact_token_smoke
+    validation: attention probe; qwen3_exact_token_smoke; graph_smoke
   - name: PagedAttentionPrefill
     category: paged-attention
-    implementation: deferred_pa_kv
+    implementation: infinicore_attention_backend
     default_enabled: false
-    graph_policy: deferred_keep_native_vllm_cudagraph_baseline
+    graph_policy: stream_bridge_graph_validated
     native_fallback: vLLM native paged attention prefill backend
-    validation: attention output compare, descriptor dump, graph evidence
+    validation: attention output compare; qwen3_exact_token_smoke; graph evidence
   - name: PagedAttentionDecode
     category: paged-attention
-    implementation: deferred_pa_kv
+    implementation: infinicore_attention_backend
     default_enabled: false
-    graph_policy: deferred_keep_native_vllm_cudagraph_baseline
+    graph_policy: stream_bridge_graph_validated
     native_fallback: vLLM native paged attention decode backend
-    validation: decode health, descriptor dump, graph evidence
+    validation: decode health; qwen3_exact_token_smoke; graph evidence
 
 benchmark_rules:
   prompt_ids: generate_once_and_reuse

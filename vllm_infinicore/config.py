@@ -22,12 +22,9 @@ DEFAULT_CONFIG_PATH = (
     Path(__file__).resolve().parent.parent / "configs" / "qwen3_infinicore_graph.yaml"
 )
 
-_ROUTE_IMPLEMENTATIONS = {"torch_custom_op", "deferred_pa_kv"}
+_ROUTE_IMPLEMENTATIONS = {"torch_custom_op", "infinicore_attention_backend"}
 _GRAPH_POLICIES = {
-    "requires_explicit_graph_safety_proof",
-    "avoid_from_blob_or_from_torch_inside_capture",
-    "deferred_no_explicit_graph_path",
-    "deferred_keep_native_vllm_cudagraph_baseline",
+    "stream_bridge_graph_validated",
 }
 
 

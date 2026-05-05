@@ -2,7 +2,10 @@
 
 ## Goal
 
-`vllm-infinicore` is an out-of-tree vLLM plugin for InfiniCore operator experiments on single-node Qwen3 inference. The project starts as a conservative scaffold: it registers cleanly with vLLM and declares the operator scope, but it does not replace vLLM native execution paths yet.
+`vllm-infinicore` is an out-of-tree vLLM plugin for InfiniCore operator
+experiments on single-node Qwen3 inference. It remains default-off, but when
+explicitly enabled it now installs InfiniCore-backed eager routes for the full
+Qwen3-8B scoped inference operator set.
 
 ## Layers
 
@@ -53,19 +56,33 @@ hook for routes owned by this plugin.
 
 `vllm_infinicore.ops` reserves the interface for future C++/PyTorch custom ops.
 
-First-stage direction:
+Current route implementation:
 
-- Non-PA operators use PyTorch custom op wrappers backed by InfiniCore kernels.
-- `vllm_infinicore::rms_norm` exists as a Python PyTorch custom op prototype only when `VLLM_INFINICORE_ENABLE_CUSTOM_OPS` is explicitly truthy.
-- The RMSNorm prototype can also be loaded explicitly by the patch installer.
-  Direct `vllm_infinicore.ops.rms_norm()` calls remain gated by
-  `VLLM_INFINICORE_ENABLE_CUSTOM_OPS`.
-- The RMSNorm vLLM route uses `CustomOp.register_oot(name="RMSNorm")` and
-  routes only the weighted, non-residual, no variance override path. Residual
-  and variant paths fall back to vLLM's PyTorch-native RMSNorm implementation.
-- The RMSNorm prototype is not a performance path.
-- PA/KV operators stay deferred for a dedicated descriptor and graph-safety phase.
-- The Python side should avoid dynamic object creation inside captured graph paths.
+- Non-PA operators use PyTorch custom op wrappers backed by InfiniCore Python
+  APIs, which call the installed `_infinicore` extension.
+- `vllm_infinicore::rms_norm`, `silu_and_mul`, `linear`, `lm_head`,
+  `embedding`, and `rotary_embedding` are registered only when explicitly
+  loaded by direct custom-op opt-in or patch installation.
+- Direct `vllm_infinicore.ops.*` calls remain gated by
+  `VLLM_INFINICORE_ENABLE_CUSTOM_OPS`; vLLM route installers may force-load the
+  needed custom op wrappers.
+- RMSNorm, SiluAndMul, and RoPE use vLLM OOT `CustomOp` replacement classes.
+- Embedding patches `UnquantizedEmbeddingMethod.embedding`.
+- MatMul patches `UnquantizedLinearMethod.apply`.
+- LMHead patches `UnquantizedEmbeddingMethod.apply` for `ParallelLMHead`.
+- StoreKVCache and PagedAttention patch backend implementation methods such as
+  `FlashAttentionImpl.do_kv_cache_update` and `FlashAttentionImpl.forward`,
+  not `Attention.forward`. This keeps vLLM's opaque attention custom op
+  boundary intact.
+- CPU tensors intentionally use PyTorch fallbacks because the local InfiniCore
+  CPU `from_torch` path can crash. Strict backend validation is done on MACA
+  device tensors.
+- Device launches are wrapped with an InfiniCore/PyTorch stream bridge.
+  InfiniCore owns a runtime stream exposed through `infinicore.get_stream()`,
+  while vLLM cudagraph capture is ordered through PyTorch streams. The bridge
+  wraps the InfiniCore stream as a `torch.cuda.ExternalStream` and adds
+  `wait_stream` dependencies before and after each `_infinicore` launch so
+  graph capture and replay see the InfiniCore kernels in the correct order.
 
 ### 4. Config Layer
 
@@ -95,7 +112,7 @@ Qwen3 routes are requested but forced to native fallback.
 
 vLLM native cudagraph is the graph baseline on MetaX. Use PIECEWISE cudagraph with `backend="eager"` and `enforce_eager=False`.
 
-Do not enable patched paths during graph capture until:
+Do not claim patched paths are graph-safe until:
 
 - The exact operator output is validated against vLLM native.
 - Actual input and output token counts are recorded.
@@ -103,13 +120,27 @@ Do not enable patched paths during graph capture until:
 - Graph capture completes in logs.
 - The path avoids graph-unsafe InfiniCore wrapper construction.
 
-The current graph smoke artifact is
+The native/fallback graph smoke artifact is
 `artifacts/qwen3_128_32_smoke.json`. It records PIECEWISE cudagraph with
 `backend="eager"`, `enforce_eager=False`, and `num_cudagraph_captured=148` for
 both native graph and all-routes-native-fallback graph. The script does not
 explicitly set `CompilationMode.VLLM_COMPILE`; local vLLM logs may still show an
 internal compilation mode while also logging that the eager backend disables AOT
 compile.
+
+The current all-routes InfiniCore artifacts are:
+
+- `artifacts/qwen3_128_32_all_routes_streamed_strict_eager.json`
+- `artifacts/qwen3_128_32_all_routes_streamed_strict_graph.json`
+
+The eager artifact records `enforce_eager=True`, exact 128 input / 32 output
+token validation, and nonzero InfiniCore backend call counts for every scoped
+route. The graph artifact records PIECEWISE cudagraph with `backend="eager"`,
+`enforce_eager=False`, `num_cudagraph_captured=148`, exact 128 input / 32
+output token validation, and all nine scoped routes installed. In graph mode,
+Python counters count capture and non-captured paths; captured non-attention
+op replay does not re-enter Python, so decoded-output validation and graph
+capture evidence are required together with the counters.
 
 ## Benchmark Policy
 
@@ -121,3 +152,10 @@ All benchmark work must follow the current fairness rules:
 - Use output-only TPS as the primary metric.
 - Warm up before measurement and run repeated iterations.
 - Treat old TPS tables as historical until rebenchmarked under these rules.
+
+Current vLLM-InfiniCore throughput runs should use
+`VLLM_INFINICORE_ROUTES=throughput`, which expands to
+`RMSNorm,SiluAndMul,Embedding`. This is a performance policy, not an operator
+coverage claim: the full nine-route set remains available with
+`VLLM_INFINICORE_ROUTES=all`, but the attention/KV routes currently dominate
+decode overhead because they replay through the Python backend wrapper.

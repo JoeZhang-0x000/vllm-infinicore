@@ -40,6 +40,7 @@ print("torch" in sys.modules)
     def test_rms_norm_prototype_matches_torch_formula(self) -> None:
         try:
             import torch
+            import torch.nn.functional as F
         except Exception as exc:  # pragma: no cover - depends on local install
             self.skipTest(f"torch unavailable: {exc}")
 
@@ -50,7 +51,8 @@ print("torch" in sys.modules)
         ):
             status = custom_ops.load_custom_ops()
             self.assertTrue(status.available, status.reason)
-            self.assertEqual(status.registered_ops, (custom_ops.RMS_NORM_OP,))
+            for op_name in custom_ops.ALL_CUSTOM_OPS:
+                self.assertIn(op_name, status.registered_ops)
 
             input_tensor = torch.tensor(
                 [[1.0, -2.0, 3.0], [0.5, 1.5, -2.5]],
@@ -66,6 +68,59 @@ print("torch" in sys.modules)
             expected = expected.to(dtype=input_tensor.dtype) * weight
 
             torch.testing.assert_close(output, expected)
+
+            silu_input = torch.tensor(
+                [[0.5, -1.0, 2.0, 3.0, -4.0, 5.0]],
+                dtype=torch.float32,
+            )
+            silu_output = custom_ops.silu_and_mul(silu_input)
+            silu_expected = F.silu(silu_input[..., :3]) * silu_input[..., 3:]
+            torch.testing.assert_close(silu_output, silu_expected)
+
+            linear_input = torch.tensor(
+                [[1.0, -2.0, 0.5, 3.0], [-1.0, 2.0, 1.5, 0.0]],
+                dtype=torch.float32,
+            )
+            linear_weight = torch.tensor(
+                [[0.5, -1.0, 0.25, 2.0], [1.0, 0.0, -0.5, 0.75]],
+                dtype=torch.float32,
+            )
+            linear_bias = torch.tensor([0.25, -0.75], dtype=torch.float32)
+            linear_expected = F.linear(linear_input, linear_weight, linear_bias)
+            torch.testing.assert_close(
+                custom_ops.linear(linear_input, linear_weight, linear_bias),
+                linear_expected,
+            )
+            torch.testing.assert_close(
+                custom_ops.lm_head(linear_input, linear_weight, linear_bias),
+                linear_expected,
+            )
+
+            embedding_input = torch.tensor([0, 2, 4], dtype=torch.long)
+            embedding_weight = torch.arange(15, dtype=torch.float32).view(5, 3)
+            torch.testing.assert_close(
+                custom_ops.embedding(embedding_input, embedding_weight),
+                F.embedding(embedding_input, embedding_weight),
+            )
+
+            positions = torch.tensor([0, 1], dtype=torch.long)
+            angles = torch.arange(6, dtype=torch.float32).view(3, 2) * 0.1
+            cos_sin_cache = torch.cat((angles.cos(), angles.sin()), dim=-1)
+            query = torch.arange(16, dtype=torch.float32).view(2, 8) / 10
+            key = query + 1.0
+            rotated_query, rotated_key = custom_ops.rotary_embedding(
+                positions,
+                query,
+                key,
+                4,
+                4,
+                cos_sin_cache,
+                True,
+            )
+            expected_query = _rotate_neox(positions, query, cos_sin_cache)
+            expected_key = _rotate_neox(positions, key, cos_sin_cache)
+            torch.testing.assert_close(rotated_query, expected_query)
+            torch.testing.assert_close(rotated_key, expected_key)
 
     def test_force_load_does_not_enable_direct_api_without_env(self) -> None:
         try:
@@ -85,6 +140,21 @@ print("torch" in sys.modules)
             weight = torch.ones((4,), dtype=torch.float32)
             with self.assertRaisesRegex(RuntimeError, custom_ops.CUSTOM_OP_ENABLE_ENV):
                 custom_ops.rms_norm(input_tensor, weight)
+
+
+def _rotate_neox(positions, tensor, cos_sin_cache):
+    import torch
+
+    cos, sin = cos_sin_cache.index_select(0, positions).chunk(2, dim=-1)
+    view = tensor.view(positions.shape[0], -1, 4)
+    first, second = view.chunk(2, dim=-1)
+    cos = cos.unsqueeze(-2)
+    sin = sin.unsqueeze(-2)
+    rotated = torch.cat(
+        (first * cos - second * sin, second * cos + first * sin),
+        dim=-1,
+    )
+    return rotated.reshape_as(tensor)
 
 
 if __name__ == "__main__":

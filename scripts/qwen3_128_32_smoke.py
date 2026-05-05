@@ -61,6 +61,15 @@ CASE_SPECS: dict[str, dict[str, object]] = {
         "routes": None,
         "force_native_fallback": None,
         "require_cudagraph": True,
+        "enforce_eager": False,
+    },
+    "custom-eager": {
+        "description": "custom route subset from --custom-routes with vLLM eager",
+        "patches": "1",
+        "routes": None,
+        "force_native_fallback": None,
+        "require_cudagraph": False,
+        "enforce_eager": True,
     },
 }
 
@@ -136,7 +145,7 @@ def configure_case_environment(case_name: str, args: argparse.Namespace) -> None
     os.environ["VLLM_INFINICORE_ENABLE_PATCHES"] = str(spec["patches"])
 
     routes = spec["routes"]
-    if case_name == "custom-graph":
+    if case_name.startswith("custom-"):
         routes = args.custom_routes
     if routes:
         os.environ["VLLM_INFINICORE_ROUTES"] = str(routes)
@@ -144,7 +153,7 @@ def configure_case_environment(case_name: str, args: argparse.Namespace) -> None
         os.environ.pop("VLLM_INFINICORE_ROUTES", None)
 
     force_native = spec["force_native_fallback"]
-    if case_name == "custom-graph":
+    if case_name.startswith("custom-"):
         force_native = "1" if args.force_native_fallback else "0"
     os.environ["VLLM_INFINICORE_FORCE_NATIVE_FALLBACK"] = str(force_native)
 
@@ -211,13 +220,18 @@ def make_compilation_config() -> dict[str, Any]:
     }
 
 
-def make_llm(args: argparse.Namespace, compilation_config: dict[str, Any]) -> Any:
+def make_llm(
+    args: argparse.Namespace,
+    compilation_config: dict[str, Any],
+    *,
+    enforce_eager: bool,
+) -> Any:
     from vllm import LLM
 
     return LLM(
         model=args.model,
         trust_remote_code=args.trust_remote_code,
-        enforce_eager=False,
+        enforce_eager=enforce_eager,
         compilation_config=compilation_config,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
@@ -325,21 +339,23 @@ def run_single_case(args: argparse.Namespace) -> int:
     registration = vllm_infinicore.register()
     prompt_ids, prompt_json = load_or_create_prompt_ids(args)
     sampling_params = make_sampling_params(args.output_len)
+    enforce_eager = bool(CASE_SPECS[args.single_case].get("enforce_eager", False))
     compilation_config = make_compilation_config()
-    llm = make_llm(args, compilation_config)
+    llm = make_llm(args, compilation_config, enforce_eager=enforce_eager)
 
     warmup_iterations = 0 if args.skip_warmup else args.warmup
     for _ in range(warmup_iterations):
         run_generation(llm, prompt_ids, sampling_params)
 
+    _reset_infinicore_backend_counts()
     raw_measurements: list[tuple[Any, float]] = []
     for _ in range(args.repeats):
         raw_measurements.append(run_generation(llm, prompt_ids, sampling_params))
 
     graph_capture_count = _read_vllm_graph_capture_count()
     graph_evidence = GraphEvidence.from_compilation_config(
-        _artifact_compilation_config(),
-        enforce_eager=False,
+        _artifact_compilation_config(enforce_eager=enforce_eager),
+        enforce_eager=enforce_eager,
         evidence_strings=(f"num_cudagraph_captured={graph_capture_count}",),
     )
     extra_errors = []
@@ -389,10 +405,12 @@ def run_single_case(args: argparse.Namespace) -> int:
             "max_tokens": args.output_len,
             "ignore_eos": True,
         },
-        "compilation_config": _artifact_compilation_config(),
+        "compilation_config": _artifact_compilation_config(enforce_eager=enforce_eager),
         "graph_capture_count": graph_capture_count,
         "graph_evidence": graph_evidence.as_dict(),
         "registration": _registration_as_dict(registration),
+        "infinicore_backend_call_counts": _infinicore_backend_call_counts(),
+        "infinicore_attention_route_counts": _infinicore_attention_route_counts(),
         "measurements": measurements,
         "first_decoded_preview": (
             measurements[0]["decoded_preview"] if measurements else ""
@@ -471,13 +489,21 @@ def _registration_as_dict(registration: Any) -> dict[str, Any]:
     }
 
 
-def _artifact_compilation_config() -> dict[str, Any]:
+def _artifact_compilation_config(*, enforce_eager: bool = False) -> dict[str, Any]:
+    if enforce_eager:
+        return {
+            "cudagraph_mode": "NONE",
+            "cudagraph_capture_sizes": [],
+            "cudagraph_num_of_warmups": 0,
+            "backend": "eager",
+            "enforce_eager": True,
+        }
     return {
         "cudagraph_mode": "PIECEWISE",
         "cudagraph_capture_sizes": [1, 2, 4, 8],
         "cudagraph_num_of_warmups": 1,
         "backend": "eager",
-        "enforce_eager": False,
+        "enforce_eager": enforce_eager,
     }
 
 
@@ -487,6 +513,32 @@ def _read_vllm_graph_capture_count() -> int:
     except Exception:
         return 0
     return int(getattr(compilation_counter, "num_cudagraph_captured", 0))
+
+
+def _reset_infinicore_backend_counts() -> None:
+    try:
+        from vllm_infinicore.ops import infinicore_backend
+        from vllm_infinicore.ops import vllm_attention
+    except Exception:
+        return
+    infinicore_backend.reset_backend_call_counts()
+    vllm_attention.reset_attention_route_counts()
+
+
+def _infinicore_backend_call_counts() -> dict[str, int]:
+    try:
+        from vllm_infinicore.ops import infinicore_backend
+    except Exception:
+        return {}
+    return infinicore_backend.backend_call_counts()
+
+
+def _infinicore_attention_route_counts() -> dict[str, int]:
+    try:
+        from vllm_infinicore.ops import vllm_attention
+    except Exception:
+        return {}
+    return vllm_attention.attention_route_counts()
 
 
 def _child_command(

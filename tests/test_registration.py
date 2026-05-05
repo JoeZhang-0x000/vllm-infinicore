@@ -79,6 +79,42 @@ class RegistrationTests(unittest.TestCase):
         self.assertIsNone(result.failure_reason)
         self.assertEqual(calls, ["RMSNorm"])
 
+    def test_route_selector_expands_throughput_profile(self) -> None:
+        calls: list[str] = []
+
+        def make_installer(route_name: str):
+            def install() -> PatchInstallResult:
+                calls.append(route_name)
+                return PatchInstallResult(installed=True, reason="installed")
+
+            return install
+
+        registry = PatchRegistry(
+            QWEN3_OPERATOR_ROUTES,
+            installers={
+                "RMSNorm": make_installer("RMSNorm"),
+                "SiluAndMul": make_installer("SiluAndMul"),
+                "Embedding": make_installer("Embedding"),
+            },
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VLLM_INFINICORE_ENABLE_PATCHES": "1",
+                "VLLM_INFINICORE_ROUTES": "throughput",
+                ROUTE_DISABLE_ENV: "",
+                FORCE_NATIVE_FALLBACK_ENV: "0",
+            },
+        ):
+            result = registry.register_from_environment()
+
+        self.assertTrue(result.patching_enabled)
+        self.assertEqual(result.requested_routes, ("RMSNorm", "SiluAndMul", "Embedding"))
+        self.assertEqual(result.installed_routes, ("RMSNorm", "SiluAndMul", "Embedding"))
+        self.assertEqual(result.skipped_routes, ())
+        self.assertIsNone(result.failure_reason)
+        self.assertEqual(calls, ["RMSNorm", "SiluAndMul", "Embedding"])
+
     def test_all_routes_can_force_native_fallback(self) -> None:
         registry = PatchRegistry(
             QWEN3_OPERATOR_ROUTES,

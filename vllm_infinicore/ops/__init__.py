@@ -1,19 +1,41 @@
-"""Interfaces for future InfiniCore-backed PyTorch custom ops."""
+"""Interfaces for InfiniCore-backed PyTorch custom op wrappers."""
 
 from .custom_ops import (
+    ALL_CUSTOM_OPS,
     CUSTOM_OP_ENABLE_ENV,
+    EMBEDDING_OP,
+    LINEAR_OP,
+    LM_HEAD_OP,
     RMS_NORM_OP,
+    ROTARY_EMBEDDING_OP,
+    SILU_AND_MUL_OP,
     CustomOpStatus,
+    embedding,
     is_available,
+    linear,
     load_custom_ops,
+    lm_head,
     rms_norm,
+    rotary_embedding,
+    silu_and_mul,
 )
 
 __all__ = [
+    "ALL_CUSTOM_OPS",
     "CUSTOM_OP_ENABLE_ENV",
+    "EMBEDDING_OP",
+    "LINEAR_OP",
+    "LM_HEAD_OP",
     "RMS_NORM_OP",
+    "ROTARY_EMBEDDING_OP",
+    "SILU_AND_MUL_OP",
     "CustomOpStatus",
+    "embedding",
     "is_available",
+    "linear",
     "load_custom_ops",
+    "lm_head",
     "rms_norm",
+    "rotary_embedding",
+    "silu_and_mul",
 ]

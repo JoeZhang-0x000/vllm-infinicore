@@ -18,6 +18,8 @@ ROUTE_DISABLE_ENV = "VLLM_INFINICORE_DISABLED_ROUTES"
 FORCE_NATIVE_FALLBACK_ENV = "VLLM_INFINICORE_FORCE_NATIVE_FALLBACK"
 
 ALL_ROUTES_TOKEN = "all"
+THROUGHPUT_ROUTES_TOKEN = "throughput"
+THROUGHPUT_ROUTE_NAMES = ("RMSNorm", "SiluAndMul", "Embedding")
 ROUTE_STATE_DISABLED = "disabled"
 ROUTE_STATE_INSTALLED = "installed"
 ROUTE_STATE_NATIVE_FALLBACK = "native_fallback"
@@ -131,49 +133,49 @@ QWEN3_OPERATOR_ROUTES: tuple[OperatorRoute, ...] = (
         category="normalization",
         implementation="torch_custom_op",
         default_enabled=False,
-        graph_policy="requires_explicit_graph_safety_proof",
+        graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM RMSNorm forward_native",
-        validation="unit_numeric_compare; qwen3_exact_token_smoke",
-        notes="First non-PA candidate for a C++ PyTorch custom op.",
+        validation="unit_numeric_compare; qwen3_exact_token_smoke; graph_smoke",
+        notes="InfiniCore-backed OOT RMSNorm route.",
     ),
     OperatorRoute(
         name="SiluAndMul",
         category="mlp",
         implementation="torch_custom_op",
         default_enabled=False,
-        graph_policy="requires_explicit_graph_safety_proof",
+        graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native SiluAndMul activation",
-        validation="qwen3_exact_token_smoke before any route enablement",
-        notes="Candidate for a fused activation custom op.",
+        validation="qwen3_exact_token_smoke and graph_smoke",
+        notes="InfiniCore swiglu-backed fused activation route.",
     ),
     OperatorRoute(
         name="RoPE",
         category="attention",
         implementation="torch_custom_op",
         default_enabled=False,
-        graph_policy="requires_explicit_graph_safety_proof",
+        graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native rotary embedding",
         validation="qwen3_exact_token_smoke and graph evidence",
-        notes="Keep tensor views and shape metadata stable before enabling graph.",
+        notes="InfiniCore RoPE route with stream-bridge graph validation.",
     ),
     OperatorRoute(
         name="Embedding",
         category="embedding",
         implementation="torch_custom_op",
         default_enabled=False,
-        graph_policy="avoid_from_blob_or_from_torch_inside_capture",
+        graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native token embedding",
         validation="qwen3_exact_token_smoke and graph capture probe",
-        notes="Known graph-sensitive area from prior experiments.",
+        notes="InfiniCore embedding route with stream-bridge graph validation.",
     ),
     OperatorRoute(
         name="MatMul",
         category="linear",
         implementation="torch_custom_op",
         default_enabled=False,
-        graph_policy="requires_explicit_graph_safety_proof",
+        graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native linear layers",
-        validation="operator numeric compare and qwen3_exact_token_smoke",
+        validation="operator numeric compare; qwen3_exact_token_smoke; graph_smoke",
         notes="Covers QKV, gate/up, down, and output projection candidates.",
     ),
     OperatorRoute(
@@ -181,40 +183,40 @@ QWEN3_OPERATOR_ROUTES: tuple[OperatorRoute, ...] = (
         category="linear",
         implementation="torch_custom_op",
         default_enabled=False,
-        graph_policy="requires_explicit_graph_safety_proof",
+        graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native LMHead/logits projection",
-        validation="logits numeric compare and qwen3_exact_token_smoke",
+        validation="logits numeric compare; qwen3_exact_token_smoke; graph_smoke",
         notes="Separate route name for final logits projection accounting.",
     ),
     OperatorRoute(
         name="StoreKVCache",
         category="kv-cache",
-        implementation="deferred_pa_kv",
+        implementation="infinicore_attention_backend",
         default_enabled=False,
-        graph_policy="deferred_no_explicit_graph_path",
+        graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native KV cache store path",
-        validation="descriptor dump plus qwen3_exact_token_smoke",
-        notes="KV descriptor stability needs a dedicated phase.",
+        validation="attention probe; qwen3_exact_token_smoke; graph_smoke",
+        notes="Patches attention backend KV update to InfiniCore paged_caching.",
     ),
     OperatorRoute(
         name="PagedAttentionPrefill",
         category="paged-attention",
-        implementation="deferred_pa_kv",
+        implementation="infinicore_attention_backend",
         default_enabled=False,
-        graph_policy="deferred_keep_native_vllm_cudagraph_baseline",
+        graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native paged attention prefill backend",
-        validation="attention output compare, descriptor dump, graph evidence",
-        notes="FA2/PA path requires separate correctness and graph validation.",
+        validation="attention output compare; qwen3_exact_token_smoke; graph evidence",
+        notes="Patches attention backend prefill path to InfiniCore paged_attention_prefill.",
     ),
     OperatorRoute(
         name="PagedAttentionDecode",
         category="paged-attention",
-        implementation="deferred_pa_kv",
+        implementation="infinicore_attention_backend",
         default_enabled=False,
-        graph_policy="deferred_keep_native_vllm_cudagraph_baseline",
+        graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native paged attention decode backend",
-        validation="decode health, descriptor dump, graph evidence",
-        notes="Decode path is performance critical but not enabled by default.",
+        validation="decode health; qwen3_exact_token_smoke; graph evidence",
+        notes="Patches attention backend decode path to InfiniCore paged_attention.",
     ),
 )
 
@@ -562,11 +564,113 @@ def _uninstall_rms_norm_route() -> PatchUninstallResult:
     return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
 
 
+def _install_silu_and_mul_route() -> PatchInstallResult:
+    from .ops.vllm_silu_and_mul import install_vllm_silu_and_mul_oot
+
+    status = install_vllm_silu_and_mul_oot()
+    return PatchInstallResult(installed=status.installed, reason=status.reason)
+
+
+def _uninstall_silu_and_mul_route() -> PatchUninstallResult:
+    from .ops.vllm_silu_and_mul import uninstall_vllm_silu_and_mul_oot
+
+    status = uninstall_vllm_silu_and_mul_oot()
+    return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
+
+
+def _install_rotary_embedding_route() -> PatchInstallResult:
+    from .ops.vllm_rotary_embedding import install_vllm_rotary_embedding_oot
+
+    status = install_vllm_rotary_embedding_oot()
+    return PatchInstallResult(installed=status.installed, reason=status.reason)
+
+
+def _uninstall_rotary_embedding_route() -> PatchUninstallResult:
+    from .ops.vllm_rotary_embedding import uninstall_vllm_rotary_embedding_oot
+
+    status = uninstall_vllm_rotary_embedding_oot()
+    return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
+
+
+def _install_embedding_route() -> PatchInstallResult:
+    from .ops.vllm_embedding import install_vllm_unquantized_embedding_route
+
+    status = install_vllm_unquantized_embedding_route()
+    return PatchInstallResult(installed=status.installed, reason=status.reason)
+
+
+def _uninstall_embedding_route() -> PatchUninstallResult:
+    from .ops.vllm_embedding import uninstall_vllm_unquantized_embedding_route
+
+    status = uninstall_vllm_unquantized_embedding_route()
+    return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
+
+
+def _make_linear_installer(route_name: str) -> PatchInstaller:
+    def installer() -> PatchInstallResult:
+        from .ops.vllm_linear import install_vllm_unquantized_linear_route
+
+        status = install_vllm_unquantized_linear_route(route_name)
+        return PatchInstallResult(installed=status.installed, reason=status.reason)
+
+    return installer
+
+
+def _make_linear_uninstaller(route_name: str) -> PatchUninstaller:
+    def uninstaller() -> PatchUninstallResult:
+        from .ops.vllm_linear import uninstall_vllm_unquantized_linear_route
+
+        status = uninstall_vllm_unquantized_linear_route(route_name)
+        return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
+
+    return uninstaller
+
+
+def _make_attention_installer(route_name: str) -> PatchInstaller:
+    def installer() -> PatchInstallResult:
+        from .ops.vllm_attention import install_vllm_attention_route
+
+        status = install_vllm_attention_route(route_name)
+        return PatchInstallResult(installed=status.installed, reason=status.reason)
+
+    return installer
+
+
+def _make_attention_uninstaller(route_name: str) -> PatchUninstaller:
+    def uninstaller() -> PatchUninstallResult:
+        from .ops.vllm_attention import uninstall_vllm_attention_route
+
+        status = uninstall_vllm_attention_route(route_name)
+        return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
+
+    return uninstaller
+
+
 _DEFAULT_INSTALLERS: Mapping[str, PatchInstaller] = MappingProxyType(
-    {"RMSNorm": _install_rms_norm_route}
+    {
+        "RMSNorm": _install_rms_norm_route,
+        "SiluAndMul": _install_silu_and_mul_route,
+        "RoPE": _install_rotary_embedding_route,
+        "Embedding": _install_embedding_route,
+        "MatMul": _make_linear_installer("MatMul"),
+        "LMHead": _make_linear_installer("LMHead"),
+        "StoreKVCache": _make_attention_installer("StoreKVCache"),
+        "PagedAttentionPrefill": _make_attention_installer("PagedAttentionPrefill"),
+        "PagedAttentionDecode": _make_attention_installer("PagedAttentionDecode"),
+    }
 )
 _DEFAULT_UNINSTALLERS: Mapping[str, PatchUninstaller] = MappingProxyType(
-    {"RMSNorm": _uninstall_rms_norm_route}
+    {
+        "RMSNorm": _uninstall_rms_norm_route,
+        "SiluAndMul": _uninstall_silu_and_mul_route,
+        "RoPE": _uninstall_rotary_embedding_route,
+        "Embedding": _uninstall_embedding_route,
+        "MatMul": _make_linear_uninstaller("MatMul"),
+        "LMHead": _make_linear_uninstaller("LMHead"),
+        "StoreKVCache": _make_attention_uninstaller("StoreKVCache"),
+        "PagedAttentionPrefill": _make_attention_uninstaller("PagedAttentionPrefill"),
+        "PagedAttentionDecode": _make_attention_uninstaller("PagedAttentionDecode"),
+    }
 )
 
 
@@ -586,8 +690,15 @@ def _parse_route_names(
         route_name = raw_name.strip()
         if not route_name:
             continue
-        if route_name.lower() == ALL_ROUTES_TOKEN and available_routes:
-            for available_route in available_routes:
+        route_token = route_name.lower()
+        if route_token == ALL_ROUTES_TOKEN and available_routes:
+            expanded_routes = available_routes
+        elif route_token == THROUGHPUT_ROUTES_TOKEN:
+            expanded_routes = THROUGHPUT_ROUTE_NAMES
+        else:
+            expanded_routes = ()
+        if expanded_routes:
+            for available_route in expanded_routes:
                 if available_route not in seen:
                     seen.add(available_route)
                     route_names.append(available_route)

@@ -9,3 +9,7 @@ __pycache__/
 build/
 dist/
 tmp/
+artifacts/perf-ablate-*/
+artifacts/qwen3-8b-*/
+artifacts/qwen3-three-engine-smoke-*/
+artifacts/qwen3_128_32_*strict*.json
