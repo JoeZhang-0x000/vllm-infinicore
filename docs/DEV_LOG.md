@@ -381,3 +381,232 @@ python scripts/qwen3_three_engine_throughput.py \
 All three cases produced `12288` measured output tokens with
 `validation_errors=[]`. The vLLM-InfiniCore result installed
 `RMSNorm,SiluAndMul,Embedding` and no native fallback routes.
+
+## 2026-05-05 InfiniLM vs vLLM Native Reason Analysis
+
+Added `docs/INFINILM_VS_VLLM_REASON.md` to document the current evidence for
+why InfiniLM can beat vLLM native in long-output Qwen3-8B graph runs.
+
+Output length sweep at `bs=8`, `input_len=4096`, graph mode:
+
+| Output length | InfiniLM TPS | vLLM native TPS | Faster engine |
+|---:|---:|---:|---|
+| 32 | 55.94 | 69.30 | vLLM native |
+| 128 | 157.30 | 175.60 | vLLM native |
+| 512 | 288.05 | 282.72 | InfiniLM |
+| 1024 | 332.96 | 311.57 | InfiniLM |
+
+Linear fit of average iteration time against output length:
+
+| Engine | Fixed cost / iteration | Decode step cost | Steady decode TPS at bs=8 |
+|---|---:|---:|---:|
+| InfiniLM | 3.919 s | 20.184 ms/token-step | 396.35 tok/s |
+| vLLM native | 2.916 s | 22.784 ms/token-step | 351.12 tok/s |
+
+Conclusion: InfiniLM's long-output advantage comes from lower steady-state
+decode-loop cost, not lower fixed/prefill overhead. vLLM native has lower fixed
+cost and wins at short outputs, but InfiniLM's per-step decode cost is lower
+once output length is high enough to amortize its fixed cost. A vLLM native
+control run with `detokenize=False` did not improve throughput (`282.98` tok/s
+vs `283.61` tok/s with detokenize), so text decoding is not the cause.
+
+## 2026-05-05 InfiniCore Attention Backend First Cut
+
+Moved the InfiniCore attention/KV integration from the old method-patch layer
+to a vLLM attention backend override:
+
+- Added `vllm_infinicore.ops.vllm_attention_backend`.
+- Attention routes now register
+  `InfiniCoreFlashAttentionBackend` as vLLM's `FLASH_ATTN` backend.
+- The installer wraps MetaX `register_attention_backends()` so MetaX can refresh
+  its backend table first, then InfiniCore re-applies its `FLASH_ATTN` override.
+- The backend reuses the platform FlashAttention metadata builder and KV cache
+  layout, while `InfiniCoreFlashAttentionImpl` routes supported KV update,
+  prefill, and decode calls through `infinicore_backend`.
+- The old `vllm_attention.py` monkey-patch module is no longer used by the
+  attention route installer.
+
+Validation:
+
+- `python -m compileall vllm_infinicore scripts tests`
+- `python -m unittest discover -s tests` (`26` tests passed, `2` skipped)
+- Registration test confirms `AttentionBackendEnum.FLASH_ATTN.get_path()` is
+  `vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`.
+- Runtime introspection confirmed the earlier issue where MetaX re-registered
+  `FLASH_ATTN` after plugin registration; the installer now wraps the MetaX
+  registration hook to keep the InfiniCore backend selected.
+- Eager Qwen3-8B `128/32` attention-backend smoke:
+  `artifacts/attention_backend_custom_eager_128_32_v3.json`
+  - `vllm_attention_backend`:
+    `vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`
+  - backend `_infinicore` calls:
+    `store_kv_cache=1152`, `paged_attention_prefill=36`,
+    `paged_attention_decode=1116`
+  - backend route counters:
+    `backend_kv_update_infinicore=1152`,
+    `backend_prefill_infinicore=36`,
+    `backend_decode_infinicore=1116`
+  - `validation_errors=[]`
+- Graph Qwen3-8B `bs=2`, `128/32` attention-backend smoke:
+  `artifacts/attention-backend-smoke-bs2-in128-out32-v3`
+  - `vllm_attention_backend`:
+    `vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`
+  - backend `_infinicore` calls:
+    `store_kv_cache=36`, `paged_attention_decode=1116`
+  - `graph_capture_count=148`
+  - `validation_errors=[]`
+
+Current limitation: in the graph smoke, the prefill attention forward still
+falls back to the platform backend (`backend_forward_fallback=36`). Eager mode
+exercises InfiniCore prefill correctly. The next performance step is to make
+the graph prefill metadata path satisfy the InfiniCore backend's supported
+descriptor contract and then re-benchmark long decode.
+
+Follow-up throughput check at the requested production shape (`bs=8`,
+`input_len=4096`, `output_len=512`, graph mode, `warmup=1`, `repeats=3`):
+
+```bash
+python scripts/qwen3_three_engine_throughput.py \
+  --engines vllm-native,vllm-infinicore \
+  --batch-size 8 \
+  --input-len 4096 \
+  --output-len 512 \
+  --warmup 1 \
+  --repeats 3 \
+  --max-model-len 5120 \
+  --infinicore-routes StoreKVCache,PagedAttentionPrefill,PagedAttentionDecode \
+  --run-dir artifacts/attention-backend-vs-native-bs8-in4096-out512-graph-20260505-135727
+```
+
+| Engine | Attention backend | Valid | Output TPS | Graph captures |
+|---|---|---:|---:|---:|
+| vLLM native | `vllm_metax...MacaFlashAttentionBackend` | true | 280.99 | 148 |
+| vLLM-InfiniCore | `vllm_infinicore...InfiniCoreFlashAttentionBackend` | true | 44.93 | 148 |
+
+The vLLM-InfiniCore run installed only the three attention/KV routes and
+recorded nonzero backend `_infinicore` calls:
+`store_kv_cache=540`, `paged_attention_prefill=540`, and
+`paged_attention_decode=55620`. This confirms the backend override is active,
+but performance is still approximately `6.25x` slower than vLLM native. The
+remaining bottleneck is therefore not the old monkey-patch dispatch itself; it
+is the per-token/layer InfiniCore attention backend path, especially decode,
+still executing too many Python/backend descriptor/stream-bridge calls.
+
+## 2026-05-05 Attention Gap Isolation And Throughput-Safe Profile
+
+Added a small InfiniCore tensor-wrapper LRU cache for stable attention metadata
+and KV cache views. Validation:
+
+- `python -m compileall vllm_infinicore scripts tests`
+- `python -m unittest discover -s tests` (`28` tests passed, `2` skipped)
+- `git diff --check`
+- Added unit coverage for wrapper cache reuse and stride-sensitive keys.
+
+The cache did not materially improve the slow attention profile. A broader
+q/out wrapper cache was rejected because it caused CUDA OOM at the Qwen3
+benchmark shape by retaining activation buffers.
+
+Route isolation at `bs=8`, `input_len=4096`, `output_len=128`, graph mode:
+
+| Routes | Valid | Output TPS | Artifact |
+|---|---:|---:|---|
+| `StoreKVCache,PagedAttentionPrefill,PagedAttentionDecode` | true | 17.90 | `artifacts/attention-wrapper-cache-bs8-in4096-out128-graph-20260505-142100` |
+| `StoreKVCache,PagedAttentionPrefill` | true | 60.84 | `artifacts/attention-no-decode-bs8-in4096-out128-graph-20260505-142722` |
+| `PagedAttentionPrefill` | true | 61.65 | `artifacts/attention-prefill-only-bs8-in4096-out128-graph-20260505-143036` |
+| `StoreKVCache` | true | 168.66 | `artifacts/attention-storekv-only-bs8-in4096-out128-graph-20260505-142918` |
+
+Conclusion: `StoreKVCache` is acceptable for the current throughput profile;
+`PagedAttentionPrefill` and `PagedAttentionDecode` are the performance-risk
+routes. They remain available for correctness/operator coverage, but should not
+be used for throughput comparisons until the underlying PA kernels or call
+granularity are redesigned.
+
+Implemented `VLLM_INFINICORE_ROUTES=attention-safe`, expanding to
+`StoreKVCache`, and updated tests for the alias. The current throughput-safe
+configuration is:
+
+```text
+VLLM_INFINICORE_ROUTES=throughput,attention-safe
+```
+
+Formal graph benchmark at `bs=8`, `input_len=4096`, `output_len=512`,
+`warmup=1`, `repeats=3`:
+
+| Engine/routes | Valid | Output TPS | Median iter TPS | Graph captures |
+|---|---:|---:|---:|---:|
+| vLLM native | true | 286.55 | 286.46 | 148 |
+| vLLM-InfiniCore `throughput,attention-safe` | true | 267.32 | 267.31 | 148 |
+
+Artifact:
+`artifacts/throughput-attention-safe-vs-native-bs8-in4096-out512-graph-20260505-143335`.
+The throughput-safe plugin profile is now `93.3%` of vLLM native graph
+throughput on this benchmark.
+
+Requirement correction: this isolation profile is not an acceptable fix when
+the target is that every scoped called operator routes through InfiniCore. The
+benchmark script default was changed back to `VLLM_INFINICORE_ROUTES=all`, and
+the `attention-safe` selector was removed. The isolation results above remain
+diagnostic evidence only: they show that the remaining work is to improve the
+InfiniCore `PagedAttentionPrefill`/`PagedAttentionDecode` paths rather than
+bypassing them.
+
+Reran the requested all-scoped-operator benchmark after the correction:
+
+```bash
+python scripts/qwen3_three_engine_throughput.py \
+  --engines vllm-native,vllm-infinicore \
+  --batch-size 8 \
+  --input-len 4096 \
+  --output-len 512 \
+  --warmup 1 \
+  --repeats 3 \
+  --max-model-len 5120 \
+  --infinicore-routes all \
+  --run-dir artifacts/all-routes-vs-native-bs8-in4096-out512-graph-20260505-150547
+```
+
+| Engine/routes | Valid | Output TPS | Median iter TPS | Graph captures |
+|---|---:|---:|---:|---:|
+| vLLM native | true | 282.96 | 282.92 | 148 |
+| vLLM-InfiniCore `all` | true | 43.17 | 43.18 | 148 |
+
+The vLLM-InfiniCore run installed all nine scoped routes:
+`RMSNorm,SiluAndMul,RoPE,Embedding,MatMul,LMHead,StoreKVCache,`
+`PagedAttentionPrefill,PagedAttentionDecode`. Runtime counters were nonzero
+for every scoped route family: `embedding=15`, `rms_norm=1095`, `linear=2160`,
+`rotary_embedding=540`, `store_kv_cache=540`,
+`paged_attention_prefill=540`, `silu_and_mul=540`, `lm_head=1548`, and
+`paged_attention_decode=55620`. The all-route performance gap remains open.
+
+Follow-up: switched the PA routes to the FlashAttention-wrapped InfiniCore
+operators used by InfiniLM's `FlashAttentionImpl`:
+
+- `PagedAttentionPrefill`: `infinicore.paged_attention_prefill` ->
+  `infinicore.mha_varlen`
+- `PagedAttentionDecode`: `infinicore.paged_attention` ->
+  `infinicore.mha_kvcache`
+- KV cache views are presented in BSHD layout for these FA wrapper calls.
+
+Validation:
+
+- `python -m compileall vllm_infinicore scripts tests`
+- `python -m unittest discover -s tests` (`28` tests passed, `2` skipped)
+- Qwen3-8B all-routes graph smoke:
+  `artifacts/qwen3_128_32_all_routes_mha_fa_graph.json`
+  with `validation_errors=[]`
+- Short all-routes throughput at `bs=8`, `input_len=4096`,
+  `output_len=128`: `127.50` output tok/s,
+  artifact `artifacts/all-routes-mha-fa-bs8-in4096-out128-graph-20260505-155737`
+
+Formal all-routes graph benchmark after the FA wrapper switch:
+
+| Engine/routes | Valid | Output TPS | Median iter TPS | Graph captures |
+|---|---:|---:|---:|---:|
+| vLLM native | true | 283.00 | 283.04 | 148 |
+| vLLM-InfiniCore `all` | true | 211.73 | 211.59 | 148 |
+
+Artifact:
+`artifacts/all-routes-mha-fa-vs-native-bs8-in4096-out512-graph-20260505-155903`.
+All nine scoped routes were still installed, and runtime counters remained
+nonzero for every route family. The full-route profile improved from `43.17`
+to `211.73` output tok/s, reaching `74.8%` of vLLM native graph throughput.

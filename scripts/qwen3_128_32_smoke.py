@@ -411,6 +411,8 @@ def run_single_case(args: argparse.Namespace) -> int:
         "registration": _registration_as_dict(registration),
         "infinicore_backend_call_counts": _infinicore_backend_call_counts(),
         "infinicore_attention_route_counts": _infinicore_attention_route_counts(),
+        "infinicore_attention_backend_route_counts": _infinicore_attention_backend_route_counts(),
+        "vllm_attention_backend": _vllm_attention_backend_path(),
         "measurements": measurements,
         "first_decoded_preview": (
             measurements[0]["decoded_preview"] if measurements else ""
@@ -519,10 +521,12 @@ def _reset_infinicore_backend_counts() -> None:
     try:
         from vllm_infinicore.ops import infinicore_backend
         from vllm_infinicore.ops import vllm_attention
+        from vllm_infinicore.ops import vllm_attention_backend
     except Exception:
         return
     infinicore_backend.reset_backend_call_counts()
     vllm_attention.reset_attention_route_counts()
+    vllm_attention_backend.reset_attention_backend_route_counts()
 
 
 def _infinicore_backend_call_counts() -> dict[str, int]:
@@ -539,6 +543,25 @@ def _infinicore_attention_route_counts() -> dict[str, int]:
     except Exception:
         return {}
     return vllm_attention.attention_route_counts()
+
+
+def _infinicore_attention_backend_route_counts() -> dict[str, int]:
+    try:
+        from vllm_infinicore.ops import vllm_attention_backend
+    except Exception:
+        return {}
+    return vllm_attention_backend.attention_backend_route_counts()
+
+
+def _vllm_attention_backend_path() -> str:
+    try:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    except Exception:
+        return ""
+    try:
+        return AttentionBackendEnum.FLASH_ATTN.get_path()
+    except Exception:
+        return ""
 
 
 def _child_command(

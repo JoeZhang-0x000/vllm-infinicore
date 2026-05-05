@@ -138,19 +138,70 @@ Before any route can be enabled by default, it needs:
 
 ## Throughput Route Policy
 
-For current graph-mode throughput runs, use the throughput-oriented
+For current graph-mode all-operator throughput runs, use the full
 vLLM-InfiniCore route profile:
 
 ```text
-VLLM_INFINICORE_ROUTES=throughput
+VLLM_INFINICORE_ROUTES=all
 ```
 
-This expands to `RMSNorm,SiluAndMul,Embedding`.
+This expands to all nine scoped Qwen3 routes:
+`RMSNorm,SiluAndMul,RoPE,Embedding,MatMul,LMHead,StoreKVCache,`
+`PagedAttentionPrefill,PagedAttentionDecode`.
 
-The full nine-route set remains valid for correctness and operator-coverage
-checks, but it is not the throughput configuration. The current bottleneck is
-the attention/KV route group (`StoreKVCache`, `PagedAttentionPrefill`,
-`PagedAttentionDecode`): at `bs=8`, `input_len=4096`, `output_len=512`, graph
-mode, all nine routes measured `43.20` output tok/s, while
-`RMSNorm,SiluAndMul,Embedding` measured `268.21` output tok/s with
-`validation_errors=[]` and `148` graph captures.
+Isolation data remains useful for diagnosis only. It must not be used as the
+delivery configuration when the requirement is that every scoped called
+operator routes through InfiniCore. The current bottleneck is the
+paged-attention kernel pair, not KV cache update. Isolation at `bs=8`,
+`input_len=4096`, `output_len=128`, graph mode showed:
+
+| Routes | Output TPS | Artifact |
+|---|---:|---|
+| `StoreKVCache,PagedAttentionPrefill,PagedAttentionDecode` | 17.90 | `artifacts/attention-wrapper-cache-bs8-in4096-out128-graph-20260505-142100` |
+| `StoreKVCache,PagedAttentionPrefill` | 60.84 | `artifacts/attention-no-decode-bs8-in4096-out128-graph-20260505-142722` |
+| `PagedAttentionPrefill` | 61.65 | `artifacts/attention-prefill-only-bs8-in4096-out128-graph-20260505-143036` |
+| `StoreKVCache` | 168.66 | `artifacts/attention-storekv-only-bs8-in4096-out128-graph-20260505-142918` |
+
+The latest full-route benchmark at `bs=8`, `input_len=4096`,
+`output_len=512`, graph mode was:
+
+| Engine/routes | Output TPS | Graph captures | Artifact |
+|---|---:|---:|---|
+| vLLM native | 283.00 | 148 | `artifacts/all-routes-mha-fa-vs-native-bs8-in4096-out512-graph-20260505-155903` |
+| vLLM-InfiniCore `all` | 211.73 | 148 | `artifacts/all-routes-mha-fa-vs-native-bs8-in4096-out512-graph-20260505-155903` |
+
+The `all` run installed all nine scoped routes and recorded nonzero InfiniCore
+calls for Embedding, RMSNorm, MatMul/Linear, RoPE, StoreKVCache,
+PagedAttentionPrefill, SiluAndMul, LMHead, and PagedAttentionDecode.
+`PagedAttentionPrefill` now dispatches to InfiniCore's FlashAttention-wrapped
+`mha_varlen`, and `PagedAttentionDecode` dispatches to `mha_kvcache`. This keeps
+the all-scoped-operators requirement while reducing the full-route result from
+`43.17` to `211.73` output tok/s at the production benchmark shape. The
+remaining gap is still open; bypassing `PagedAttentionPrefill`,
+`PagedAttentionDecode`, or `MatMul` is not an acceptable throughput fix under
+the all-scoped-operators requirement.
+
+## Attention Backend Status
+
+The attention/KV route group is now installed through a vLLM attention backend
+override rather than through per-method monkey patches. When these routes are
+requested, `FLASH_ATTN` is re-registered to:
+
+```text
+vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend
+```
+
+The implementation reuses the MetaX/vLLM FlashAttention metadata builder and
+KV-cache layout, then dispatches supported KV update, prefill, and decode paths
+to `_infinicore`. Current validation artifacts:
+
+- Eager `128/32` custom attention-backend smoke:
+  `artifacts/attention_backend_custom_eager_128_32_v3.json`
+- Graph `bs=2`, `128/32` attention-backend smoke:
+  `artifacts/attention-backend-smoke-bs2-in128-out32-v3`
+
+Eager validation shows backend-level nonzero calls for StoreKVCache,
+PagedAttentionPrefill, and PagedAttentionDecode. Graph validation shows
+backend-level nonzero calls for StoreKVCache and PagedAttentionDecode with
+`graph_capture_count=148`; the prefill forward in that graph smoke currently
+falls back to the platform backend and remains a follow-up item.

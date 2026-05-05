@@ -628,9 +628,9 @@ def _make_linear_uninstaller(route_name: str) -> PatchUninstaller:
 
 def _make_attention_installer(route_name: str) -> PatchInstaller:
     def installer() -> PatchInstallResult:
-        from .ops.vllm_attention import install_vllm_attention_route
+        from .ops.vllm_attention_backend import install_infinicore_attention_backend
 
-        status = install_vllm_attention_route(route_name)
+        status = install_infinicore_attention_backend(route_name)
         return PatchInstallResult(installed=status.installed, reason=status.reason)
 
     return installer
@@ -638,9 +638,9 @@ def _make_attention_installer(route_name: str) -> PatchInstaller:
 
 def _make_attention_uninstaller(route_name: str) -> PatchUninstaller:
     def uninstaller() -> PatchUninstallResult:
-        from .ops.vllm_attention import uninstall_vllm_attention_route
+        from .ops.vllm_attention_backend import uninstall_infinicore_attention_backend
 
-        status = uninstall_vllm_attention_route(route_name)
+        status = uninstall_infinicore_attention_backend(route_name)
         return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
 
     return uninstaller

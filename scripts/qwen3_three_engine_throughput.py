@@ -24,7 +24,7 @@ if str(ROOT) not in sys.path:
 DEFAULT_MODEL = "/mnt/geogpt-doc-new/default/xb/qwen3-8B"
 DEFAULT_INFINILM_ROOT = "/root/InfiniLM"
 ENGINES = ("infinilm", "vllm-native", "vllm-infinicore")
-DEFAULT_INFINICORE_THROUGHPUT_ROUTES = "throughput"
+DEFAULT_INFINICORE_THROUGHPUT_ROUTES = "all"
 
 
 def parse_args() -> argparse.Namespace:
@@ -378,6 +378,8 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
             "registration": _registration_dict(registration),
             "infinicore_backend_call_counts": _infinicore_backend_counts(),
             "infinicore_attention_route_counts": _infinicore_attention_counts(),
+            "infinicore_attention_backend_route_counts": _infinicore_attention_backend_counts(),
+            "vllm_attention_backend": _vllm_attention_backend_path(),
             "graph_capture_count": _vllm_graph_count(),
         }
     )
@@ -579,10 +581,15 @@ def _vllm_graph_count() -> int:
 
 def _reset_infinicore_counts() -> None:
     try:
-        from vllm_infinicore.ops import infinicore_backend, vllm_attention
+        from vllm_infinicore.ops import (
+            infinicore_backend,
+            vllm_attention,
+            vllm_attention_backend,
+        )
 
         infinicore_backend.reset_backend_call_counts()
         vllm_attention.reset_attention_route_counts()
+        vllm_attention_backend.reset_attention_backend_route_counts()
     except Exception:
         return
 
@@ -603,6 +610,24 @@ def _infinicore_attention_counts() -> dict[str, int]:
         return vllm_attention.attention_route_counts()
     except Exception:
         return {}
+
+
+def _infinicore_attention_backend_counts() -> dict[str, int]:
+    try:
+        from vllm_infinicore.ops import vllm_attention_backend
+
+        return vllm_attention_backend.attention_backend_route_counts()
+    except Exception:
+        return {}
+
+
+def _vllm_attention_backend_path() -> str:
+    try:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        return AttentionBackendEnum.FLASH_ATTN.get_path()
+    except Exception:
+        return ""
 
 
 def _result_line(result: dict[str, Any]) -> str:

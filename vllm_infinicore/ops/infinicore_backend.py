@@ -8,6 +8,7 @@ InfiniCore build is device-oriented and can crash on CPU ``from_torch`` paths.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import ctypes
 import logging
 import os
@@ -23,6 +24,8 @@ logger = logging.getLogger(__name__)
 _CALL_COUNTS: dict[str, int] = {}
 _PY_CAPSULE_GET_POINTER: Any | None = None
 _EXTERNAL_STREAMS: dict[int, torch.cuda.ExternalStream] = {}
+_INFINI_TENSOR_CACHE_MAX = 4096
+_INFINI_TENSOR_CACHE: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
 
 
 def rms_norm(input_tensor: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -191,6 +194,10 @@ def reset_backend_call_counts() -> None:
     _CALL_COUNTS.clear()
 
 
+def clear_tensor_wrapper_cache() -> None:
+    _INFINI_TENSOR_CACHE.clear()
+
+
 def paged_attention_prefill_infinicore_only(
     attn_impl: Any,
     query: torch.Tensor,
@@ -298,6 +305,12 @@ def _as_infini(tensor: torch.Tensor) -> Any:
     return infinicore.from_torch(tensor)
 
 
+def _as_infini_cached(tensor: torch.Tensor) -> Any:
+    if not tensor.is_contiguous():
+        return _as_infini(tensor)
+    return _cached_infini_tensor(("contiguous",) + _tensor_cache_key(tensor), tensor)
+
+
 def _as_infini_strided(tensor: torch.Tensor) -> Any:
     import infinicore
     from infinicore.tensor import to_infinicore_dtype
@@ -309,6 +322,37 @@ def _as_infini_strided(tensor: torch.Tensor) -> Any:
         list(tensor.stride()),
         dtype=to_infinicore_dtype(tensor.dtype),
         device=infinicore.device(tensor.device.type, device_index),
+    )
+
+
+def _as_infini_strided_cached(tensor: torch.Tensor) -> Any:
+    return _cached_infini_tensor(("strided",) + _tensor_cache_key(tensor), tensor)
+
+
+def _cached_infini_tensor(cache_key: tuple[Any, ...], tensor: torch.Tensor) -> Any:
+    cached = _INFINI_TENSOR_CACHE.get(cache_key)
+    if cached is not None:
+        _INFINI_TENSOR_CACHE.move_to_end(cache_key)
+        return cached
+
+    wrapped = _as_infini_strided(tensor)
+    # Keep the torch tensor/view alive for wrappers created from raw data_ptr.
+    wrapped._torch_ref = tensor
+    _INFINI_TENSOR_CACHE[cache_key] = wrapped
+    if len(_INFINI_TENSOR_CACHE) > _INFINI_TENSOR_CACHE_MAX:
+        _INFINI_TENSOR_CACHE.popitem(last=False)
+    return wrapped
+
+
+def _tensor_cache_key(tensor: torch.Tensor) -> tuple[Any, ...]:
+    device_index = tensor.device.index if tensor.device.index is not None else 0
+    return (
+        tensor.data_ptr(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+        tensor.device.type,
+        device_index,
     )
 
 
@@ -557,11 +601,23 @@ def _cache_views(kv_cache: torch.Tensor, key: torch.Tensor) -> tuple[Any, Any]:
     key_cache, value_cache = _split_kv_cache(kv_cache)
     num_kv_heads = key.shape[1]
     if key_cache.shape[1] == num_kv_heads:
-        return _as_infini_strided(key_cache), _as_infini_strided(value_cache)
+        return _as_infini_strided_cached(key_cache), _as_infini_strided_cached(value_cache)
     if key_cache.shape[2] == num_kv_heads:
-        return _as_infini_strided(key_cache.permute(0, 2, 1, 3)), _as_infini_strided(
-            value_cache.permute(0, 2, 1, 3)
-        )
+        return _as_infini_strided_cached(
+            key_cache.permute(0, 2, 1, 3)
+        ), _as_infini_strided_cached(value_cache.permute(0, 2, 1, 3))
+    raise RuntimeError(f"cannot infer KV cache layout from key={key.shape}, cache={kv_cache.shape}")
+
+
+def _cache_views_bshd(kv_cache: torch.Tensor, key: torch.Tensor) -> tuple[Any, Any]:
+    key_cache, value_cache = _split_kv_cache(kv_cache)
+    num_kv_heads = key.shape[1]
+    if key_cache.shape[1] == num_kv_heads:
+        return _as_infini_strided_cached(
+            key_cache.permute(0, 2, 1, 3)
+        ), _as_infini_strided_cached(value_cache.permute(0, 2, 1, 3))
+    if key_cache.shape[2] == num_kv_heads:
+        return _as_infini_strided_cached(key_cache), _as_infini_strided_cached(value_cache)
     raise RuntimeError(f"cannot infer KV cache layout from key={key.shape}, cache={kv_cache.shape}")
 
 
@@ -650,25 +706,34 @@ def _paged_attention_prefill_infinicore(
 ) -> None:
     import infinicore
 
-    key_cache, value_cache = _cache_views(kv_cache, key)
+    key_cache, value_cache = _cache_views_bshd(kv_cache, key)
     num_decode_tokens = int(getattr(attn_metadata, "num_decode_tokens", 0))
     num_actual_tokens = int(attn_metadata.num_actual_tokens)
     q = query[num_decode_tokens:num_actual_tokens]
     if q.numel() == 0:
         return
     out = output[num_decode_tokens:num_actual_tokens].view(q.shape)
-    total_lens = _prefill_total_lens(attn_metadata)
+    total_lens = getattr(attn_metadata, "cu_prefix_kv_lens", None)
+    if total_lens is None:
+        total_lens = _prefill_total_lens(attn_metadata)
+        total_lens = torch.nn.functional.pad(total_lens, (1, 0), value=0).cumsum(
+            dim=0, dtype=torch.int32
+        )
+    max_query_len = int(getattr(attn_metadata, "max_query_len", q.shape[0]))
+    max_seq_len = int(getattr(attn_metadata, "prefill_max_seq_len", max_query_len))
     alibi_slopes = attn_impl.alibi_slopes
     _run_on_infinicore_stream(
         query,
-        lambda: infinicore.paged_attention_prefill(
+        lambda: infinicore.mha_varlen(
             _as_infini(q),
             key_cache,
             value_cache,
-            _as_infini(attn_metadata.prefill_block_table),
-            _as_infini(total_lens),
-            _as_infini(attn_metadata.prefill_query_start_loc),
-            _as_infini(alibi_slopes) if alibi_slopes is not None else None,
+            _as_infini_cached(attn_metadata.prefill_query_start_loc),
+            _as_infini_cached(total_lens),
+            _as_infini_cached(attn_metadata.prefill_block_table),
+            max_query_len,
+            max_seq_len,
+            _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
             attn_impl.scale,
             out=_as_infini(out),
         ),
@@ -691,19 +756,20 @@ def _paged_attention_decode_infinicore(
         return
     if num_decode_tokens != num_decodes:
         raise RuntimeError("InfiniCore paged attention wrapper does not support speculative decode")
-    key_cache, value_cache = _cache_views(kv_cache, key)
+    key_cache, value_cache = _cache_views_bshd(kv_cache, key)
     q = query[:num_decode_tokens]
-    out = output[:num_decode_tokens].view(q.shape)
+    q_for_fa = q.view(num_decode_tokens, 1, q.shape[1], q.shape[2])
+    out = output[:num_decode_tokens].view(q_for_fa.shape)
     alibi_slopes = attn_impl.alibi_slopes
     _run_on_infinicore_stream(
         query,
-        lambda: infinicore.paged_attention(
-            _as_infini(q),
+        lambda: infinicore.mha_kvcache(
+            _as_infini(q_for_fa),
             key_cache,
             value_cache,
-            _as_infini(attn_metadata.decode_block_table),
-            _as_infini(attn_metadata.decode_seq_lens),
-            _as_infini(alibi_slopes) if alibi_slopes is not None else None,
+            _as_infini_cached(attn_metadata.decode_seq_lens),
+            _as_infini_cached(attn_metadata.decode_block_table),
+            _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
             attn_impl.scale,
             out=_as_infini(out),
         ),
@@ -739,10 +805,10 @@ def _paged_attention_decode_as_prefill_infinicore(
             _as_infini(q),
             key_cache,
             value_cache,
-            _as_infini(attn_metadata.decode_block_table[:1]),
-            _as_infini(total_lens),
-            _as_infini(query_start_loc),
-            _as_infini(alibi_slopes) if alibi_slopes is not None else None,
+            _as_infini_cached(attn_metadata.decode_block_table[:1]),
+            _as_infini_cached(total_lens),
+            _as_infini_cached(query_start_loc),
+            _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
             attn_impl.scale,
             out=_as_infini(out),
         ),

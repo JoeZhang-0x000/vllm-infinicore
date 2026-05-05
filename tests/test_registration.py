@@ -115,6 +115,37 @@ class RegistrationTests(unittest.TestCase):
         self.assertIsNone(result.failure_reason)
         self.assertEqual(calls, ["RMSNorm", "SiluAndMul", "Embedding"])
 
+    def test_attention_routes_register_backend_override(self) -> None:
+        try:
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        except Exception as exc:  # pragma: no cover - depends on vLLM install
+            self.skipTest(f"vLLM attention registry unavailable: {exc}")
+
+        AttentionBackendEnum.FLASH_ATTN.clear_override()
+        registry = PatchRegistry(QWEN3_OPERATOR_ROUTES)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VLLM_INFINICORE_ENABLE_PATCHES": "1",
+                "VLLM_INFINICORE_ROUTES": "StoreKVCache,PagedAttentionPrefill,PagedAttentionDecode",
+                ROUTE_DISABLE_ENV: "",
+                FORCE_NATIVE_FALLBACK_ENV: "0",
+            },
+        ):
+            result = registry.register_from_environment()
+
+        self.assertTrue(result.patching_enabled)
+        self.assertEqual(
+            result.installed_routes,
+            ("StoreKVCache", "PagedAttentionPrefill", "PagedAttentionDecode"),
+        )
+        self.assertTrue(AttentionBackendEnum.FLASH_ATTN.is_overridden())
+        self.assertEqual(
+            AttentionBackendEnum.FLASH_ATTN.get_path(),
+            "vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend",
+        )
+        AttentionBackendEnum.FLASH_ATTN.clear_override()
+
     def test_all_routes_can_force_native_fallback(self) -> None:
         registry = PatchRegistry(
             QWEN3_OPERATOR_ROUTES,

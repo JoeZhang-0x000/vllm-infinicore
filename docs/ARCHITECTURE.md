@@ -70,10 +70,11 @@ Current route implementation:
 - Embedding patches `UnquantizedEmbeddingMethod.embedding`.
 - MatMul patches `UnquantizedLinearMethod.apply`.
 - LMHead patches `UnquantizedEmbeddingMethod.apply` for `ParallelLMHead`.
-- StoreKVCache and PagedAttention patch backend implementation methods such as
-  `FlashAttentionImpl.do_kv_cache_update` and `FlashAttentionImpl.forward`,
-  not `Attention.forward`. This keeps vLLM's opaque attention custom op
-  boundary intact.
+- StoreKVCache and PagedAttention now use an attention-backend override:
+  `vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`
+  is registered as vLLM's `FLASH_ATTN` backend after the MetaX backend table is
+  refreshed. This keeps the implementation at vLLM attention backend level
+  instead of monkey-patching `FlashAttentionImpl.forward`.
 - CPU tensors intentionally use PyTorch fallbacks because the local InfiniCore
   CPU `from_torch` path can crash. Strict backend validation is done on MACA
   device tensors.
@@ -153,9 +154,19 @@ All benchmark work must follow the current fairness rules:
 - Warm up before measurement and run repeated iterations.
 - Treat old TPS tables as historical until rebenchmarked under these rules.
 
-Current vLLM-InfiniCore throughput runs should use
-`VLLM_INFINICORE_ROUTES=throughput`, which expands to
-`RMSNorm,SiluAndMul,Embedding`. This is a performance policy, not an operator
-coverage claim: the full nine-route set remains available with
-`VLLM_INFINICORE_ROUTES=all`, but the attention/KV routes currently dominate
-decode overhead because they replay through the Python backend wrapper.
+Current all-operator vLLM-InfiniCore throughput runs should use
+`VLLM_INFINICORE_ROUTES=all`, which expands to the full nine scoped Qwen3
+routes. Diagnostic isolation profiles may identify bottlenecks, but they are
+not acceptable delivery configurations when the requirement is that every
+scoped called operator routes through InfiniCore.
+
+The current attention routes use InfiniCore's FlashAttention-wrapped operators
+for the PA/FA paths: prefill dispatches to `infinicore.mha_varlen`, and decode
+dispatches to `infinicore.mha_kvcache`. The current fair graph benchmark at
+`bs=8`, `input_len=4096`, `output_len=512`, `warmup=1`, `repeats=3` measured
+vLLM native at `283.00` output tok/s and vLLM-InfiniCore `all` routes at
+`211.73` output tok/s, both with `validation_errors=[]` and `148` graph
+captures. Artifact:
+`artifacts/all-routes-mha-fa-vs-native-bs8-in4096-out512-graph-20260505-155903`.
+The remaining gap must be fixed inside the all-route InfiniCore path rather
+than by bypassing scoped operators.
