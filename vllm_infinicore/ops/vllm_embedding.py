@@ -84,6 +84,10 @@ def _patched_embedding(
     layer: torch.nn.Module,
     input_: torch.Tensor,
 ) -> torch.Tensor:
+    if _should_use_native_embedding(layer):
+        if _ORIGINAL_EMBEDDING is None:
+            raise RuntimeError("native vLLM embedding route is unavailable")
+        return _ORIGINAL_EMBEDDING(self, layer, input_)
     try:
         return torch.ops.vllm_infinicore.embedding(input_, layer.weight)
     except Exception:
@@ -94,6 +98,10 @@ def _patched_embedding(
         if _ORIGINAL_EMBEDDING is None:
             raise
         return _ORIGINAL_EMBEDDING(self, layer, input_)
+
+
+def _should_use_native_embedding(layer: torch.nn.Module) -> bool:
+    return int(getattr(layer, "tp_size", 1) or 1) > 1
 
 
 __all__ = [

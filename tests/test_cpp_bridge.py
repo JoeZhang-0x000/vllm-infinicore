@@ -11,15 +11,25 @@ class CppBridgeTests(unittest.TestCase):
     def setUp(self) -> None:
         os.environ.pop(cpp_bridge.CPP_BRIDGE_ENABLE_ENV, None)
         os.environ.pop(cpp_bridge.CPP_BRIDGE_ROUTES_ENV, None)
+        os.environ.pop(cpp_bridge.CPP_BRIDGE_DISABLE_ENV, None)
         cpp_bridge.reset_bridge_call_counts()
 
     def tearDown(self) -> None:
         os.environ.pop(cpp_bridge.CPP_BRIDGE_ENABLE_ENV, None)
         os.environ.pop(cpp_bridge.CPP_BRIDGE_ROUTES_ENV, None)
+        os.environ.pop(cpp_bridge.CPP_BRIDGE_DISABLE_ENV, None)
         cpp_bridge.reset_bridge_call_counts()
 
-    def test_disabled_by_default(self) -> None:
-        with self.assertRaisesRegex(cpp_bridge.CppBridgeError, cpp_bridge.CPP_BRIDGE_ENABLE_ENV):
+    def test_decode_enabled_by_default(self) -> None:
+        self.assertEqual(cpp_bridge.selected_routes(), (cpp_bridge.DECODE_ROUTE,))
+        self.assertTrue(cpp_bridge.enabled_for(cpp_bridge.DECODE_ROUTE))
+        self.assertFalse(cpp_bridge.enabled_for(cpp_bridge.LM_HEAD_ROUTE))
+
+    def test_can_be_explicitly_disabled(self) -> None:
+        os.environ[cpp_bridge.CPP_BRIDGE_DISABLE_ENV] = "1"
+
+        self.assertEqual(cpp_bridge.selected_routes(), ())
+        with self.assertRaisesRegex(cpp_bridge.CppBridgeError, "disabled"):
             cpp_bridge.module()
 
     def test_route_selection(self) -> None:

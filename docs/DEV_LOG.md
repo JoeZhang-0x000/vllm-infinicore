@@ -1,5 +1,33 @@
 # Development Log
 
+## 2026-06-03 Single-GPU Decode Bridge Default
+
+Re-tested the current Qwen3-4B single-GPU production-debug shape with
+`batch_size=8`, `input_len=1024`, `output_len=512`, `warmup=1`, `repeats=2`,
+PIECEWISE CUDA graph, and `backend="eager"`.
+
+Baseline all-routes InfiniCore still dispatched `PagedAttentionDecode` through
+the Python `infinicore.paged_attention` wrapper and measured only `209.42`
+output tok/s against `417.31` vLLM native (`50.2%`). The route counters showed
+all nine routes installed with no native fallback and `paged_attention_decode`
+called `36792` times, making decode the dominant single-GPU gap.
+
+Enabling the plugin C++ bridge for `PagedAttentionDecode` dispatches the same
+route through InfiniCore `mha_kvcache_` and measured `412.44` output tok/s on
+the same shape (`98.8%` of the native run). The run was valid with 148 graph
+captures, no fallback routes, and bridge counter `PagedAttentionDecode=36792`.
+
+`PagedAttentionDecode` now uses the C++ bridge by default. It can be explicitly
+disabled with `VLLM_INFINICORE_DISABLE_CPP_BRIDGE=1` or
+`VLLM_INFINICORE_ENABLE_CPP_BRIDGE=0` when comparing against the slower Python
+wrapper path. `LMHead` remains opt-in through
+`VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode,LMHead`.
+
+Artifacts:
+
+- `artifacts/single-gpu-decision-qwen3-4b-20260603-195957`
+- `artifacts/single-gpu-cpp-decode-qwen3-4b-20260603-200530`
+
 ## 2026-05-04 Bootstrap
 
 Created a clean `vllm-infinicore` project skeleton at `/root/vllm-infinicore`.

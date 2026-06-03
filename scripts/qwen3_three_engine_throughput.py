@@ -118,6 +118,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--max-model-len", type=int, default=5120)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--distributed-executor-backend", default="")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--run-dir", default="")
     parser.add_argument("--infinilm-root", default=DEFAULT_INFINILM_ROOT)
@@ -311,6 +313,8 @@ def build_manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
         "repeats": args.repeats,
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "distributed_executor_backend": args.distributed_executor_backend,
         "dtype": args.dtype,
         "temperature": 0.0,
         "top_p": 1.0,
@@ -412,12 +416,6 @@ def worker_main(args: argparse.Namespace) -> int:
 
 
 def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dict[str, Any]) -> dict[str, Any]:
-    import torch
-    from transformers import AutoTokenizer
-    from vllm import LLM, SamplingParams
-    from vllm.config import CUDAGraphMode
-    from vllm.inputs import TokensPrompt
-
     if case["engine"] == "vllm-infinicore":
         os.environ["VLLM_INFINICORE_ENABLE_PATCHES"] = "1"
         os.environ["VLLM_INFINICORE_ROUTES"] = (
@@ -448,6 +446,20 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
     else:
         registration = None
 
+    distributed_executor_backend = manifest.get("distributed_executor_backend") or None
+    if distributed_executor_backend == "ray":
+        from vllm_infinicore.ray import configure_ray_environment
+
+        configure_ray_environment(
+            distributed_executor_backend=distributed_executor_backend,
+        )
+
+    import torch
+    from transformers import AutoTokenizer
+    from vllm import LLM, SamplingParams
+    from vllm.config import CUDAGraphMode
+    from vllm.inputs import TokensPrompt
+
     tokenizer = AutoTokenizer.from_pretrained(manifest["model"], trust_remote_code=True)
     prompt_ids = prompt_payload["prompt_token_ids"]
     prompts = [TokensPrompt(prompt_token_ids=prompt_ids) for _ in range(manifest["batch_size"])]
@@ -457,17 +469,20 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
         "cudagraph_num_of_warmups": 1,
         "backend": "eager",
     }
-    llm = LLM(
-        model=manifest["model"],
-        dtype=manifest["dtype"],
-        trust_remote_code=True,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=manifest["gpu_memory_utilization"],
-        max_model_len=manifest["max_model_len"],
-        enforce_eager=False,
-        compilation_config=comp_config,
-        enable_prefix_caching=False,
-    )
+    llm_kwargs = {
+        "model": manifest["model"],
+        "dtype": manifest["dtype"],
+        "trust_remote_code": True,
+        "tensor_parallel_size": int(manifest.get("tensor_parallel_size", 1)),
+        "gpu_memory_utilization": manifest["gpu_memory_utilization"],
+        "max_model_len": manifest["max_model_len"],
+        "enforce_eager": False,
+        "compilation_config": comp_config,
+        "enable_prefix_caching": False,
+    }
+    if distributed_executor_backend:
+        llm_kwargs["distributed_executor_backend"] = distributed_executor_backend
+    llm = LLM(**llm_kwargs)
     sampling = SamplingParams(
         temperature=0.0,
         top_p=1.0,
@@ -496,7 +511,7 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
     for _ in range(manifest["warmup"]):
         generate_once()
 
-    _reset_infinicore_counts()
+    _reset_infinicore_counts(llm, use_ray=distributed_executor_backend == "ray")
     iterations = []
     for index in range(1, manifest["repeats"] + 1):
         torch.cuda.synchronize()
@@ -514,17 +529,32 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
             )
         )
 
+    selected_cpp_bridge_routes = (
+        _infinicore_cpp_bridge_selected_routes(
+            llm, use_ray=distributed_executor_backend == "ray"
+        )
+        if case["engine"] == "vllm-infinicore"
+        else ()
+    )
     result = _base_result(case, manifest, prompt_payload)
     result.update(
         {
             "vllm_compilation_config": str(comp_config),
             "registration": _registration_dict(registration),
-            "infinicore_backend_call_counts": _infinicore_backend_counts(),
-            "infinicore_attention_route_counts": _infinicore_attention_counts(),
-            "infinicore_attention_backend_route_counts": _infinicore_attention_backend_counts(),
-            "infinicore_cpp_bridge_call_counts": _infinicore_cpp_bridge_counts(),
-            "cpp_bridge_enabled": bool(manifest.get("cpp_bridge_routes")),
-            "cpp_bridge_routes": manifest.get("cpp_bridge_routes", ""),
+            "infinicore_backend_call_counts": _infinicore_backend_counts(
+                llm, use_ray=distributed_executor_backend == "ray"
+            ),
+            "infinicore_attention_route_counts": _infinicore_attention_counts(
+                llm, use_ray=distributed_executor_backend == "ray"
+            ),
+            "infinicore_attention_backend_route_counts": _infinicore_attention_backend_counts(
+                llm, use_ray=distributed_executor_backend == "ray"
+            ),
+            "infinicore_cpp_bridge_call_counts": _infinicore_cpp_bridge_counts(
+                llm, use_ray=distributed_executor_backend == "ray"
+            ),
+            "cpp_bridge_enabled": bool(selected_cpp_bridge_routes),
+            "cpp_bridge_routes": ",".join(selected_cpp_bridge_routes),
             "vllm_attention_backend": _vllm_attention_backend_path(),
             "graph_capture_count": _vllm_graph_count(),
         }
@@ -660,6 +690,8 @@ def _base_result(case: dict[str, Any], manifest: dict[str, Any], prompt_payload:
         "input_token_count_per_request": len(prompt_payload["prompt_token_ids"]),
         "warmup": manifest["warmup"],
         "repeats": manifest["repeats"],
+        "tensor_parallel_size": manifest.get("tensor_parallel_size", 1),
+        "distributed_executor_backend": manifest.get("distributed_executor_backend", ""),
         "graph_mode_requested": True,
         "sampling": {
             "temperature": 0.0,
@@ -682,7 +714,12 @@ def _finalize(result: dict[str, Any], iterations: list[dict[str, Any]]) -> dict[
         for error in item.get("validation_errors", [])
     ]
     graph_errors = []
-    if result["engine"].startswith("vllm") and result.get("graph_capture_count", 0) <= 0:
+    ray_backend = result.get("distributed_executor_backend") == "ray"
+    if (
+        result["engine"].startswith("vllm")
+        and not ray_backend
+        and result.get("graph_capture_count", 0) <= 0
+    ):
         graph_errors.append("graph_capture_count=0")
     validation_errors.extend(graph_errors)
     result.update(
@@ -728,7 +765,7 @@ def _vllm_graph_count() -> int:
         return 0
 
 
-def _reset_infinicore_counts() -> None:
+def _reset_infinicore_counts(llm: Any | None = None, *, use_ray: bool = False) -> None:
     try:
         from vllm_infinicore.ops import (
             infinicore_backend,
@@ -742,10 +779,18 @@ def _reset_infinicore_counts() -> None:
         vllm_attention.reset_attention_route_counts()
         vllm_attention_backend.reset_attention_backend_route_counts()
     except Exception:
-        return
+        pass
+    if use_ray and llm is not None:
+        _ray_collective_rpc(llm, _worker_reset_infinicore_counts)
 
 
-def _infinicore_backend_counts() -> dict[str, int]:
+def _infinicore_backend_counts(
+    llm: Any | None = None, *, use_ray: bool = False
+) -> dict[str, int]:
+    if use_ray and llm is not None:
+        return _aggregate_worker_count_dicts(
+            _ray_collective_rpc(llm, _worker_infinicore_backend_counts)
+        )
     try:
         from vllm_infinicore.ops import infinicore_backend
 
@@ -754,7 +799,13 @@ def _infinicore_backend_counts() -> dict[str, int]:
         return {}
 
 
-def _infinicore_attention_counts() -> dict[str, int]:
+def _infinicore_attention_counts(
+    llm: Any | None = None, *, use_ray: bool = False
+) -> dict[str, int]:
+    if use_ray and llm is not None:
+        return _aggregate_worker_count_dicts(
+            _ray_collective_rpc(llm, _worker_infinicore_attention_counts)
+        )
     try:
         from vllm_infinicore.ops import vllm_attention
 
@@ -763,7 +814,13 @@ def _infinicore_attention_counts() -> dict[str, int]:
         return {}
 
 
-def _infinicore_attention_backend_counts() -> dict[str, int]:
+def _infinicore_attention_backend_counts(
+    llm: Any | None = None, *, use_ray: bool = False
+) -> dict[str, int]:
+    if use_ray and llm is not None:
+        return _aggregate_worker_count_dicts(
+            _ray_collective_rpc(llm, _worker_infinicore_attention_backend_counts)
+        )
     try:
         from vllm_infinicore.ops import vllm_attention_backend
 
@@ -772,13 +829,104 @@ def _infinicore_attention_backend_counts() -> dict[str, int]:
         return {}
 
 
-def _infinicore_cpp_bridge_counts() -> dict[str, int]:
+def _infinicore_cpp_bridge_counts(
+    llm: Any | None = None, *, use_ray: bool = False
+) -> dict[str, int]:
+    if use_ray and llm is not None:
+        return _aggregate_worker_count_dicts(
+            _ray_collective_rpc(llm, _worker_infinicore_cpp_bridge_counts)
+        )
     try:
         from vllm_infinicore.ops import cpp_bridge
 
         return cpp_bridge.bridge_call_counts()
     except Exception:
         return {}
+
+
+def _infinicore_cpp_bridge_selected_routes(
+    llm: Any | None = None, *, use_ray: bool = False
+) -> tuple[str, ...]:
+    if use_ray and llm is not None:
+        worker_routes = _ray_collective_rpc(llm, _worker_infinicore_cpp_bridge_routes)
+        routes = sorted(
+            {
+                route
+                for item in worker_routes
+                if isinstance(item, (list, tuple))
+                for route in item
+                if isinstance(route, str)
+            }
+        )
+        return tuple(routes)
+    try:
+        from vllm_infinicore.ops import cpp_bridge
+
+        return cpp_bridge.selected_routes()
+    except Exception:
+        return ()
+
+
+def _ray_collective_rpc(llm: Any, method: Any) -> list[Any]:
+    try:
+        return list(llm.collective_rpc(method))
+    except Exception:
+        return []
+
+
+def _aggregate_worker_count_dicts(worker_counts: list[Any]) -> dict[str, int]:
+    aggregate: dict[str, int] = {}
+    for counts in worker_counts:
+        if not isinstance(counts, dict):
+            continue
+        for name, count in counts.items():
+            if isinstance(count, int):
+                aggregate[name] = aggregate.get(name, 0) + count
+    return aggregate
+
+
+def _worker_reset_infinicore_counts(_worker: Any) -> None:
+    from vllm_infinicore.ops import (
+        cpp_bridge,
+        infinicore_backend,
+        vllm_attention,
+        vllm_attention_backend,
+    )
+
+    infinicore_backend.reset_backend_call_counts()
+    cpp_bridge.reset_bridge_call_counts()
+    vllm_attention.reset_attention_route_counts()
+    vllm_attention_backend.reset_attention_backend_route_counts()
+
+
+def _worker_infinicore_backend_counts(_worker: Any) -> dict[str, int]:
+    from vllm_infinicore.ops import infinicore_backend
+
+    return infinicore_backend.backend_call_counts()
+
+
+def _worker_infinicore_attention_counts(_worker: Any) -> dict[str, int]:
+    from vllm_infinicore.ops import vllm_attention
+
+    return vllm_attention.attention_route_counts()
+
+
+def _worker_infinicore_attention_backend_counts(_worker: Any) -> dict[str, int]:
+    from vllm_infinicore.ops import vllm_attention_backend
+
+    return vllm_attention_backend.attention_backend_route_counts()
+
+
+def _worker_infinicore_cpp_bridge_counts(_worker: Any) -> dict[str, int]:
+    from vllm_infinicore.ops import cpp_bridge
+
+    return cpp_bridge.bridge_call_counts()
+
+
+def _worker_infinicore_cpp_bridge_routes(_worker: Any) -> tuple[str, ...]:
+    from vllm_infinicore.ops import cpp_bridge
+
+    return cpp_bridge.selected_routes()
 
 
 def _vllm_attention_backend_path() -> str:

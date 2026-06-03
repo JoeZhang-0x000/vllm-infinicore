@@ -420,8 +420,8 @@ def run_single_case(args: argparse.Namespace) -> int:
         "infinicore_attention_route_counts": _infinicore_attention_route_counts(),
         "infinicore_attention_backend_route_counts": _infinicore_attention_backend_route_counts(),
         "infinicore_cpp_bridge_call_counts": _infinicore_cpp_bridge_call_counts(),
-        "cpp_bridge_enabled": bool(args.cpp_bridge_routes),
-        "cpp_bridge_routes": args.cpp_bridge_routes,
+        "cpp_bridge_enabled": bool(_infinicore_cpp_bridge_selected_routes()),
+        "cpp_bridge_routes": ",".join(_infinicore_cpp_bridge_selected_routes()),
         "vllm_attention_backend": _vllm_attention_backend_path(),
         "measurements": measurements,
         "first_decoded_preview": (
@@ -571,6 +571,14 @@ def _infinicore_cpp_bridge_call_counts() -> dict[str, int]:
     except Exception:
         return {}
     return cpp_bridge.bridge_call_counts()
+
+
+def _infinicore_cpp_bridge_selected_routes() -> tuple[str, ...]:
+    try:
+        from vllm_infinicore.ops import cpp_bridge
+    except Exception:
+        return ()
+    return cpp_bridge.selected_routes()
 
 
 def _vllm_attention_backend_path() -> str:

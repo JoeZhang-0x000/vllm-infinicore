@@ -394,7 +394,7 @@ def _should_use_infinicore_kv_update(
         and isinstance(value, torch.Tensor)
         and isinstance(slot_mapping, torch.Tensor)
         and _valid_kv_cache(kv_cache)
-        and infinicore_backend.real_backend_enabled(key)
+        and infinicore_backend.store_kv_cache_backend_enabled(key)
     )
 
 

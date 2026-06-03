@@ -8,10 +8,12 @@ from typing import Any
 
 CPP_BRIDGE_ENABLE_ENV = "VLLM_INFINICORE_ENABLE_CPP_BRIDGE"
 CPP_BRIDGE_ROUTES_ENV = "VLLM_INFINICORE_CPP_BRIDGE_ROUTES"
+CPP_BRIDGE_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_CPP_BRIDGE"
 
 DECODE_ROUTE = "PagedAttentionDecode"
 LM_HEAD_ROUTE = "LMHead"
 SUPPORTED_ROUTES = frozenset({DECODE_ROUTE, LM_HEAD_ROUTE})
+DEFAULT_ROUTES = (DECODE_ROUTE,)
 
 _MODULE: Any | None = None
 _LOAD_ERROR: str | None = None
@@ -23,11 +25,16 @@ class CppBridgeError(RuntimeError):
 
 
 def enabled_for(route_name: str) -> bool:
-    return _env_truthy(CPP_BRIDGE_ENABLE_ENV) and route_name in selected_routes()
+    return route_name in selected_routes()
 
 
 def selected_routes() -> tuple[str, ...]:
-    raw = os.environ.get(CPP_BRIDGE_ROUTES_ENV, "")
+    if _env_truthy(CPP_BRIDGE_DISABLE_ENV) or _env_falsey(CPP_BRIDGE_ENABLE_ENV):
+        return ()
+
+    raw = os.environ.get(CPP_BRIDGE_ROUTES_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_ROUTES
     routes = tuple(route.strip() for route in raw.split(",") if route.strip())
     if routes == ("all",):
         return tuple(sorted(SUPPORTED_ROUTES))
@@ -40,9 +47,12 @@ def selected_routes() -> tuple[str, ...]:
 def module() -> Any:
     global _MODULE, _LOAD_ERROR
 
-    if not _env_truthy(CPP_BRIDGE_ENABLE_ENV):
-        raise CppBridgeError(f"{CPP_BRIDGE_ENABLE_ENV} is unset or false")
-    selected_routes()
+    routes = selected_routes()
+    if not routes:
+        raise CppBridgeError(
+            f"C++ bridge is disabled; unset {CPP_BRIDGE_DISABLE_ENV} and avoid "
+            f"setting {CPP_BRIDGE_ENABLE_ENV}=0"
+        )
     if _MODULE is not None:
         return _MODULE
     if _LOAD_ERROR is not None:
@@ -99,3 +109,8 @@ def _compile_bridge() -> Any:
 def _env_truthy(name: str) -> bool:
     value = os.environ.get(name, "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_falsey(name: str) -> bool:
+    value = os.environ.get(name)
+    return value is not None and value.strip().lower() in {"0", "false", "no", "off"}

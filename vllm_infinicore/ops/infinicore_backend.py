@@ -19,6 +19,8 @@ import torch.nn.functional as F
 
 REAL_BACKEND_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_REAL_BACKEND"
 STRICT_BACKEND_ENV = "VLLM_INFINICORE_STRICT_BACKEND"
+RAY_BACKEND_ENV = "VLLM_INFINICORE_RAY_BACKEND"
+RAY_STORE_KV_CACHE_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_RAY_STORE_KV_CACHE"
 
 logger = logging.getLogger(__name__)
 _CALL_COUNTS: dict[str, int] = {}
@@ -187,6 +189,12 @@ def real_backend_enabled(reference_tensor: torch.Tensor) -> bool:
     return _should_use_infinicore(reference_tensor)
 
 
+def store_kv_cache_backend_enabled(reference_tensor: torch.Tensor) -> bool:
+    if not _should_use_infinicore(reference_tensor):
+        return False
+    return not _env_truthy(RAY_STORE_KV_CACHE_DISABLE_ENV)
+
+
 def backend_call_counts() -> dict[str, int]:
     return dict(_CALL_COUNTS)
 
@@ -311,6 +319,10 @@ def strict_backend_enabled() -> bool:
     return _env_truthy(STRICT_BACKEND_ENV)
 
 
+def ray_backend_enabled() -> bool:
+    return _env_truthy(RAY_BACKEND_ENV)
+
+
 def _is_non_fallback_error(exc: Exception) -> bool:
     try:
         from .cpp_bridge import CppBridgeError
@@ -324,6 +336,11 @@ def _as_infini(tensor: torch.Tensor) -> Any:
 
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
+    if tensor.is_cuda:
+        wrapped = _as_infini_strided(tensor)
+        wrapped._torch_ref = tensor
+        return wrapped
+    _set_infinicore_device(tensor)
     return infinicore.from_torch(tensor)
 
 
@@ -356,6 +373,7 @@ def _as_infini_strided(tensor: torch.Tensor) -> Any:
     from infinicore.tensor import to_infinicore_dtype
 
     device_index = tensor.device.index if tensor.device.index is not None else 0
+    _set_infinicore_device(tensor)
     return infinicore.strided_from_blob(
         tensor.data_ptr(),
         list(tensor.shape),
@@ -430,6 +448,7 @@ def _infinicore_external_stream(
             import infinicore
 
             with torch.cuda.device(reference_tensor.device):
+                _set_infinicore_device(reference_tensor)
                 ptr = _capsule_pointer(infinicore.get_stream())
         except Exception:
             return None
@@ -458,6 +477,18 @@ def _capsule_pointer(capsule: Any) -> int:
     return int(_PY_CAPSULE_GET_POINTER(capsule, None) or 0)
 
 
+def _set_infinicore_device(tensor: torch.Tensor) -> None:
+    if not tensor.is_cuda:
+        return
+    try:
+        import infinicore
+
+        device_index = tensor.device.index if tensor.device.index is not None else 0
+        infinicore.set_device(infinicore.device(tensor.device.type, device_index))
+    except Exception:
+        return
+
+
 def _is_cuda_graph_capturing(reference_tensor: torch.Tensor) -> bool:
     if not reference_tensor.is_cuda:
         return False
@@ -465,6 +496,12 @@ def _is_cuda_graph_capturing(reference_tensor: torch.Tensor) -> bool:
         return bool(torch.cuda.is_current_stream_capturing())
     except Exception:
         return False
+
+
+def _on_reference_device(tensor: torch.Tensor | None, reference: torch.Tensor) -> torch.Tensor | None:
+    if tensor is None or tensor.device == reference.device:
+        return tensor
+    return tensor.to(device=reference.device)
 
 
 def _rms_norm_infinicore(
@@ -723,6 +760,7 @@ def _store_kv_cache_infinicore(
     import infinicore
 
     key_cache, value_cache = _cache_views(kv_cache, key)
+    slot_mapping = _on_reference_device(slot_mapping, key)
     _run_on_infinicore_stream(
         key,
         lambda: infinicore.paged_caching(
@@ -800,18 +838,21 @@ def _paged_attention_prefill_infinicore(
         total_lens = torch.nn.functional.pad(total_lens, (1, 0), value=0).cumsum(
             dim=0, dtype=torch.int32
         )
+    total_lens = _on_reference_device(total_lens, query)
+    query_start_loc = _on_reference_device(attn_metadata.prefill_query_start_loc, query)
+    block_table = _on_reference_device(attn_metadata.prefill_block_table, query)
+    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
     max_query_len = int(getattr(attn_metadata, "max_query_len", q.shape[0]))
     max_seq_len = int(getattr(attn_metadata, "prefill_max_seq_len", max_query_len))
-    alibi_slopes = attn_impl.alibi_slopes
     _run_on_infinicore_stream(
         query,
         lambda: infinicore.mha_varlen(
             _as_infini(q),
             key_cache,
             value_cache,
-            _as_infini_cached(attn_metadata.prefill_query_start_loc),
+            _as_infini_cached(query_start_loc),
             _as_infini_cached(total_lens),
-            _as_infini_cached(attn_metadata.prefill_block_table),
+            _as_infini_cached(block_table),
             max_query_len,
             max_seq_len,
             _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
@@ -855,19 +896,20 @@ def _paged_attention_decode_infinicore(
             ),
         )
         return
-    key_cache, value_cache = _cache_views_bshd(kv_cache, key)
+    key_cache, value_cache = _cache_views(kv_cache, key)
     q = query[:num_decode_tokens]
-    q_for_fa = q.view(num_decode_tokens, 1, q.shape[1], q.shape[2])
-    out = output[:num_decode_tokens].view(q_for_fa.shape)
-    alibi_slopes = attn_impl.alibi_slopes
+    out = output[:num_decode_tokens].view(q.shape)
+    decode_block_table = _on_reference_device(attn_metadata.decode_block_table, query)
+    decode_seq_lens = _on_reference_device(attn_metadata.decode_seq_lens, query)
+    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
     _run_on_infinicore_stream(
         query,
-        lambda: infinicore.mha_kvcache(
-            _as_infini(q_for_fa),
+        lambda: infinicore.paged_attention(
+            _as_infini(q),
             key_cache,
             value_cache,
-            _as_infini_cached(attn_metadata.decode_seq_lens),
-            _as_infini_cached(attn_metadata.decode_block_table),
+            _as_infini_cached(decode_block_table),
+            _as_infini_cached(decode_seq_lens),
             _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
             attn_impl.scale,
             out=_as_infini(out),
@@ -924,16 +966,18 @@ def _paged_attention_decode_as_prefill_infinicore(
         dtype=torch.int32,
         device=query.device,
     )
-    total_lens = attn_metadata.decode_seq_lens[:1].to(torch.int64)
+    decode_block_table = _on_reference_device(attn_metadata.decode_block_table, query)
+    decode_seq_lens = _on_reference_device(attn_metadata.decode_seq_lens, query)
+    total_lens = decode_seq_lens[:1].to(torch.int64)
     out = output[:num_actual_tokens].view(q.shape)
-    alibi_slopes = attn_impl.alibi_slopes
+    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
     _run_on_infinicore_stream(
         query,
         lambda: infinicore.paged_attention_prefill(
             _as_infini(q),
             key_cache,
             value_cache,
-            _as_infini_cached(attn_metadata.decode_block_table[:1]),
+            _as_infini_cached(decode_block_table[:1]),
             _as_infini_cached(total_lens),
             _as_infini_cached(query_start_loc),
             _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
