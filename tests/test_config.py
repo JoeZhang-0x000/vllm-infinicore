@@ -66,11 +66,17 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigValidationError, "duplicate route"):
             parse_config(raw_config)
 
-    def test_pyproject_declares_vllm_entry_point(self) -> None:
+    def test_pyproject_declares_vllm_entry_points(self) -> None:
         data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-        entry_points = data["project"]["entry-points"]["vllm.general_plugins"]
-        self.assertEqual(entry_points["vllm_infinicore"], "vllm_infinicore:register")
+        general_plugins = data["project"]["entry-points"]["vllm.general_plugins"]
+        self.assertEqual(general_plugins["vllm_infinicore"], "vllm_infinicore:register")
+
+        platform_plugins = data["project"]["entry-points"]["vllm.platform_plugins"]
+        self.assertEqual(
+            platform_plugins["infinicore"],
+            "vllm_infinicore.platform:register_platform",
+        )
 
 
 if __name__ == "__main__":

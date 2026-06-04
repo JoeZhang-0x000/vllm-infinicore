@@ -11,9 +11,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import os
+from types import SimpleNamespace
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from . import infinicore_backend
 
@@ -37,34 +40,44 @@ def _load_platform_flash_attention() -> tuple[type, type, type, type]:
     compatible with the local vLLM runtime.
     """
 
-    try:
-        from vllm_metax.v1.attention.backends.flash_attn import (
-            FlashAttentionImpl,
-            FlashAttentionMetadata,
-            FlashAttentionMetadataBuilder,
-            MacaFlashAttentionBackend,
-        )
+    if _metax_platform_plugin_enabled():
+        try:
+            from vllm_metax.v1.attention.backends.flash_attn import (
+                FlashAttentionImpl,
+                FlashAttentionMetadata,
+                FlashAttentionMetadataBuilder,
+                MacaFlashAttentionBackend,
+            )
 
-        return (
-            MacaFlashAttentionBackend,
-            FlashAttentionImpl,
-            FlashAttentionMetadata,
-            FlashAttentionMetadataBuilder,
-        )
-    except Exception:
-        from vllm.v1.attention.backends.flash_attn import (
-            FlashAttentionBackend,
-            FlashAttentionImpl,
-            FlashAttentionMetadata,
-            FlashAttentionMetadataBuilder,
-        )
+            return (
+                MacaFlashAttentionBackend,
+                FlashAttentionImpl,
+                FlashAttentionMetadata,
+                FlashAttentionMetadataBuilder,
+            )
+        except Exception:
+            pass
 
-        return (
-            FlashAttentionBackend,
-            FlashAttentionImpl,
-            FlashAttentionMetadata,
-            FlashAttentionMetadataBuilder,
-        )
+    from vllm.v1.attention.backends.flash_attn import (
+        FlashAttentionBackend,
+        FlashAttentionImpl,
+        FlashAttentionMetadata,
+        FlashAttentionMetadataBuilder,
+    )
+
+    return (
+        FlashAttentionBackend,
+        FlashAttentionImpl,
+        FlashAttentionMetadata,
+        FlashAttentionMetadataBuilder,
+    )
+
+
+def _metax_platform_plugin_enabled() -> bool:
+    plugins = os.environ.get("VLLM_PLUGINS")
+    if plugins is None:
+        return True
+    return "metax" in {plugin.strip() for plugin in plugins.split(",") if plugin.strip()}
 
 
 (
@@ -116,7 +129,20 @@ class InfiniCoreFlashAttentionImpl(_BaseFlashAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if not _should_use_infinicore_forward(
+        if output is None:
+            output = torch.empty(
+                (query.shape[0], query.shape[1] * query.shape[2]),
+                dtype=query.dtype,
+                device=query.device,
+            )
+        if attn_metadata is None:
+            _record_attention("backend_forward_profile_zero")
+            return output.fill_(0)
+        attn_metadata = _metadata_with_infinicore_fields(attn_metadata, query)
+        if _should_return_profile_output(query, kv_cache, attn_metadata, output):
+            _record_attention("backend_forward_profile_zero")
+            return output.fill_(0)
+        skip_reason = _infinicore_forward_skip_reason(
             self,
             query,
             key,
@@ -126,8 +152,14 @@ class InfiniCoreFlashAttentionImpl(_BaseFlashAttentionImpl):
             output,
             output_scale,
             output_block_scale,
-        ):
+        )
+        if skip_reason is not None:
             _record_attention("backend_forward_fallback")
+            if (
+                not _metax_platform_plugin_enabled()
+                and infinicore_backend.strict_backend_enabled()
+            ):
+                raise RuntimeError(f"InfiniCore attention skipped: {skip_reason}")
             return super().forward(
                 layer,
                 query,
@@ -254,6 +286,13 @@ def install_infinicore_attention_backend(
     )
 
 
+def install_platform_attention_backend() -> None:
+    """Install the InfiniCore attention backend for the platform plugin path."""
+
+    _ACTIVE_ROUTES.update(INFINICORE_ATTENTION_BACKEND_ROUTES)
+    _register_backend_once()
+
+
 def uninstall_infinicore_attention_backend(
     route_name: str,
 ) -> InfiniCoreAttentionBackendUninstallStatus:
@@ -302,6 +341,9 @@ def _patch_metax_backend_registration() -> None:
     global _PATCHED_METAX_REGISTER
     if _PATCHED_METAX_REGISTER:
         return
+    if not _metax_platform_plugin_enabled():
+        _PATCHED_METAX_REGISTER = True
+        return
     # vllm_metax registers its FLASH_ATTN override from a module-level
     # decorator and from platform.register_attention_backends(). Ensure both
     # registration paths run before our override, then re-apply the InfiniCore
@@ -338,20 +380,48 @@ def _should_use_infinicore_forward(
     output_scale: torch.Tensor | None,
     output_block_scale: torch.Tensor | None,
 ) -> bool:
+    return (
+        _infinicore_forward_skip_reason(
+            attn_impl,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+        )
+        is None
+    )
+
+
+def _infinicore_forward_skip_reason(
+    attn_impl: object,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: object,
+    output: torch.Tensor | None,
+    output_scale: torch.Tensor | None,
+    output_block_scale: torch.Tensor | None,
+) -> str | None:
     if output is None or attn_metadata is None:
-        return False
+        return "missing_output_or_metadata"
     if output_scale is not None or output_block_scale is not None:
-        return False
+        return "output_quantization"
     if getattr(attn_metadata, "use_cascade", False):
-        return False
+        return "cascade"
     if getattr(attn_impl, "kv_sharing_target_layer_name", None) is not None:
-        return False
+        return "kv_sharing"
     if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
-        return False
+        return "missing_key_value"
     if not _valid_kv_cache(kv_cache):
-        return False
+        shape = getattr(kv_cache, "shape", None)
+        return f"invalid_kv_cache:{shape}"
     if not infinicore_backend.real_backend_enabled(query):
-        return False
+        return f"real_backend_disabled:query_is_cuda={getattr(query, 'is_cuda', None)}"
 
     num_decode_tokens = int(getattr(attn_metadata, "num_decode_tokens", 0))
     num_decodes = int(getattr(attn_metadata, "num_decodes", 0))
@@ -372,12 +442,112 @@ def _should_use_infinicore_forward(
         num_decodes > 0 or num_decode_tokens > 0
     )
     if needs_prefill and "PagedAttentionPrefill" not in _ACTIVE_ROUTES:
-        return False
+        return "prefill_route_inactive"
     if needs_decode and "PagedAttentionDecode" not in _ACTIVE_ROUTES:
-        return False
+        return "decode_route_inactive"
     if needs_decode and num_decode_tokens != num_decodes:
-        return False
-    return needs_prefill or needs_decode
+        return f"unsupported_spec_decode:{num_decode_tokens}!={num_decodes}"
+    if not (needs_prefill or needs_decode):
+        return "no_prefill_or_decode"
+    return None
+
+
+def _should_return_profile_output(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: object,
+    output: torch.Tensor | None,
+) -> bool:
+    return (
+        output is not None
+        and attn_metadata is not None
+        and not _metax_platform_plugin_enabled()
+        and infinicore_backend.real_backend_enabled(query)
+        and not _valid_kv_cache(kv_cache)
+    )
+
+
+def _metadata_with_infinicore_fields(
+    attn_metadata: object,
+    query: torch.Tensor,
+) -> object:
+    if hasattr(attn_metadata, "num_decode_tokens") and hasattr(
+        attn_metadata, "prefill_query_start_loc"
+    ):
+        return attn_metadata
+
+    query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+    seq_lens = getattr(attn_metadata, "seq_lens", None)
+    block_table = getattr(attn_metadata, "block_table", None)
+    if not (
+        isinstance(query_start_loc, torch.Tensor)
+        and isinstance(seq_lens, torch.Tensor)
+        and isinstance(block_table, torch.Tensor)
+        and query_start_loc.numel() >= 2
+    ):
+        return attn_metadata
+
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    num_reqs = int(query_lens.numel())
+    num_actual_tokens = int(getattr(attn_metadata, "num_actual_tokens", query.shape[0]))
+
+    num_decodes = 0
+    for query_len in query_lens.tolist():
+        if int(query_len) > 1:
+            break
+        num_decodes += 1
+    num_prefills = num_reqs - num_decodes
+    num_decode_tokens = (
+        int(query_start_loc[num_decodes].item()) if num_decodes > 0 else 0
+    )
+    num_prefill_tokens = num_actual_tokens - num_decode_tokens
+
+    if num_decodes > 0:
+        decode_query_start_loc = query_start_loc[: num_decodes + 1]
+        decode_seq_lens = seq_lens[:num_decodes]
+        decode_block_table = block_table[:num_decodes]
+    else:
+        decode_query_start_loc = None
+        decode_seq_lens = None
+        decode_block_table = None
+
+    if num_prefills > 0:
+        prefill_query_start_loc = (
+            query_start_loc[num_decodes : num_reqs + 1] - query_start_loc[num_decodes]
+        )
+        prefill_seq_lens = seq_lens[num_decodes:num_reqs]
+        prefill_max_seq_len = int(prefill_seq_lens.max().item())
+        prefill_block_table = block_table[num_decodes:num_reqs]
+        cu_prefix_kv_lens = F.pad(prefill_seq_lens, (1, 0), value=0).cumsum(
+            dim=0,
+            dtype=torch.int32,
+        )
+    else:
+        prefill_query_start_loc = None
+        prefill_max_seq_len = 0
+        prefill_block_table = None
+        cu_prefix_kv_lens = None
+
+    values = {
+        name: getattr(attn_metadata, name)
+        for name in dir(attn_metadata)
+        if not name.startswith("_")
+    }
+    values.update(
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        decode_query_start_loc=decode_query_start_loc,
+        decode_seq_lens=decode_seq_lens,
+        decode_block_table=decode_block_table,
+        num_prefills=num_prefills,
+        num_prefill_tokens=num_prefill_tokens,
+        prefill_query_start_loc=prefill_query_start_loc,
+        prefill_max_seq_len=prefill_max_seq_len,
+        prefill_block_table=prefill_block_table,
+        cu_prefix_kv_lens=cu_prefix_kv_lens,
+        cu_seqlens_k=None,
+    )
+    return SimpleNamespace(**values)
 
 
 def _should_use_infinicore_kv_update(
@@ -433,6 +603,7 @@ __all__ = [
     "InfiniCoreFlashAttentionImpl",
     "attention_backend_route_counts",
     "install_infinicore_attention_backend",
+    "install_platform_attention_backend",
     "reset_attention_backend_route_counts",
     "uninstall_infinicore_attention_backend",
 ]

@@ -65,6 +65,9 @@ Eager artifact:
 Graph artifact:
 `artifacts/qwen3_128_32_all_routes_streamed_strict_graph.json`
 
+No-MetaX single-card artifact:
+`artifacts/qwen3_128_32_no_metax_stage3.json`
+
 Settings:
 
 - Model: `/mnt/geogpt-doc-new/default/xb/qwen3-8B`
@@ -84,6 +87,13 @@ Result:
 |---|---|---:|---|
 | `custom-eager` | all nine scoped routes | 0 | `validation_errors=[]` |
 | `custom-graph` | all nine scoped routes | 148 | `validation_errors=[]` |
+| `no-metax-eager` | all nine scoped routes, `vllm_metax_loaded=False` | 0 | `validation_errors=[]` |
+| `no-metax-graph` | all nine scoped routes, `vllm_metax_loaded=False` | 148 | `validation_errors=[]` |
+
+The no-MetaX cases run with `VLLM_PLUGINS=infinicore,vllm_infinicore`,
+`VLLM_INFINICORE_ROUTES=all`, and
+`VLLM_INFINICORE_FORCE_NATIVE_FALLBACK=0`. The smoke harness treats
+`vllm_metax_loaded=True` as a validation error for these cases.
 
 Backend call counts in the all-routes eager measured iteration:
 

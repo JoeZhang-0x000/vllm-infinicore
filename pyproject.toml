@@ -14,6 +14,9 @@ dependencies = [
 [project.entry-points."vllm.general_plugins"]
 vllm_infinicore = "vllm_infinicore:register"
 
+[project.entry-points."vllm.platform_plugins"]
+infinicore = "vllm_infinicore.platform:register_platform"
+
 [tool.hatch.build.targets.wheel]
 packages = ["vllm_infinicore"]
 include = [

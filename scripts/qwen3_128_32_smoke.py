@@ -6,6 +6,10 @@ subprocess-isolated cases:
 
 - ``native-graph``: vLLM native graph baseline with this plugin present but dry.
 - ``plugin-fallback-graph``: all Qwen3 routes requested, forced to native fallback.
+- ``no-metax-eager``: all Qwen3 routes requested on the InfiniCore platform
+  without loading ``vllm_metax``.
+- ``no-metax-graph``: the same no-``vllm_metax`` route set with PIECEWISE
+  cudagraph.
 
 The same script can run a single case via ``--single-case`` for debugging or
 later route-subset checks.
@@ -40,6 +44,8 @@ CASE_SPECS: dict[str, dict[str, object]] = {
         "routes": "",
         "force_native_fallback": "0",
         "require_cudagraph": True,
+        "plugins": None,
+        "forbid_metax_load": False,
     },
     "plugin-fallback-graph": {
         "description": "all Qwen3 plugin routes requested with native fallback",
@@ -47,6 +53,8 @@ CASE_SPECS: dict[str, dict[str, object]] = {
         "routes": "all",
         "force_native_fallback": "1",
         "require_cudagraph": True,
+        "plugins": None,
+        "forbid_metax_load": False,
     },
     "plugin-rmsnorm-graph": {
         "description": "RMSNorm prototype route requested for route-subset probing",
@@ -54,6 +62,28 @@ CASE_SPECS: dict[str, dict[str, object]] = {
         "routes": "RMSNorm",
         "force_native_fallback": "0",
         "require_cudagraph": True,
+        "plugins": None,
+        "forbid_metax_load": False,
+    },
+    "no-metax-eager": {
+        "description": "all Qwen3 routes on InfiniCore platform without vllm_metax",
+        "patches": "1",
+        "routes": "all",
+        "force_native_fallback": "0",
+        "require_cudagraph": False,
+        "enforce_eager": True,
+        "plugins": "infinicore,vllm_infinicore",
+        "forbid_metax_load": True,
+    },
+    "no-metax-graph": {
+        "description": "all Qwen3 routes on InfiniCore platform without vllm_metax, PIECEWISE graph",
+        "patches": "1",
+        "routes": "all",
+        "force_native_fallback": "0",
+        "require_cudagraph": True,
+        "enforce_eager": False,
+        "plugins": "infinicore,vllm_infinicore",
+        "forbid_metax_load": True,
     },
     "custom-graph": {
         "description": "custom route subset from --custom-routes",
@@ -62,6 +92,8 @@ CASE_SPECS: dict[str, dict[str, object]] = {
         "force_native_fallback": None,
         "require_cudagraph": True,
         "enforce_eager": False,
+        "plugins": None,
+        "forbid_metax_load": False,
     },
     "custom-eager": {
         "description": "custom route subset from --custom-routes with vLLM eager",
@@ -70,6 +102,8 @@ CASE_SPECS: dict[str, dict[str, object]] = {
         "force_native_fallback": None,
         "require_cudagraph": False,
         "enforce_eager": True,
+        "plugins": None,
+        "forbid_metax_load": False,
     },
 }
 
@@ -91,6 +125,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disabled-routes", default="")
     parser.add_argument("--cpp-bridge-routes", default="")
     parser.add_argument("--force-native-fallback", action="store_true")
+    parser.add_argument(
+        "--plugins",
+        default="",
+        help=(
+            "Override VLLM_PLUGINS for parent and child cases. "
+            "When omitted, the existing environment is respected, falling back "
+            "to metax,vllm_infinicore for compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--forbid-metax-load",
+        action="store_true",
+        help="Fail the case if any vllm_metax module is loaded.",
+    )
     parser.add_argument("--prompt-json", default="")
     parser.add_argument("--output-json", default=DEFAULT_OUTPUT_JSON)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
@@ -101,7 +149,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def configure_runtime_environment() -> None:
+def configure_runtime_environment(args: argparse.Namespace) -> None:
     site_packages = "/opt/conda/lib/python3.12/site-packages"
     maca_path = "/opt/maca-3.5.3"
     infini_root = os.path.expanduser("~/.infini")
@@ -118,7 +166,10 @@ def configure_runtime_environment() -> None:
         f"{site_packages}/flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so",
     )
     os.environ.setdefault("XMAKE_ROOT", "y")
-    os.environ["VLLM_PLUGINS"] = "metax,vllm_infinicore"
+    if args.plugins:
+        os.environ["VLLM_PLUGINS"] = args.plugins
+    else:
+        os.environ.setdefault("VLLM_PLUGINS", "metax,vllm_infinicore")
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     _prepend_env(
@@ -143,6 +194,10 @@ def configure_runtime_environment() -> None:
 
 def configure_case_environment(case_name: str, args: argparse.Namespace) -> None:
     spec = CASE_SPECS[case_name]
+    plugins = spec.get("plugins") or args.plugins
+    if plugins:
+        os.environ["VLLM_PLUGINS"] = str(plugins)
+
     os.environ["VLLM_INFINICORE_ENABLE_PATCHES"] = str(spec["patches"])
 
     routes = spec["routes"]
@@ -260,7 +315,7 @@ def run_generation(
 
 
 def run_parent(args: argparse.Namespace) -> int:
-    configure_runtime_environment()
+    configure_runtime_environment(args)
     cases = _parse_cases(args.cases)
     output_json = Path(args.output_json)
     output_dir = Path(args.output_dir)
@@ -338,7 +393,7 @@ def run_parent(args: argparse.Namespace) -> int:
 
 def run_single_case(args: argparse.Namespace) -> int:
     assert args.single_case is not None
-    configure_runtime_environment()
+    configure_runtime_environment(args)
     configure_case_environment(args.single_case, args)
 
     import vllm_infinicore
@@ -368,6 +423,13 @@ def run_single_case(args: argparse.Namespace) -> int:
     extra_errors = []
     if CASE_SPECS[args.single_case]["require_cudagraph"] and graph_capture_count <= 0:
         extra_errors.append("num_cudagraph_captured=0")
+    forbid_metax_load = bool(
+        CASE_SPECS[args.single_case].get("forbid_metax_load")
+        or args.forbid_metax_load
+    )
+    vllm_metax_loaded = _vllm_metax_loaded()
+    if forbid_metax_load and vllm_metax_loaded:
+        extra_errors.append("vllm_metax_loaded=True")
 
     measurements = [
         _measurement_result(
@@ -416,6 +478,25 @@ def run_single_case(args: argparse.Namespace) -> int:
         "graph_capture_count": graph_capture_count,
         "graph_evidence": graph_evidence.as_dict(),
         "registration": _registration_as_dict(registration),
+        "environment": {
+            "VLLM_PLUGINS": os.environ.get("VLLM_PLUGINS", ""),
+            "VLLM_INFINICORE_ENABLE_PATCHES": os.environ.get(
+                "VLLM_INFINICORE_ENABLE_PATCHES",
+                "",
+            ),
+            "VLLM_INFINICORE_ROUTES": os.environ.get("VLLM_INFINICORE_ROUTES", ""),
+            "VLLM_INFINICORE_DISABLED_ROUTES": os.environ.get(
+                "VLLM_INFINICORE_DISABLED_ROUTES",
+                "",
+            ),
+            "VLLM_INFINICORE_FORCE_NATIVE_FALLBACK": os.environ.get(
+                "VLLM_INFINICORE_FORCE_NATIVE_FALLBACK",
+                "",
+            ),
+        },
+        "vllm_metax_loaded": vllm_metax_loaded,
+        "forbid_metax_load": forbid_metax_load,
+        "vllm_platform": _vllm_platform_name(),
         "infinicore_backend_call_counts": _infinicore_backend_call_counts(),
         "infinicore_attention_route_counts": _infinicore_attention_route_counts(),
         "infinicore_attention_backend_route_counts": _infinicore_attention_backend_route_counts(),
@@ -592,6 +673,26 @@ def _vllm_attention_backend_path() -> str:
         return ""
 
 
+def _vllm_metax_loaded() -> bool:
+    return any(
+        name == "vllm_metax" or name.startswith("vllm_metax.")
+        for name in sys.modules
+    )
+
+
+def _vllm_platform_name() -> str:
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return ""
+    platform_cls = (
+        current_platform
+        if isinstance(current_platform, type)
+        else type(current_platform)
+    )
+    return f"{platform_cls.__module__}.{platform_cls.__qualname__}"
+
+
 def _child_command(
     args: argparse.Namespace,
     case_name: str,
@@ -634,6 +735,10 @@ def _child_command(
         command.extend(["--cpp-bridge-routes", args.cpp_bridge_routes])
     if args.force_native_fallback:
         command.append("--force-native-fallback")
+    if args.plugins:
+        command.extend(["--plugins", args.plugins])
+    if args.forbid_metax_load:
+        command.append("--forbid-metax-load")
     return command
 
 

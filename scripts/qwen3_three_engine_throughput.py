@@ -129,6 +129,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--infinicore-routes", default=DEFAULT_INFINICORE_THROUGHPUT_ROUTES)
     parser.add_argument("--infinicore-disabled-routes", default="")
     parser.add_argument("--cpp-bridge-routes", default="")
+    parser.add_argument("--vllm-native-plugins", default="metax")
+    parser.add_argument("--vllm-infinicore-plugins", default="metax,vllm_infinicore")
+    parser.add_argument(
+        "--forbid-metax-load",
+        action="store_true",
+        help="Fail vLLM cases if any vllm_metax module is loaded.",
+    )
     parser.add_argument(
         "--ablation-matrix",
         action="store_true",
@@ -328,6 +335,9 @@ def build_manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
         "infinicore_routes": args.infinicore_routes,
         "infinicore_disabled_routes": args.infinicore_disabled_routes,
         "cpp_bridge_routes": args.cpp_bridge_routes,
+        "vllm_native_plugins": args.vllm_native_plugins,
+        "vllm_infinicore_plugins": args.vllm_infinicore_plugins,
+        "forbid_metax_load": args.forbid_metax_load,
         "ablation_matrix": args.ablation_matrix,
         "all_route_names": list(ALL_ROUTE_NAMES),
         "attention_route_names": list(ATTENTION_ROUTE_NAMES),
@@ -541,6 +551,35 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
         {
             "vllm_compilation_config": str(comp_config),
             "registration": _registration_dict(registration),
+            "environment": {
+                "VLLM_PLUGINS": os.environ.get("VLLM_PLUGINS", ""),
+                "VLLM_INFINICORE_ENABLE_PATCHES": os.environ.get(
+                    "VLLM_INFINICORE_ENABLE_PATCHES",
+                    "",
+                ),
+                "VLLM_INFINICORE_ROUTES": os.environ.get(
+                    "VLLM_INFINICORE_ROUTES",
+                    "",
+                ),
+                "VLLM_INFINICORE_DISABLED_ROUTES": os.environ.get(
+                    "VLLM_INFINICORE_DISABLED_ROUTES",
+                    "",
+                ),
+                "VLLM_INFINICORE_FORCE_NATIVE_FALLBACK": os.environ.get(
+                    "VLLM_INFINICORE_FORCE_NATIVE_FALLBACK",
+                    "",
+                ),
+                "VLLM_INFINICORE_STRICT_BACKEND": os.environ.get(
+                    "VLLM_INFINICORE_STRICT_BACKEND",
+                    "",
+                ),
+            },
+            "forbid_metax_load": bool(manifest.get("forbid_metax_load")),
+            "vllm_metax_loaded": _vllm_metax_loaded(
+                llm,
+                use_ray=distributed_executor_backend == "ray",
+            ),
+            "vllm_platform": _vllm_platform_name(),
             "infinicore_backend_call_counts": _infinicore_backend_counts(
                 llm, use_ray=distributed_executor_backend == "ray"
             ),
@@ -556,7 +595,10 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
             "cpp_bridge_enabled": bool(selected_cpp_bridge_routes),
             "cpp_bridge_routes": ",".join(selected_cpp_bridge_routes),
             "vllm_attention_backend": _vllm_attention_backend_path(),
-            "graph_capture_count": _vllm_graph_count(),
+            "graph_capture_count": _vllm_graph_count(
+                llm,
+                use_ray=distributed_executor_backend == "ray",
+            ),
         }
     )
     return _finalize(result, iterations)
@@ -714,14 +756,15 @@ def _finalize(result: dict[str, Any], iterations: list[dict[str, Any]]) -> dict[
         for error in item.get("validation_errors", [])
     ]
     graph_errors = []
-    ray_backend = result.get("distributed_executor_backend") == "ray"
-    if (
-        result["engine"].startswith("vllm")
-        and not ray_backend
-        and result.get("graph_capture_count", 0) <= 0
-    ):
+    if result["engine"].startswith("vllm") and result.get("graph_capture_count", 0) <= 0:
         graph_errors.append("graph_capture_count=0")
     validation_errors.extend(graph_errors)
+    if (
+        result["engine"].startswith("vllm")
+        and result.get("forbid_metax_load")
+        and result.get("vllm_metax_loaded")
+    ):
+        validation_errors.append("vllm_metax_loaded=True")
     result.update(
         {
             "iterations": iterations,
@@ -741,7 +784,15 @@ def _worker_env(manifest: dict[str, Any], engine: str) -> dict[str, str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ROOT) + ":" + str(Path(manifest["infinilm_root"]) / "python") + ":" + env.get("PYTHONPATH", "")
     env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    env["VLLM_PLUGINS"] = "metax,vllm_infinicore" if engine == "vllm-infinicore" else "metax"
+    if engine == "vllm-infinicore":
+        env["VLLM_PLUGINS"] = manifest.get(
+            "vllm_infinicore_plugins",
+            "metax,vllm_infinicore",
+        )
+    elif engine == "vllm-native":
+        env["VLLM_PLUGINS"] = manifest.get("vllm_native_plugins", "metax")
+    else:
+        env["VLLM_PLUGINS"] = "metax"
     return env
 
 
@@ -756,7 +807,17 @@ def _registration_dict(registration: Any) -> dict[str, Any] | None:
     }
 
 
-def _vllm_graph_count() -> int:
+def _vllm_graph_count(llm: Any | None = None, *, use_ray: bool = False) -> int:
+    local_count = _local_vllm_graph_count()
+    if use_ray and llm is not None:
+        worker_counts = _ray_collective_rpc(llm, _worker_vllm_graph_count)
+        return local_count + sum(
+            int(count) for count in worker_counts if isinstance(count, int)
+        )
+    return local_count
+
+
+def _local_vllm_graph_count() -> int:
     try:
         from vllm.compilation.counter import compilation_counter
 
@@ -929,6 +990,14 @@ def _worker_infinicore_cpp_bridge_routes(_worker: Any) -> tuple[str, ...]:
     return cpp_bridge.selected_routes()
 
 
+def _worker_vllm_metax_loaded(_worker: Any) -> bool:
+    return _local_vllm_metax_loaded()
+
+
+def _worker_vllm_graph_count(_worker: Any) -> int:
+    return _local_vllm_graph_count()
+
+
 def _vllm_attention_backend_path() -> str:
     try:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -936,6 +1005,38 @@ def _vllm_attention_backend_path() -> str:
         return AttentionBackendEnum.FLASH_ATTN.get_path()
     except Exception:
         return ""
+
+
+def _vllm_metax_loaded(
+    llm: Any | None = None, *, use_ray: bool = False
+) -> bool:
+    local_loaded = _local_vllm_metax_loaded()
+    if use_ray and llm is not None:
+        worker_loaded = any(
+            bool(item) for item in _ray_collective_rpc(llm, _worker_vllm_metax_loaded)
+        )
+        return local_loaded or worker_loaded
+    return local_loaded
+
+
+def _local_vllm_metax_loaded() -> bool:
+    return any(
+        name == "vllm_metax" or name.startswith("vllm_metax.")
+        for name in sys.modules
+    )
+
+
+def _vllm_platform_name() -> str:
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return ""
+    platform_cls = (
+        current_platform
+        if isinstance(current_platform, type)
+        else type(current_platform)
+    )
+    return f"{platform_cls.__module__}.{platform_cls.__qualname__}"
 
 
 def _result_line(result: dict[str, Any]) -> str:

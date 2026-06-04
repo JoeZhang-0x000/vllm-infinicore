@@ -1,5 +1,181 @@
 # Development Log
 
+## 2026-06-04 No-MetaX Qwen3 128/32 Stage Three
+
+Extended `scripts/qwen3_128_32_smoke.py` so no-MetaX validation uses the same
+prompt-token and measurement harness as the graph smoke:
+
+- Added `no-metax-eager` and `no-metax-graph` cases.
+- Added `--plugins` so the harness can run with
+  `VLLM_PLUGINS=infinicore,vllm_infinicore` without being overwritten by the
+  historical MetaX default.
+- Added `--forbid-metax-load` / case-level validation that fails if any
+  `vllm_metax` module is present in `sys.modules`.
+- Artifacts now record the effective plugin environment, selected attention
+  backend, `vllm_metax_loaded`, and InfiniCore backend/attention/bridge
+  counters.
+
+Remote validation on the MetaX C550 machine:
+
+```bash
+python scripts/qwen3_128_32_smoke.py \
+  --trust-remote-code \
+  --warmup 1 \
+  --repeats 2 \
+  --cases no-metax-eager,no-metax-graph \
+  --output-json artifacts/qwen3_128_32_no_metax_stage3.json \
+  --output-dir artifacts/qwen3_128_32_no_metax_stage3_cases
+```
+
+Result:
+
+| Case | Validation | Graph captures | `vllm_metax_loaded` | Output TPS |
+|---|---|---:|---|---:|
+| `no-metax-eager` | `validation_errors=[]` | 0 | `False` | 12.46 |
+| `no-metax-graph` | `validation_errors=[]` | 148 | `False` | 40.66 |
+
+Both cases used `VLLM_PLUGINS=infinicore,vllm_infinicore`,
+`VLLM_INFINICORE_ROUTES=all`, and
+`VLLM_INFINICORE_FORCE_NATIVE_FALLBACK=0`. Both installed all nine scoped
+routes: `RMSNorm`, `SiluAndMul`, `RoPE`, `Embedding`, `MatMul`, `LMHead`,
+`StoreKVCache`, `PagedAttentionPrefill`, and `PagedAttentionDecode`.
+
+Stage-three graph counters included nonzero InfiniCore calls for every scoped
+route, `backend_prefill_infinicore=72`, `backend_decode_infinicore=2232`, and
+`PagedAttentionDecode` C++ bridge calls `2232`. vLLM still logs native
+FlashAttention probe failures on this MACA stack (`libcudart.so.12` missing),
+but runtime attention used the InfiniCore backend and the strict no-MetaX
+module-load check passed.
+
+This closes the current single-card no-`vllm_metax` Qwen3 128/32 eager + graph
+smoke target. Multi-card no-MetaX validation and larger throughput benchmarks
+remain future work.
+
+### Stage Three Graph-Safe Strict Check
+
+Re-ran the no-MetaX graph case with strict backend validation enabled:
+
+```bash
+VLLM_INFINICORE_STRICT_BACKEND=1 \
+python scripts/qwen3_128_32_smoke.py \
+  --trust-remote-code \
+  --warmup 1 \
+  --repeats 3 \
+  --cases no-metax-graph \
+  --output-json artifacts/qwen3_128_32_no_metax_graphsafe_stage3.json \
+  --output-dir artifacts/qwen3_128_32_no_metax_graphsafe_stage3_cases
+```
+
+Result:
+
+- `valid=True`, `validation_errors=[]`
+- `VLLM_PLUGINS=infinicore,vllm_infinicore`
+- `vllm_metax_loaded=False`
+- PIECEWISE graph with `backend="eager"` and `num_cudagraph_captured=148`
+- three measured graph replays, each with exact `128` input tokens and `32`
+  output tokens
+- all nine scoped routes installed, with `native_fallback_routes=[]` and
+  `skipped_routes=[]`
+- graph counters included `store_kv_cache=108`,
+  `paged_attention_prefill=108`, `paged_attention_decode=3348`,
+  `backend_decode_infinicore=3348`, and C++ bridge
+  `PagedAttentionDecode=3348`
+
+This is the current graph-safe evidence for the single-card no-`vllm_metax`
+Qwen3 128/32 path. It validates capture plus replay correctness for this shape;
+it is not yet a multi-card or long-context graph-safety claim.
+
+### Stage Three Coverage Benchmarks
+
+Extended `scripts/qwen3_three_engine_throughput.py` so throughput runs can
+exercise the no-MetaX platform path:
+
+- Added `--vllm-infinicore-plugins` and `--vllm-native-plugins` to remove the
+  historical hardcoded `VLLM_PLUGINS=metax,vllm_infinicore`.
+- Added `--forbid-metax-load` so vLLM benchmark artifacts fail validation when
+  `vllm_metax` is present in `sys.modules`.
+- Artifacts now record the effective vLLM plugin environment, selected platform,
+  `vllm_metax_loaded`, strict backend state, and route counters.
+- Ray tensor-parallel runs now aggregate worker cudagraph counters through
+  collective RPC; the TP=2 smoke reports `296` total captures, matching two
+  workers with `148` captures each.
+
+Remote no-MetaX coverage results:
+
+| Coverage | Shape | TP/backend | Repeats | Graph captures | Output TPS | Validation |
+|---|---|---|---:|---:|---:|---|
+| Harness smoke | `bs=1,in=128,out=32` | `1` | 1 | 148 | 39.72 | `validation_errors=[]` |
+| Multi-card | `bs=1,in=128,out=32` | `2,ray` | 1 | 296 | 37.86 | `validation_errors=[]` |
+| Long context | `bs=1,in=4096,out=128` | `1` | 1 | 148 | 36.51 | `validation_errors=[]` |
+| Large batch | `bs=8,in=1024,out=128` | `1` | 1 | 148 | 247.79 | `validation_errors=[]` |
+| Formal throughput | `bs=8,in=4096,out=512` | `1` | 3 | 148 | 213.20 | `validation_errors=[]` |
+
+All runs used `VLLM_PLUGINS=infinicore,vllm_infinicore`,
+`VLLM_INFINICORE_ROUTES=all`, `VLLM_INFINICORE_FORCE_NATIVE_FALLBACK=0`, and
+`VLLM_INFINICORE_STRICT_BACKEND=1`. Every run reported
+`vllm_metax_loaded=False`, all nine scoped routes installed,
+`native_fallback_routes=[]`, and `skipped_routes=[]`.
+
+Formal throughput artifact:
+`artifacts/no-metax-formal-throughput-bs8-in4096-out512-20260604`.
+The formal run measured `12288` output tokens across three iterations. Per-run
+TPS stats were mean `213.26`, median `213.83`, min `208.78`, max `217.16`, and
+stdev `4.22`.
+
+These runs expand the stage-three evidence from the 128/32 graph-safe smoke to
+multi-card startup, long context, large batch, and the current formal
+throughput shape. They are no-MetaX vLLM-InfiniCore coverage benchmarks, not a
+new comparison against vLLM native or InfiniLM.
+
+## 2026-06-04 No-MetaX Platform Attention Smoke
+
+Added an experimental InfiniCore vLLM platform plugin entry point:
+
+- `vllm.platform_plugins`: `infinicore = vllm_infinicore.platform:register_platform`
+- `register_platform()` returns `vllm_infinicore.platform.InfiniCorePlatform`
+- platform entry-point discovery stays lazy and does not import torch or vLLM
+- platform initialization imports `mcoplib._C` / `mcoplib._moe_C` so vLLM native
+  custom ops such as `_C.silu_and_mul` are registered without loading
+  `vllm_metax`
+
+The attention backend now respects the selected platform plugin:
+
+- `VLLM_PLUGINS=metax,vllm_infinicore` keeps the existing MetaX-compatible path
+  and prefers `vllm_metax.v1.attention.backends.flash_attn`.
+- `VLLM_PLUGINS=infinicore,vllm_infinicore` skips importing `vllm_metax`.
+- The InfiniCore platform path activates `StoreKVCache`,
+  `PagedAttentionPrefill`, and `PagedAttentionDecode` from platform
+  registration.
+- No-MetaX attention normalizes vLLM native metadata into the decode/prefill
+  fields required by the InfiniCore PA/KV wrappers.
+- Profile/warmup calls that omit an output buffer or use an invalid temporary KV
+  cache return zero-filled profile output rather than falling back to native
+  FlashAttention.
+
+Remote validation on the MetaX C550 machine:
+
+- `python -m unittest discover -s tests`: `41` tests passed with `3` skipped.
+- `VLLM_PLUGINS=infinicore` pre-register selected
+  `vllm_infinicore.platform.InfiniCorePlatform`, activated the three attention
+  routes, and reported `vllm_metax_loaded=False`.
+- `VLLM_PLUGINS=metax,vllm_infinicore` still selected the MetaX
+  FlashAttention base backend and reported `vllm_metax_loaded=True`.
+- No-MetaX eager LLM smoke with Qwen3-8B, `max_model_len=128`,
+  `max_tokens=1`, and `enforce_eager=True` generated one token and reported
+  `NO_METAX_WITH_GENERAL_PLUGIN_SMOKE_OK`.
+
+Smoke counters for the no-MetaX generated request:
+
+| Counter group | Counts |
+|---|---|
+| InfiniCore backend | `store_kv_cache=36`, `paged_attention_decode=36` |
+| Attention backend | `backend_kv_update_infinicore=36`, `backend_decode_infinicore=36`, `backend_forward_infinicore=36` |
+
+The smoke also reported `vllm_metax_loaded=False`. This is a correctness and
+runtime-independence smoke, not a graph-safety or throughput benchmark. Graph
+mode, multi-card, and full all-operator no-MetaX benchmarks remain future
+validation work.
+
 ## 2026-06-03 Single-GPU Decode Bridge Default
 
 Re-tested the current Qwen3-4B single-GPU production-debug shape with

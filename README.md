@@ -1,8 +1,38 @@
 # vLLM InfiniCore Plugin
 
-This repository contains a first-pass vLLM operator plugin that keeps the MetaX
-platform plugin for device/runtime integration while routing the covered decoder
-operator path through InfiniCore.
+This repository contains a first-pass vLLM operator plugin for routing the
+covered Qwen decoder operator path through InfiniCore. It supports the existing
+MetaX platform-plugin stack and now has an experimental InfiniCore platform
+entry point for running without loading `vllm_metax`.
+
+It also declares an experimental InfiniCore vLLM platform plugin entry point:
+
+```bash
+export VLLM_PLUGINS=infinicore,vllm_infinicore
+```
+
+When `VLLM_PLUGINS` does not include `metax`, the InfiniCore attention backend
+skips the MetaX backend import path and enables the InfiniCore
+StoreKV/Prefill/Decode routes from the platform plugin.
+
+The current no-MetaX single-card closure smoke uses exact 128 input / 32 output
+token validation for both eager and PIECEWISE graph modes:
+
+```bash
+export VLLM_PLUGINS=infinicore,vllm_infinicore
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+python scripts/qwen3_128_32_smoke.py \
+  --trust-remote-code \
+  --warmup 1 \
+  --repeats 2 \
+  --cases no-metax-eager,no-metax-graph \
+  --output-json artifacts/qwen3_128_32_no_metax_stage3.json \
+  --output-dir artifacts/qwen3_128_32_no_metax_stage3_cases
+```
+
+The remote stage-three run installed all nine scoped routes, reported
+`vllm_metax_loaded=False` for both cases, and captured `148` cudagraphs in the
+graph case. Multi-card no-MetaX validation remains future work.
 
 ## Remote Setup
 

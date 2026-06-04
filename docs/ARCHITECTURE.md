@@ -25,7 +25,36 @@ vllm.general_plugins
 
 The local vLLM loader imports entry points from this group and executes each callable with no arguments. `register()` must therefore stay idempotent and safe to execute in multiple vLLM processes.
 
-### 2. Python Patch And Route Layer
+### 2. vLLM Platform Entry
+
+The package also exposes an experimental platform plugin:
+
+```text
+vllm_infinicore.platform:register_platform
+```
+
+`pyproject.toml` registers this callable under:
+
+```text
+vllm.platform_plugins
+```
+
+The platform entry point returns:
+
+```text
+vllm_infinicore.platform.InfiniCorePlatform
+```
+
+The platform module keeps entry-point discovery lightweight: importing
+`register_platform()` does not import torch or vLLM. The actual
+`InfiniCorePlatform` class is constructed lazily after vLLM selects this
+platform plugin. The no-MetaX single-card path has passed Qwen3-8B 128/32
+eager and PIECEWISE graph smoke validation with
+`VLLM_PLUGINS=infinicore,vllm_infinicore`, all nine scoped routes installed,
+exact input/output token accounting, and `vllm_metax_loaded=False`. Multi-card
+no-MetaX validation remains future work.
+
+### 3. Python Patch And Route Layer
 
 `vllm_infinicore.patching` owns the route declarations and runtime route states for Qwen3 operators. Every scoped operator has a declared implementation family, graph policy, native fallback, and validation path.
 
@@ -52,7 +81,7 @@ records requested, installed, skipped, disabled, native-fallback, and per-route
 state entries. `vllm_infinicore.unregister()` provides an idempotent uninstall
 hook for routes owned by this plugin.
 
-### 3. Custom Op Layer
+### 4. Custom Op Layer
 
 `vllm_infinicore.ops` reserves the interface for future C++/PyTorch custom ops.
 
@@ -75,6 +104,19 @@ Current route implementation:
   is registered as vLLM's `FLASH_ATTN` backend after the MetaX backend table is
   refreshed. This keeps the implementation at vLLM attention backend level
   instead of monkey-patching `FlashAttentionImpl.forward`.
+- When `VLLM_PLUGINS` explicitly includes `metax`, the attention backend keeps
+  the current validated behavior and prefers MetaX's FlashAttention metadata
+  builder and KV-cache layout. When `VLLM_PLUGINS` excludes `metax`, it skips
+  importing `vllm_metax` and falls back to vLLM's native FlashAttention backend
+  classes for metadata shape compatibility, but the platform plugin activates
+  the InfiniCore StoreKV/Prefill/Decode routes so runtime attention calls do not
+  fall back to vLLM's native FlashAttention implementation. The native fallback
+  does not detect a usable FlashAttention version on the current MACA stack.
+- In no-MetaX mode, the backend normalizes vLLM native attention metadata into
+  the decode/prefill fields needed by the InfiniCore PA/KV wrappers. It also
+  handles vLLM profile/warmup calls that omit an output buffer or use an invalid
+  temporary KV cache by returning zero-filled profile output instead of calling
+  native FlashAttention.
 - CPU tensors intentionally use PyTorch fallbacks because the local InfiniCore
   CPU `from_torch` path can crash. Strict backend validation is done on MACA
   device tensors.
@@ -85,13 +127,13 @@ Current route implementation:
   `wait_stream` dependencies before and after each `_infinicore` launch so
   graph capture and replay see the InfiniCore kernels in the correct order.
 
-### 4. Config Layer
+### 5. Config Layer
 
 `configs/qwen3_infinicore_graph.yaml` documents the planned route table, native fallback, validation path, and graph policy. `vllm_infinicore.config.load_config()` parses it with a structured YAML parser and validates it against the in-code route registry.
 
 The vLLM plugin registration path still does not load this config by default. Config loading is an explicit validation and tooling API until there is a proven safe patch installer.
 
-### 5. Validation Layer
+### 6. Validation Layer
 
 `vllm_infinicore.validation` is pure Python and imports neither torch nor vLLM
 at module import. It provides:
@@ -102,12 +144,16 @@ at module import. It provides:
 - graph evidence records for cudagraph mode, backend, capture sizes, and log/counter evidence,
 - benchmark result records with output-only TPS.
 
-### 6. Qwen3 Smoke Harness
+### 7. Qwen3 Smoke Harness
 
 `scripts/qwen3_128_32_smoke.py` generates prompt token IDs once and runs
 subprocess-isolated graph cases against `/mnt/geogpt-doc-new/default/xb/qwen3-8B`.
 The default cases compare `native-graph` with `plugin-fallback-graph`, where all
-Qwen3 routes are requested but forced to native fallback.
+Qwen3 routes are requested but forced to native fallback. The stage-three
+no-MetaX cases are `no-metax-eager` and `no-metax-graph`; both use
+`VLLM_PLUGINS=infinicore,vllm_infinicore`, request `VLLM_INFINICORE_ROUTES=all`,
+force no native fallback, and fail validation if any `vllm_metax` module is
+loaded.
 
 ## CUDA Graph Policy
 
@@ -133,6 +179,7 @@ The current all-routes InfiniCore artifacts are:
 
 - `artifacts/qwen3_128_32_all_routes_streamed_strict_eager.json`
 - `artifacts/qwen3_128_32_all_routes_streamed_strict_graph.json`
+- `artifacts/qwen3_128_32_no_metax_stage3.json`
 
 The eager artifact records `enforce_eager=True`, exact 128 input / 32 output
 token validation, and nonzero InfiniCore backend call counts for every scoped
@@ -142,6 +189,10 @@ output token validation, and all nine scoped routes installed. In graph mode,
 Python counters count capture and non-captured paths; captured non-attention
 op replay does not re-enter Python, so decoded-output validation and graph
 capture evidence are required together with the counters.
+
+The no-MetaX stage-three artifact records the same exact 128/32 validation for
+`no-metax-eager` and `no-metax-graph`, with all nine scoped routes installed,
+`vllm_metax_loaded=False`, and `num_cudagraph_captured=148` for the graph case.
 
 ## Benchmark Policy
 
