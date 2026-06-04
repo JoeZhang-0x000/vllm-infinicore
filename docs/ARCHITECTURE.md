@@ -51,8 +51,10 @@ The platform module keeps entry-point discovery lightweight: importing
 platform plugin. The no-MetaX single-card path has passed Qwen3-8B 128/32
 eager and PIECEWISE graph smoke validation with
 `VLLM_PLUGINS=infinicore,vllm_infinicore`, all nine scoped routes installed,
-exact input/output token accounting, and `vllm_metax_loaded=False`. Multi-card
-no-MetaX validation remains future work.
+exact input/output token accounting, and `vllm_metax_loaded=False`. The
+stage-three coverage pass also validated TP=2 Ray startup, long context,
+large batch, and `bs=8,input_len=4096,output_len=512` formal no-MetaX
+throughput coverage.
 
 ### 3. Python Patch And Route Layer
 
@@ -193,6 +195,10 @@ capture evidence are required together with the counters.
 The no-MetaX stage-three artifact records the same exact 128/32 validation for
 `no-metax-eager` and `no-metax-graph`, with all nine scoped routes installed,
 `vllm_metax_loaded=False`, and `num_cudagraph_captured=148` for the graph case.
+Additional stage-three coverage artifacts record TP=2 Ray graph captures
+(`296` total), long context (`bs=1,input_len=4096,output_len=128`), large batch
+(`bs=8,input_len=1024,output_len=128`), and the formal throughput shape
+(`bs=8,input_len=4096,output_len=512`).
 
 ## Benchmark Policy
 

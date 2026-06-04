@@ -1,5 +1,41 @@
 # Development Log
 
+## 2026-06-04 Stage Four No-MetaX Remote Smoke Hardening
+
+Hardened `tests/remote/run_qwen_smoke.py` so no-MetaX is a first-class remote
+smoke path rather than only a benchmark-harness mode:
+
+- Removed module-import side effects; environment setup and plugin registration
+  now happen inside `main()`, so the module is unit-testable.
+- Added runtime bootstrap for MACA, InfiniCore, torch, and loader paths.
+- Added a one-time `os.execvpe()` re-exec after setting `LD_LIBRARY_PATH` so
+  `libinfinicore_cpp_api.so` is visible to the dynamic loader before importing
+  InfiniCore wrappers.
+- Added `VLLM_SMOKE_FORBID_METAX_LOAD=1`, which selects
+  `VLLM_PLUGINS=infinicore,vllm_infinicore` by default and fails the smoke if
+  `vllm_metax` is loaded locally or inside Ray workers.
+- Added exact output-token validation with `min_tokens=max_tokens`,
+  `ignore_eos=True`, `temperature=0.0`, `top_p=1.0`, and `top_k=1`.
+- Ray smoke now propagates the runtime environment and checks worker-side
+  `vllm_metax` load state through `collective_rpc`.
+
+Remote validation:
+
+- Single-card no-MetaX smoke:
+  `MODEL=/mnt/geogpt-doc-new/default/xb/qwen3-8B`,
+  `VLLM_SMOKE_FORBID_METAX_LOAD=1`, `VLLM_SMOKE_MAX_MODEL_LEN=128`,
+  `VLLM_SMOKE_MAX_TOKENS=1`, `VLLM_SMOKE_ENFORCE_EAGER=1`:
+  `VLLM_SMOKE_OK`, `OUTPUT_TOKEN_COUNT 1`, `vllm_metax_loaded False`.
+- Two-card Ray no-MetaX smoke with `CUDA_VISIBLE_DEVICES=0,1`,
+  `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`,
+  `VLLM_TENSOR_PARALLEL_SIZE=2`, and
+  `VLLM_DISTRIBUTED_EXECUTOR_BACKEND=ray`:
+  `VLLM_SMOKE_OK`, `OUTPUT_TOKEN_COUNT 1`, `vllm_metax_loaded False`.
+
+The smoke still logs vLLM's native FlashAttention/Triton probe errors on this
+MACA stack, but the route registration, generation, exact token count, and
+no-`vllm_metax` checks all pass.
+
 ## 2026-06-04 No-MetaX Qwen3 128/32 Stage Three
 
 Extended `scripts/qwen3_128_32_smoke.py` so no-MetaX validation uses the same
