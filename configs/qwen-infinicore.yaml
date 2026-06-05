@@ -1,0 +1,30 @@
+version: 1
+defaults:
+  backend: original
+ops:
+  RMSNorm:
+    backend: infinicore
+  GemmaRMSNorm:
+    backend: infinicore
+  ApplyRotaryEmb:
+    backend: infinicore
+  Embedding:
+    backend: infinicore
+  MatMul:
+    backend: infinicore
+  LMHead:
+    backend: infinicore
+  StoreKVCache:
+    backend: infinicore
+  MhaVarlenFA2:
+    backend: infinicore
+  MhaKVCacheFA2:
+    backend: infinicore
+  PagedAttentionPrefill:
+    backend: original
+  PagedAttentionDecode:
+    backend: original
+  # Blocked on the current MetaX remote runtime: InfiniCore silu_and_mul
+  # segfaults even for a standalone tiny tensor.
+  SiluAndMul:
+    backend: original

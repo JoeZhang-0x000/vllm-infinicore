@@ -1,5 +1,224 @@
 # Development Log
 
+## 2026-06-05 Strict InfiniCore FA Metadata Builder Port
+
+Root-caused the remaining Qwen2.5 TP=1 throughput gap after the direct FA2
+forward port. The issue was not the final FA2 adaptor call and not the
+non-attention InfiniCore routes. The strict no-`vllm_metax` backend was still
+using vLLM's native FlashAttention metadata builder/base initialization, while
+the fast diagnostic MetaX path used MetaX's FA metadata builder.
+
+Target shape: Qwen2.5-0.5B-Instruct, TP=1, `input_len=2048`,
+`output_len=1024`, `warmup=1`, `repeats=1`.
+
+| Case | Output TPS | Notes | Artifact |
+|---|---:|---|---|
+| InfiniCore forward-only MetaX-compatible FA | 109.15 | strict no-`vllm_metax`; old builder | `/root/vllm-infinicore/artifacts/xzh-53-qwen25-metax-compat-20260605-105848` |
+| Diagnostic MetaX FA base/builder | 183.59 | InfiniCore platform; `vllm_metax_loaded=true`; diagnostic only | `/root/vllm-infinicore/artifacts/xzh-53-qwen25-diag-metax-fa-base-20260605-1133` |
+| Strict InfiniCore builder port | 170.37 | `vllm_metax_loaded=false`, `--forbid-metax-load` | `/root/vllm-infinicore/artifacts/xzh-53-qwen25-infinicore-fa2compat-strict-20260605-1146` |
+| Current vLLM MetaX baseline | 146.50 | `VLLM_PLUGINS=metax` | `/root/vllm-infinicore/artifacts/xzh-53-qwen25-metax-baseline-current-20260605-1148` |
+
+The strict InfiniCore result is `116.3%` of the current vLLM MetaX baseline
+and `56.1%` faster than the previous strict forward-only port. It reported
+`valid=True`, `validation_errors=[]`, `vllm_metax_loaded=false`,
+`VLLM_PLUGINS=infinicore,vllm_infinicore`, all nine scoped routes installed,
+`backend_decode_metax_compatible=24552`, and C++ bridge counter `MatMul=72`.
+
+Fix:
+
+- Added `InfiniCoreFlashAttentionMetadataBuilder`, which keeps vLLM's native
+  builder as the base but ports MetaX's `reorder_batch_threshold=128` decode /
+  prefill split metadata into the strict backend.
+- Recomputes split metadata after `update_block_table()` so cudagraph replay
+  uses the current block table slices.
+- Locally patches vLLM native FA version/support probes for this backend to
+  MetaX-compatible FA2 semantics (`version=2`, no FP8, sinks supported) without
+  importing `vllm_metax`.
+- Kept the strict runtime on
+  `vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`;
+  no `MacaFlashAttentionBackend` is registered in the strict path.
+
+## 2026-06-05 MetaX-Compatible InfiniCore FA Backend Port
+
+Ported the MetaX FlashAttention backend's prefill/decode split structure into
+`vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`
+as a no-`vllm_metax` custom backend path:
+
+- The plugin still registers
+  `vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`
+  as vLLM's `FLASH_ATTN` backend.
+- The runtime still uses `VLLM_PLUGINS=infinicore,vllm_infinicore`; no
+  `vllm_metax` module is loaded.
+- `StoreKVCache` remains routed through the InfiniCore KV-cache update path.
+- Prefill/decode forward now mirrors MetaX's direct
+  `flash_attn_varlen_func` / `flash_attn_with_kvcache` split when
+  `VLLM_INFINICORE_DISABLE_METAX_COMPAT_FA` is unset.
+- `VLLM_INFINICORE_DISABLE_METAX_COMPAT_FA=1` disables the new path for A/B
+  fallback to the previous bridge-backed decode path.
+
+Remote Qwen2.5-0.5B-Instruct TP=1 target shape,
+`input_len=2048`, `output_len=1024`, `warmup=1`, `repeats=1`:
+
+| Path | Output TPS | Ratio vs MetaX TP=1 baseline | Artifact |
+|---|---:|---:|---|
+| vLLM MetaX baseline | 145.65 | 100.0% | `artifacts/xzh-53-metax-bs1-in2048-out1024-repeats1-20260604-172756/qwen25-05b-tp1` |
+| InfiniCore MetaX-compatible backend | 109.15 | 74.9% | remote `/root/vllm-infinicore/artifacts/xzh-53-qwen25-metax-compat-20260605-105848` |
+| InfiniCore bridge fallback (`VLLM_INFINICORE_DISABLE_METAX_COMPAT_FA=1`) | 93.90 | 64.5% | remote `/root/vllm-infinicore/artifacts/xzh-53-qwen25-metax-compat-disabled-20260605-110053` |
+
+The enabled run reported `valid=True`, `validation_errors=[]`,
+`vllm_metax_loaded=false`,
+`vllm_attention_backend=vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`,
+all nine scoped routes installed with no native fallbacks,
+`backend_prefill_metax_compatible=24`,
+`backend_decode_metax_compatible=24552`, and C++ bridge counter
+`MatMul=72` with no decode bridge calls.
+
+This confirms the vLLM-side custom FA backend port improves TP=1 throughput,
+but it still does not match MetaX's native backend. The remaining gap is now
+inside the direct FA2/Mars backend integration details around the custom
+backend and non-attention route mix, not the old C++ decode bridge.
+
+## 2026-06-05 Flash Decode Split Sweep And Compliance Finding
+
+Added a diagnostic `VLLM_INFINICORE_FLASH_DECODE_NUM_SPLITS` knob for the
+`PagedAttentionDecodeFlash` C++ bridge. The default remains `0`, matching the
+FlashAttention heuristic used by the MetaX Python wrapper.
+
+Remote Qwen2.5-0.5B-Instruct TP=1 target shape,
+`input_len=2048`, `output_len=1024`, `warmup=1`, `repeats=1`,
+strict no-`vllm_metax`:
+
+| `num_splits` | Output TPS | Validation |
+|---:|---:|---|
+| 0 | 104.43 | `valid=True` |
+| 1 | 74.50 | `valid=True` |
+| 2 | 82.41 | `valid=True` |
+| 4 | 95.88 | `valid=True` |
+| 8 | 92.82 | `valid=True` |
+
+The split sweep did not explain the gap to the MetaX baseline; the heuristic
+`0` is still the best tested value. A diagnostic no-`vllm_metax` Python
+`flash_attn_with_kvcache` wrapper path measured `97.93` output tok/s, slower
+than the C++ bridge, so the remaining TP=1 gap is not caused by the bridge
+calling convention alone.
+
+Final same-shape validation after removing the diagnostic Python wrapper path:
+
+| Engine | Output TPS | Ratio vs MetaX TP=1 baseline | Artifact |
+|---|---:|---:|---|
+| vLLM MetaX baseline | 145.65 | 100.0% | `artifacts/xzh-53-metax-bs1-in2048-out1024-repeats1-20260604-172756/qwen25-05b-tp1` |
+| vLLM-InfiniCore strict no-`vllm_metax` | 100.73 | 69.2% | remote `/root/vllm-infinicore/artifacts/xzh-53-qwen25-final-split0-20260605-103953` |
+
+The final run reported `valid=True`, `validation_errors=[]`,
+`VLLM_PLUGINS=infinicore,vllm_infinicore`, `vllm_metax_loaded=false`,
+`vllm_attention_backend=vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`,
+all nine scoped routes installed with no native fallbacks, and C++ bridge
+counters `PagedAttentionDecodeFlash=24552`, `MatMul=72`.
+
+Compliance finding:
+
+- The runtime does not load `vllm_metax` and does not register
+  `MacaFlashAttentionBackend`.
+- However, `libinfinicore_cpp_api.so` on the remote machine has a dynamic
+  dependency on
+  `/opt/conda/lib/python3.12/site-packages/flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so`,
+  and `mha_fwd_kvcache` is resolved from that library. The current fast decode
+  path is therefore not yet a pure standalone InfiniCore FlashAttention kernel
+  implementation.
+- `infinicore::op::flash_attention` / `infiniopFlashAttention` exists, but it
+  is the non-paged FlashAttention interface and does not directly replace vLLM
+  paged KV-cache decode. `infinicore::op::mha_kvcache_` is the paged decode
+  interface, and its current implementation wraps the same FlashAttention
+  KV-cache adaptor.
+
+## 2026-06-05 TP=1 MatMul Default And GQA Direct-Out Rejection
+
+Retained the strict no-MetaX default C++ bridge route set as
+`PagedAttentionDecodeFlash,MatMul`:
+
+- `MatMul` now uses the C++ current-stream `infiniopGemm` bridge when no bias
+  is present.
+- C++ bridge route selection is cached by the relevant environment values, so
+  high-frequency route checks no longer parse environment strings per call.
+- The Flash decode path no longer imports `infinicore` on the hot C++ bridge
+  path before checking route selection.
+
+Current remote verification for Qwen2.5-0.5B-Instruct TP=1 at
+`input_len=2048`, `output_len=1024`, `warmup=1`, `repeats=1`:
+
+| Engine | Output TPS | Ratio vs MetaX TP=1 baseline | Artifact |
+|---|---:|---:|---|
+| vLLM MetaX baseline | 145.65 | 100.0% | `artifacts/xzh-53-metax-bs1-in2048-out1024-repeats1-20260604-172756/qwen25-05b-tp1` |
+| vLLM-InfiniCore default | 102.14 | 70.1% | `artifacts/xzh-53-qwen25-clean-default-20260605-011125` |
+
+The InfiniCore run reported `valid=True`, `validation_errors=[]`,
+`vllm_metax_loaded=false`,
+`vllm_attention_backend=vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`,
+`cpp_bridge_routes=PagedAttentionDecodeFlash,MatMul`, and bridge counters
+`PagedAttentionDecodeFlash=24552`, `MatMul=72`.
+
+Rejected experiment:
+
+- Passing a direct GQA-shaped output buffer to `mha_fwd_kvcache` can satisfy
+  the FlashAttention shape check, but the full `2048/1024` generation failed
+  text-health validation with garbled output.
+- Therefore the default Flash decode route keeps the correct dynamic output
+  plus copy-back path for GQA. The remaining TP=1 gap is still in the decode
+  attention backend/kernel boundary, not a route-selection bug.
+- A pure `infiniopPagedAttention` current-stream decode bridge was also tested
+  as an explicit route. It was correct but much slower at the target Qwen2.5
+  TP=1 shape: `14.23` output tok/s for `2048/1024` in
+  `artifacts/xzh-53-qwen25-infiniop-pa-full-20260605-012004`. It is not
+  retained as a route.
+
+## 2026-06-04 Strict No-MetaX TP=1 Flash Decode Bridge
+
+Fixed the strict no-MetaX TP=1 decode bottleneck by making
+`PagedAttentionDecode` use an InfiniCore FlashAttention C++ bridge on the
+current vLLM stream by default:
+
+- Added `PagedAttentionDecodeFlash` to the C++ bridge route set.
+- The new bridge calls the InfiniCore-vendored FlashAttention adaptor directly
+  from `vllm_infinicore`, without importing `vllm_metax` or registering
+  `MacaFlashAttentionBackend`.
+- The previous default bridge route remains available as explicit
+  `VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode` for A/B tests.
+- Default C++ bridge routes are now `PagedAttentionDecodeFlash,MatMul`.
+
+Root cause:
+
+- Strict no-MetaX runs were already using
+  `vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`,
+  but decode went through InfiniCore `mha_kvcache_` on the InfiniCore external
+  stream.
+- Qwen2.5 TP=1 microbench at the 2k decode shape measured old bridged decode
+  at roughly `0.12-0.14 ms` per layer call.
+- The current-stream Flash decode bridge measured `0.059 ms` per layer call,
+  removing most of the per-layer stream handoff overhead while keeping the
+  no-`vllm_metax` runtime constraint.
+- A global no-wait experiment was rejected: it triggered a device ATU fault in
+  RoPE during graph capture, proving stream waits cannot be removed globally.
+
+Strict remote verification used `VLLM_PLUGINS=infinicore,vllm_infinicore`,
+`VLLM_INFINICORE_ROUTES=all`, `VLLM_INFINICORE_STRICT_BACKEND=1`, and
+`--forbid-metax-load`:
+
+| Model | TP | Previous strict no-MetaX TPS | New strict no-MetaX TPS | Validation |
+|---|---:|---:|---:|---|
+| Qwen2.5-0.5B-Instruct | 1 | 76.32 | 94.00 | `validation_errors=[]`, `vllm_metax_loaded=false` |
+| DeepSeek-R1-Distill-Qwen-7B | 1 | 43.13 | 52.17 | `validation_errors=[]`, `vllm_metax_loaded=false` |
+
+Both verified runs reported
+`vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`
+and `cpp_bridge_routes=PagedAttentionDecodeFlash`. Artifacts:
+`artifacts/xzh-53-qwen25-default-flashdecode-tp1-in2048-out1024-20260604-235557`
+and
+`artifacts/xzh-53-deepseek-default-flashdecode-tp1-in2048-out1024-20260604-235818`.
+
+The earlier `VLLM_PLUGINS=metax,vllm_infinicore` throughput-profile experiment
+that retained `MacaFlashAttentionBackend` is diagnostic only and is not an
+acceptable solution for strict no-MetaX delivery.
+
 ## 2026-06-04 Stage Four No-MetaX Remote Smoke Hardening
 
 Hardened `tests/remote/run_qwen_smoke.py` so no-MetaX is a first-class remote
@@ -234,6 +453,9 @@ disabled with `VLLM_INFINICORE_DISABLE_CPP_BRIDGE=1` or
 `VLLM_INFINICORE_ENABLE_CPP_BRIDGE=0` when comparing against the slower Python
 wrapper path. `LMHead` remains opt-in through
 `VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode,LMHead`.
+As of the 2026-06-04 strict no-MetaX TP=1 fix, the current default decode
+bridge route is `PagedAttentionDecodeFlash`; the `PagedAttentionDecode` route
+is retained as the older `mha_kvcache_` A/B path.
 
 Artifacts:
 
@@ -991,6 +1213,9 @@ families without changing InfiniCore or InfiniLM:
 - The existing Python stream bridge still wraps the C++ launch to preserve
   graph ordering.
 - Bridge call counters are now recorded in smoke and throughput artifacts.
+
+This probe records the older `mha_kvcache_` bridge. The current default decode
+bridge route is `PagedAttentionDecodeFlash`.
 
 Validation:
 

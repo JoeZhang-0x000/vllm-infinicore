@@ -573,6 +573,18 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
                     "VLLM_INFINICORE_STRICT_BACKEND",
                     "",
                 ),
+                "VLLM_INFINICORE_FLASH_DECODE_NUM_SPLITS": os.environ.get(
+                    "VLLM_INFINICORE_FLASH_DECODE_NUM_SPLITS",
+                    "",
+                ),
+                "VLLM_INFINICORE_DISABLE_METAX_COMPAT_FA": os.environ.get(
+                    "VLLM_INFINICORE_DISABLE_METAX_COMPAT_FA",
+                    "",
+                ),
+                "VLLM_INFINICORE_DISABLE_DUMMY_RUN_REAL_REQS": os.environ.get(
+                    "VLLM_INFINICORE_DISABLE_DUMMY_RUN_REAL_REQS",
+                    "",
+                ),
             },
             "forbid_metax_load": bool(manifest.get("forbid_metax_load")),
             "vllm_metax_loaded": _vllm_metax_loaded(

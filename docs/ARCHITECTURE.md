@@ -219,9 +219,12 @@ scoped called operator routes through InfiniCore.
 
 The current attention routes use InfiniCore's available PA/FA operators:
 prefill dispatches to `infinicore.mha_varlen`, and decode dispatches through
-the plugin C++ bridge to InfiniCore `mha_kvcache_`. The slower Python
-`infinicore.paged_attention` decode wrapper remains available only for A/B
-tests by disabling the bridge. The older fair graph benchmark at
+the plugin C++ bridge route `PagedAttentionDecodeFlash`, which uses the
+InfiniCore-vendored FlashAttention adaptor on the current vLLM stream. The
+slower Python `infinicore.paged_attention` decode wrapper remains available
+only for A/B tests by disabling the bridge, and the older external-stream
+`mha_kvcache_` bridge can be selected explicitly. The older fair graph
+benchmark at
 `bs=8`, `input_len=4096`, `output_len=512`, `warmup=1`, `repeats=3` measured
 vLLM native at `283.29` output tok/s and vLLM-InfiniCore `all` routes at
 `262.41` output tok/s after the RoPE wrapper optimization, both with
@@ -233,14 +236,18 @@ The all-route profile was previously `92.62%` to `93.61%` of vLLM native at
 the older production benchmark shape. Future improvements must remain inside
 the all-route InfiniCore path rather than bypassing scoped operators.
 
-`PagedAttentionDecode` now routes through the plugin C++ bridge by default.
-The bridge calls InfiniCore `mha_kvcache_` below the Python wrapper layer and
-keeps route/counter accounting inside `PagedAttentionDecode`. On the current
-Qwen3-4B single-GPU decision shape (`bs=8`, `input_len=1024`,
-`output_len=512`) this measured `412.44` output tok/s against `417.31` vLLM
-native (`98.8%`) with 148 graph captures and no native fallback. Artifact:
+`PagedAttentionDecode` and bias-free `MatMul` now route through the plugin C++
+bridge by default. The default bridge routes are
+`PagedAttentionDecodeFlash,MatMul`; they keep route/counter accounting inside
+this plugin without importing `vllm_metax` or registering
+`MacaFlashAttentionBackend`. On the current Qwen3-4B single-GPU
+decision shape (`bs=8`, `input_len=1024`, `output_len=512`) the older bridged
+decode measured `412.44` output tok/s against `417.31` vLLM native (`98.8%`)
+with 148 graph captures and no native fallback. Artifact:
 `artifacts/single-gpu-cpp-decode-qwen3-4b-20260603-200530`.
 
 The bridge can be disabled for A/B tests with
-`VLLM_INFINICORE_DISABLE_CPP_BRIDGE=1`. `LMHead` remains opt-in through
-`VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode,LMHead`.
+`VLLM_INFINICORE_DISABLE_CPP_BRIDGE=1`. The older `mha_kvcache_` bridge can be
+selected with `VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode`.
+`LMHead` remains opt-in through
+`VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecodeFlash,LMHead`.

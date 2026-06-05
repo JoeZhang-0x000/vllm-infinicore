@@ -250,6 +250,12 @@ def _build_platform_class() -> type:
 
         @classmethod
         def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+            from vllm_infinicore.runtime_patches import (
+                patch_gpu_model_runner_dummy_run_real_reqs,
+            )
+
+            patch_gpu_model_runner_dummy_run_real_reqs()
+
             parallel_config = vllm_config.parallel_config
             cache_config = vllm_config.cache_config
             model_config = vllm_config.model_config

@@ -10,6 +10,7 @@ Unsupported paths fall back to the platform backend.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import copy
 import importlib
 import os
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ INFINICORE_ATTENTION_BACKEND_ROUTES = (
     "PagedAttentionPrefill",
     "PagedAttentionDecode",
 )
+METAX_COMPAT_FA_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_METAX_COMPAT_FA"
 
 _ACTIVE_ROUTES: set[str] = set()
 _REGISTERED = False
@@ -58,6 +60,8 @@ def _load_platform_flash_attention() -> tuple[type, type, type, type]:
         except Exception:
             pass
 
+    flash_attn_module = importlib.import_module("vllm.v1.attention.backends.flash_attn")
+    _patch_native_flash_attention_module(flash_attn_module)
     from vllm.v1.attention.backends.flash_attn import (
         FlashAttentionBackend,
         FlashAttentionImpl,
@@ -71,6 +75,26 @@ def _load_platform_flash_attention() -> tuple[type, type, type, type]:
         FlashAttentionMetadata,
         FlashAttentionMetadataBuilder,
     )
+
+
+def _patch_native_flash_attention_module(module: Any) -> None:
+    if getattr(module, "_vllm_infinicore_fa2_compat_patched", False):
+        return
+
+    def get_flash_attn_version(requires_alibi: bool = False) -> int:
+        del requires_alibi
+        return 2
+
+    def flash_attn_supports_fp8() -> bool:
+        return False
+
+    def flash_attn_supports_sinks() -> bool:
+        return True
+
+    module.get_flash_attn_version = get_flash_attn_version
+    module.flash_attn_supports_fp8 = flash_attn_supports_fp8
+    module.flash_attn_supports_sinks = flash_attn_supports_sinks
+    module._vllm_infinicore_fa2_compat_patched = True
 
 
 def _metax_platform_plugin_enabled() -> bool:
@@ -111,11 +135,59 @@ class InfiniCoreFlashAttentionBackend(_BaseFlashAttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type:
-        return _FlashAttentionMetadataBuilder
+        return InfiniCoreFlashAttentionMetadataBuilder
+
+
+class InfiniCoreFlashAttentionMetadataBuilder(_FlashAttentionMetadataBuilder):
+    """FlashAttention metadata builder with MetaX-compatible decode split fields."""
+
+    reorder_batch_threshold: int = 128
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        init_threshold = getattr(self, "_init_reorder_batch_threshold", None)
+        if callable(init_threshold):
+            init_threshold(self.reorder_batch_threshold, True)
+
+    def build(self, *args: Any, **kwargs: Any) -> Any:
+        metadata = super().build(*args, **kwargs)
+        return _add_infinicore_metadata_fields(
+            metadata,
+            decode_threshold=int(getattr(self, "reorder_batch_threshold", 1) or 1),
+        )
+
+    def update_block_table(
+        self,
+        metadata: Any,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> Any:
+        update = getattr(super(), "update_block_table", None)
+        if callable(update):
+            try:
+                updated = update(metadata, blk_table, slot_mapping)
+            except NotImplementedError:
+                updated = copy.copy(metadata)
+                updated.block_table = blk_table
+                updated.slot_mapping = slot_mapping
+        else:
+            updated = copy.copy(metadata)
+            updated.block_table = blk_table
+            updated.slot_mapping = slot_mapping
+        return _add_infinicore_metadata_fields(
+            updated,
+            decode_threshold=int(getattr(self, "reorder_batch_threshold", 1) or 1),
+        )
 
 
 class InfiniCoreFlashAttentionImpl(_BaseFlashAttentionImpl):
     """Attention impl with backend-level InfiniCore dispatch."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.vllm_flash_attn_version = 2
+        self.supports_quant_query_input = False
+        self.supports_per_head_quant_scales = False
 
     def forward(
         self,
@@ -194,6 +266,21 @@ class InfiniCoreFlashAttentionImpl(_BaseFlashAttentionImpl):
             needs_decode = (not decode_as_prefill) and (
                 num_decodes > 0 or num_decode_tokens > 0
             )
+
+            if _metax_compatible_fa_enabled():
+                if _forward_metax_compatible_fa(
+                    self,
+                    query,
+                    kv_cache,
+                    attn_metadata,
+                    output,
+                    num_decode_tokens,
+                    num_actual_tokens,
+                    num_prefills,
+                    num_decodes,
+                ):
+                    _record_attention("backend_forward_infinicore")
+                    return output
 
             if needs_prefill:
                 _record_attention("backend_prefill_infinicore")
@@ -289,8 +376,29 @@ def install_infinicore_attention_backend(
 def install_platform_attention_backend() -> None:
     """Install the InfiniCore attention backend for the platform plugin path."""
 
-    _ACTIVE_ROUTES.update(INFINICORE_ATTENTION_BACKEND_ROUTES)
+    if _platform_should_activate_attention_routes():
+        _ACTIVE_ROUTES.update(INFINICORE_ATTENTION_BACKEND_ROUTES)
     _register_backend_once()
+
+
+def _platform_should_activate_attention_routes() -> bool:
+    """Return whether platform registration should enable attention routes.
+
+    Platform-only no-MetaX smoke runs rely on the InfiniCore attention backend
+    because vLLM's native FlashAttention probe is not usable on the current MACA
+    stack. When explicit route patching is enabled, route activation must stay
+    with the route registry so throughput/isolation profiles can actually
+    disable the attention bridge.
+    """
+
+    patches_enabled = os.environ.get("VLLM_INFINICORE_ENABLE_PATCHES", "")
+    selected_routes = os.environ.get("VLLM_INFINICORE_ROUTES", "")
+    if (
+        patches_enabled.strip().lower() in {"1", "true", "yes", "on"}
+        and selected_routes.strip()
+    ):
+        return False
+    return True
 
 
 def uninstall_infinicore_attention_backend(
@@ -550,6 +658,81 @@ def _metadata_with_infinicore_fields(
     return SimpleNamespace(**values)
 
 
+def _add_infinicore_metadata_fields(
+    attn_metadata: object,
+    *,
+    decode_threshold: int = 1,
+) -> object:
+    query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+    seq_lens = getattr(attn_metadata, "seq_lens", None)
+    block_table = getattr(attn_metadata, "block_table", None)
+    if not (
+        isinstance(query_start_loc, torch.Tensor)
+        and isinstance(seq_lens, torch.Tensor)
+        and isinstance(block_table, torch.Tensor)
+        and query_start_loc.numel() >= 2
+    ):
+        return attn_metadata
+
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    num_reqs = int(query_lens.numel())
+    num_actual_tokens = int(
+        getattr(attn_metadata, "num_actual_tokens", int(query_start_loc[-1].item()))
+    )
+
+    num_decodes = 0
+    for query_len in query_lens.tolist():
+        if int(query_len) > decode_threshold:
+            break
+        num_decodes += 1
+    num_prefills = num_reqs - num_decodes
+    num_decode_tokens = (
+        int(query_start_loc[num_decodes].item()) if num_decodes > 0 else 0
+    )
+    num_prefill_tokens = num_actual_tokens - num_decode_tokens
+
+    if num_decodes > 0:
+        decode_query_start_loc = query_start_loc[: num_decodes + 1]
+        decode_seq_lens = seq_lens[:num_decodes]
+        decode_block_table = block_table[:num_decodes]
+    else:
+        decode_query_start_loc = None
+        decode_seq_lens = None
+        decode_block_table = None
+
+    if num_prefills > 0:
+        prefill_query_start_loc = (
+            query_start_loc[num_decodes : num_reqs + 1] - query_start_loc[num_decodes]
+        )
+        prefill_seq_lens = seq_lens[num_decodes:num_reqs]
+        prefill_max_seq_len = int(prefill_seq_lens.max().item())
+        prefill_block_table = block_table[num_decodes:num_reqs]
+        cu_prefix_kv_lens = F.pad(prefill_seq_lens, (1, 0), value=0).cumsum(
+            dim=0,
+            dtype=torch.int32,
+        )
+    else:
+        prefill_query_start_loc = None
+        prefill_max_seq_len = 0
+        prefill_block_table = None
+        cu_prefix_kv_lens = None
+
+    setattr(attn_metadata, "num_decodes", num_decodes)
+    setattr(attn_metadata, "num_decode_tokens", num_decode_tokens)
+    setattr(attn_metadata, "decode_query_start_loc", decode_query_start_loc)
+    setattr(attn_metadata, "decode_seq_lens", decode_seq_lens)
+    setattr(attn_metadata, "decode_block_table", decode_block_table)
+    setattr(attn_metadata, "num_prefills", num_prefills)
+    setattr(attn_metadata, "num_prefill_tokens", num_prefill_tokens)
+    setattr(attn_metadata, "prefill_query_start_loc", prefill_query_start_loc)
+    setattr(attn_metadata, "prefill_max_seq_len", prefill_max_seq_len)
+    setattr(attn_metadata, "prefill_block_table", prefill_block_table)
+    setattr(attn_metadata, "cu_prefix_kv_lens", cu_prefix_kv_lens)
+    if not hasattr(attn_metadata, "cu_seqlens_k"):
+        setattr(attn_metadata, "cu_seqlens_k", None)
+    return attn_metadata
+
+
 def _should_use_infinicore_kv_update(
     attn_impl: object,
     key: torch.Tensor,
@@ -577,6 +760,157 @@ def _valid_kv_cache(kv_cache: torch.Tensor) -> bool:
     )
 
 
+def _metax_compatible_fa_enabled() -> bool:
+    return (
+        not _metax_platform_plugin_enabled()
+        and not _env_truthy(METAX_COMPAT_FA_DISABLE_ENV)
+    )
+
+
+def _forward_metax_compatible_fa(
+    attn_impl: object,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: object,
+    output: torch.Tensor,
+    num_decode_tokens: int,
+    num_actual_tokens: int,
+    num_prefills: int,
+    num_decodes: int,
+) -> bool:
+    if getattr(attn_metadata, "use_cascade", False):
+        return False
+    if getattr(attn_impl, "kv_cache_dtype", "").startswith("fp8"):
+        return False
+
+    try:
+        from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    except Exception:
+        return False
+
+    key_cache, value_cache = _split_kv_cache_for_flash(kv_cache)
+    handled = False
+
+    if num_prefills > 0:
+        prefill_query = query[num_decode_tokens:num_actual_tokens]
+        if prefill_query.numel() > 0:
+            prefill_output = flash_attn_varlen_func(
+                q=prefill_query,
+                k=key_cache,
+                v=value_cache,
+                cu_seqlens_q=attn_metadata.prefill_query_start_loc,
+                cu_seqlens_k=attn_metadata.cu_prefix_kv_lens,
+                max_seqlen_q=getattr(attn_metadata, "max_query_len", prefill_query.shape[0]),
+                max_seqlen_k=getattr(
+                    attn_metadata,
+                    "prefill_max_seq_len",
+                    getattr(attn_metadata, "max_seq_len", prefill_query.shape[0]),
+                ),
+                softmax_scale=float(getattr(attn_impl, "scale")),
+                causal=bool(getattr(attn_metadata, "causal", True)),
+                alibi_slopes=_on_query_device(getattr(attn_impl, "alibi_slopes", None), query),
+                window_size=getattr(attn_impl, "sliding_window", (-1, -1)),
+                block_table=attn_metadata.prefill_block_table,
+                softcap=float(getattr(attn_impl, "logits_soft_cap", 0.0) or 0.0),
+                s_aux=getattr(attn_impl, "sinks", None),
+            )
+            _copy_attention_output(
+                output[num_decode_tokens:num_actual_tokens],
+                prefill_output,
+                prefill_query.shape,
+            )
+            infinicore_backend.record_backend_call("paged_attention_prefill")
+            _record_attention("backend_prefill_infinicore")
+            _record_attention("backend_prefill_metax_compatible")
+            handled = True
+
+    if num_decodes > 0:
+        decode_query = query[:num_decode_tokens]
+        decode_query = _reshape_query_for_spec_decode(decode_query, num_decodes)
+        decode_output = flash_attn_with_kvcache(
+            q=decode_query,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            block_table=attn_metadata.decode_block_table,
+            cache_seqlens=attn_metadata.decode_seq_lens,
+            softmax_scale=float(getattr(attn_impl, "scale")),
+            causal=True,
+            window_size=getattr(attn_impl, "sliding_window", (-1, -1)),
+            alibi_slopes=_on_query_device(getattr(attn_impl, "alibi_slopes", None), query),
+            num_splits=_flash_decode_num_splits(),
+            softcap=float(getattr(attn_impl, "logits_soft_cap", 0.0) or 0.0),
+            s_aux=getattr(attn_impl, "sinks", None),
+        )
+        decoded = _reshape_attn_output_for_spec_decode(decode_output)
+        _copy_attention_output(output[:num_decode_tokens], decoded, decoded.shape)
+        infinicore_backend.record_backend_call("paged_attention_decode")
+        _record_attention("backend_decode_infinicore")
+        _record_attention("backend_decode_metax_compatible")
+        handled = True
+
+    return handled
+
+
+def _split_kv_cache_for_flash(
+    kv_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if kv_cache.shape[0] == 2:
+        return kv_cache.unbind(0)
+    if kv_cache.shape[1] == 2:
+        return kv_cache.unbind(1)
+    raise RuntimeError(f"cannot infer KV cache split axis from cache={kv_cache.shape}")
+
+
+def _reshape_query_for_spec_decode(
+    query: torch.Tensor,
+    batch_size: int,
+) -> torch.Tensor:
+    total_tokens, num_heads, head_dim = query.shape
+    if total_tokens % batch_size != 0:
+        raise RuntimeError(
+            f"decode query tokens {total_tokens} are not divisible by {batch_size}"
+        )
+    return query.view(batch_size, total_tokens // batch_size, num_heads, head_dim)
+
+
+def _reshape_attn_output_for_spec_decode(attn_output: torch.Tensor) -> torch.Tensor:
+    if attn_output.dim() == 3:
+        return attn_output
+    if attn_output.dim() != 4:
+        raise RuntimeError(f"expected 3D/4D attention output, got {attn_output.dim()}D")
+    return attn_output.view(
+        attn_output.shape[0] * attn_output.shape[1],
+        attn_output.shape[2],
+        attn_output.shape[3],
+    )
+
+
+def _copy_attention_output(
+    output_slice: torch.Tensor,
+    attention_output: torch.Tensor,
+    view_shape: torch.Size | tuple[int, ...],
+) -> None:
+    output_slice.view(view_shape).copy_(attention_output.view(view_shape))
+
+
+def _on_query_device(
+    tensor: torch.Tensor | None,
+    query: torch.Tensor,
+) -> torch.Tensor | None:
+    if tensor is None or tensor.device == query.device:
+        return tensor
+    return tensor.to(device=query.device)
+
+
+def _flash_decode_num_splits() -> int:
+    try:
+        from . import cpp_bridge
+
+        return cpp_bridge.flash_decode_num_splits()
+    except Exception:
+        return 0
+
+
 def _decode_as_prefill(
     num_decode_tokens: int,
     num_decodes: int,
@@ -593,6 +927,11 @@ def _decode_as_prefill(
 
 def _record_attention(name: str) -> None:
     _ATTENTION_COUNTS[name] = _ATTENTION_COUNTS.get(name, 0) + 1
+
+
+def _env_truthy(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 __all__ = [

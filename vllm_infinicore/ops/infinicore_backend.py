@@ -209,6 +209,10 @@ def reset_backend_call_counts() -> None:
         pass
 
 
+def record_backend_call(op_name: str) -> None:
+    _record_call(op_name)
+
+
 def clear_tensor_wrapper_cache() -> None:
     _INFINI_TENSOR_CACHE.clear()
 
@@ -509,6 +513,11 @@ def _rms_norm_infinicore(
     weight: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
+    from . import cpp_bridge
+
+    if cpp_bridge.enabled_for(cpp_bridge.RMS_NORM_ROUTE):
+        return _rms_norm_cpp_bridge(input_tensor, weight, eps)
+
     import infinicore.nn.functional as IF
 
     out = torch.empty_like(input_tensor)
@@ -525,6 +534,19 @@ def _rms_norm_infinicore(
     return out
 
 
+def _rms_norm_cpp_bridge(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    from . import cpp_bridge
+
+    module = cpp_bridge.module()
+    result = module.rms_norm_current_stream(input_tensor, weight, float(eps))
+    cpp_bridge.record_call(cpp_bridge.RMS_NORM_ROUTE)
+    return result
+
+
 def _rms_norm_torch(
     input_tensor: torch.Tensor,
     weight: torch.Tensor,
@@ -537,6 +559,11 @@ def _rms_norm_torch(
 
 
 def _silu_and_mul_infinicore(input_tensor: torch.Tensor) -> torch.Tensor:
+    from . import cpp_bridge
+
+    if cpp_bridge.enabled_for(cpp_bridge.SILU_AND_MUL_ROUTE):
+        return _silu_and_mul_cpp_bridge(input_tensor)
+
     import infinicore.nn.functional as IF
 
     d = input_tensor.shape[-1] // 2
@@ -552,6 +579,18 @@ def _silu_and_mul_infinicore(input_tensor: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _silu_and_mul_cpp_bridge(input_tensor: torch.Tensor) -> torch.Tensor:
+    from . import cpp_bridge
+
+    d = input_tensor.shape[-1] // 2
+    gate = input_tensor[..., :d]
+    up = input_tensor[..., d:]
+    module = cpp_bridge.module()
+    result = module.swiglu_current_stream(up, gate)
+    cpp_bridge.record_call(cpp_bridge.SILU_AND_MUL_ROUTE)
+    return result
+
+
 def _silu_and_mul_torch(input_tensor: torch.Tensor) -> torch.Tensor:
     d = input_tensor.shape[-1] // 2
     return F.silu(input_tensor[..., :d]) * input_tensor[..., d:]
@@ -562,6 +601,11 @@ def _linear_infinicore(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
+    from . import cpp_bridge
+
+    if bias is None and cpp_bridge.enabled_for(cpp_bridge.MATMUL_ROUTE):
+        return _linear_cpp_bridge(input_tensor, weight)
+
     import infinicore.nn.functional as IF
 
     out = torch.empty(
@@ -579,6 +623,15 @@ def _linear_infinicore(
         ),
     )
     return out
+
+
+def _linear_cpp_bridge(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    from . import cpp_bridge
+
+    module = cpp_bridge.module()
+    result = module.linear_current_stream(input_tensor, weight, None)
+    cpp_bridge.record_call(cpp_bridge.MATMUL_ROUTE)
+    return result
 
 
 def _lm_head_infinicore(
@@ -640,6 +693,21 @@ def _rotary_embedding_infinicore(
     cos_sin_cache: torch.Tensor,
     is_neox_style: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    from . import cpp_bridge
+
+    if (
+        rotary_dim == head_size
+        and cos_sin_cache.shape[-1] == head_size
+        and cpp_bridge.enabled_for(cpp_bridge.ROPE_ROUTE)
+    ):
+        return _rotary_embedding_cpp_bridge(
+            positions,
+            query,
+            key,
+            cos_sin_cache,
+            is_neox_style,
+        )
+
     import infinicore.nn.functional as IF
 
     cos, sin = cos_sin_cache.chunk(2, dim=-1)
@@ -673,6 +741,34 @@ def _rotary_embedding_infinicore(
         out[..., :rotary_dim].copy_(out_rot)
         out[..., rotary_dim:].copy_(view[..., rotary_dim:])
         return out.reshape(original_shape)
+
+    return apply_one(query), apply_one(key) if key is not None else None
+
+
+def _rotary_embedding_cpp_bridge(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    cos_sin_cache: torch.Tensor,
+    is_neox_style: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    from . import cpp_bridge
+
+    module = cpp_bridge.module()
+    cos, sin = cos_sin_cache.chunk(2, dim=-1)
+    positions = positions.flatten().to(torch.int32)
+    max_position = int(cos_sin_cache.shape[0]) - 1
+    if max_position >= 0:
+        positions = positions.clamp(0, max_position)
+    sin = sin.contiguous()
+    cos = cos.contiguous()
+
+    def apply_one(tensor: torch.Tensor) -> torch.Tensor:
+        original_shape = tensor.shape
+        view = tensor.view(positions.shape[0], -1, original_shape[-1])
+        result = module.rope_current_stream(view, positions, sin, cos, is_neox_style)
+        cpp_bridge.record_call(cpp_bridge.ROPE_ROUTE)
+        return result.reshape(original_shape)
 
     return apply_one(query), apply_one(key) if key is not None else None
 
@@ -757,6 +853,12 @@ def _store_kv_cache_infinicore(
     value: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
+    from . import cpp_bridge
+
+    if cpp_bridge.enabled_for(cpp_bridge.STORE_KV_CACHE_ROUTE):
+        _store_kv_cache_cpp_bridge(kv_cache, key, value, slot_mapping)
+        return
+
     import infinicore
 
     key_cache, value_cache = _cache_views(kv_cache, key)
@@ -771,6 +873,24 @@ def _store_kv_cache_infinicore(
             _as_infini(slot_mapping.flatten()),
         ),
     )
+
+
+def _store_kv_cache_cpp_bridge(
+    kv_cache: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    from . import cpp_bridge
+
+    module = cpp_bridge.module()
+    module.store_kv_cache_current_stream(
+        kv_cache,
+        key,
+        value,
+        _on_reference_device(slot_mapping, key),
+    )
+    cpp_bridge.record_call(cpp_bridge.STORE_KV_CACHE_ROUTE)
 
 
 def _store_kv_cache_torch(
@@ -870,8 +990,6 @@ def _paged_attention_decode_infinicore(
     attn_metadata: Any,
     output: torch.Tensor,
 ) -> None:
-    import infinicore
-
     num_decode_tokens = int(getattr(attn_metadata, "num_decode_tokens", 0))
     num_decodes = int(getattr(attn_metadata, "num_decodes", 0))
     if num_decode_tokens == 0:
@@ -880,6 +998,19 @@ def _paged_attention_decode_infinicore(
         raise RuntimeError("InfiniCore paged attention wrapper does not support speculative decode")
     from . import cpp_bridge
 
+    if cpp_bridge.enabled_for(cpp_bridge.FLASH_DECODE_ROUTE):
+        _paged_attention_decode_flash_cpp_bridge(
+            query,
+            key,
+            kv_cache,
+            attn_metadata,
+            output,
+            attn_impl.alibi_slopes,
+            attn_impl.scale,
+            num_decode_tokens,
+            num_decodes,
+        )
+        return
     if cpp_bridge.enabled_for(cpp_bridge.DECODE_ROUTE):
         _run_on_infinicore_stream(
             query,
@@ -896,6 +1027,8 @@ def _paged_attention_decode_infinicore(
             ),
         )
         return
+    import infinicore
+
     key_cache, value_cache = _cache_views(kv_cache, key)
     q = query[:num_decode_tokens]
     out = output[:num_decode_tokens].view(q.shape)
@@ -944,6 +1077,36 @@ def _paged_attention_decode_cpp_bridge(
         output,
     )
     cpp_bridge.record_call(cpp_bridge.DECODE_ROUTE)
+
+
+def _paged_attention_decode_flash_cpp_bridge(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: Any,
+    output: torch.Tensor,
+    alibi_slopes: torch.Tensor | None,
+    scale: float,
+    num_decode_tokens: int,
+    num_decodes: int,
+) -> None:
+    from . import cpp_bridge
+
+    module = cpp_bridge.module()
+    module.paged_attention_decode_flash_out(
+        query,
+        key,
+        kv_cache,
+        attn_metadata.decode_seq_lens,
+        attn_metadata.decode_block_table,
+        alibi_slopes,
+        float(scale),
+        int(num_decode_tokens),
+        int(num_decodes),
+        cpp_bridge.flash_decode_num_splits(),
+        output,
+    )
+    cpp_bridge.record_call(cpp_bridge.FLASH_DECODE_ROUTE)
 
 
 def _paged_attention_decode_as_prefill_infinicore(

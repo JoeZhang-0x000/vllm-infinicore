@@ -12,7 +12,7 @@ This document defines the first operator scope for single-node Qwen3 inference. 
 | `LMHead` | Final projection | PyTorch custom op wrapper | Disabled | `UnquantizedEmbeddingMethod.apply` for `ParallelLMHead` -> `vllm_infinicore::lm_head` | vLLM native logits projection |
 | `StoreKVCache` | KV cache update | InfiniCore PA/KV wrapper | Disabled | attention backend `do_kv_cache_update` -> `infinicore.paged_caching` | vLLM native KV cache store path |
 | `PagedAttentionPrefill` | Paged attention | InfiniCore PA/KV wrapper | Disabled | attention backend `forward` -> `infinicore.paged_attention_prefill` | vLLM native paged attention prefill backend |
-| `PagedAttentionDecode` | Paged attention | InfiniCore PA/KV wrapper | Disabled | attention backend `forward` -> C++ bridge -> InfiniCore `mha_kvcache_` | vLLM native paged attention decode backend |
+| `PagedAttentionDecode` | Paged attention | InfiniCore PA/KV wrapper | Disabled | attention backend `forward` -> C++ bridge `PagedAttentionDecodeFlash` | vLLM native paged attention decode backend |
 
 ## Routing And Defaults
 
@@ -184,10 +184,10 @@ The `all` run installed all nine scoped routes and recorded nonzero InfiniCore
 calls for Embedding, RMSNorm, MatMul/Linear, RoPE, StoreKVCache,
 PagedAttentionPrefill, SiluAndMul, LMHead, and PagedAttentionDecode.
 `PagedAttentionPrefill` now dispatches to InfiniCore's FlashAttention-wrapped
-`mha_varlen`, and `PagedAttentionDecode` dispatches to
-the plugin C++ bridge to InfiniCore `mha_kvcache_`. This keeps the
-all-scoped-operators requirement while avoiding the slower Python
-`infinicore.paged_attention` decode wrapper.
+`mha_varlen`, and `PagedAttentionDecode` dispatches to the plugin C++ bridge
+route `PagedAttentionDecodeFlash`. This keeps the all-scoped-operators
+requirement while avoiding the slower Python `infinicore.paged_attention`
+decode wrapper and the older external-stream `mha_kvcache_` bridge.
 
 Older `bs=8`, `input_len=4096`, `output_len=512` runs reduced the full-route
 result from `43.17` to `211.73`, then to `262.41` output tok/s after the RoPE
@@ -195,16 +195,27 @@ wrapper optimization. A later 95% follow-up retained per-device InfiniCore
 stream pointer caching and measured `262.97` output tok/s for
 `VLLM_INFINICORE_ROUTES=all` against `280.93` same-run vLLM native (`93.61%`).
 
-`PagedAttentionDecode` now routes through the plugin C++ bridge by default.
-The bridge calls InfiniCore `mha_kvcache_` below the Python wrapper layer and
-records bridge counters. It can be disabled for A/B tests with
-`VLLM_INFINICORE_DISABLE_CPP_BRIDGE=1`.
+`PagedAttentionDecode` and bias-free `MatMul` now route through the plugin C++
+bridge by default. The default bridge routes are
+`PagedAttentionDecodeFlash,MatMul`; Flash decode uses the InfiniCore-vendored
+FlashAttention adaptor from the current vLLM stream and records bridge
+counters. The older external-stream `mha_kvcache_` bridge can be selected for
+A/B tests with
+`VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode`.
 
 `LMHead` remains opt-in through:
 
 ```text
-VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode,LMHead
+VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecodeFlash,LMHead
 ```
+
+For Qwen2.5-0.5B-Instruct TP=1 at `input_len=2048`, `output_len=1024`, the
+current strict no-MetaX default measured `102.14` output tok/s versus the
+same-shape vLLM MetaX baseline `145.65` output tok/s (`70.1%`). The run
+reported `vllm_metax_loaded=false`, backend
+`vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`,
+and bridge counters `PagedAttentionDecodeFlash=24552`, `MatMul=72`. Artifact:
+`artifacts/xzh-53-qwen25-clean-default-20260605-011125`.
 
 On the current Qwen3-4B single-GPU decision shape (`bs=8`, `input_len=1024`,
 `output_len=512`), default bridged decode measured `412.44` output tok/s

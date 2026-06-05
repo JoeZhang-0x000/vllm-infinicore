@@ -1,0 +1,28 @@
+version: 1
+defaults:
+  backend: infinicore
+ops:
+  RMSNorm:
+    backend: infinicore
+  GemmaRMSNorm:
+    backend: infinicore
+  SiluAndMul:
+    backend: original
+  ApplyRotaryEmb:
+    backend: infinicore
+  Embedding:
+    backend: infinicore
+  MatMul:
+    backend: infinicore
+  LMHead:
+    backend: infinicore
+  StoreKVCache:
+    backend: infinicore
+  MhaVarlenFA2:
+    backend: infinicore
+  MhaKVCacheFA2:
+    backend: infinicore
+  PagedAttentionPrefill:
+    backend: infinicore
+  PagedAttentionDecode:
+    backend: infinicore
