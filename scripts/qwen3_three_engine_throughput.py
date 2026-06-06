@@ -120,6 +120,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--distributed-executor-backend", default="")
+    parser.add_argument(
+        "--execution-mode",
+        choices=("graph", "eager"),
+        default="graph",
+        help="Use PIECEWISE cudagraph or vLLM eager execution for vLLM cases.",
+    )
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--run-dir", default="")
     parser.add_argument("--infinilm-root", default=DEFAULT_INFINILM_ROOT)
@@ -295,7 +301,10 @@ def build_manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
     for spec in case_specs:
         engine = spec["engine"]
         case_name = spec["case_name"]
-        case_id = f"{case_name}-graph-bs{args.batch_size}-in{args.input_len}-out{args.output_len}"
+        case_id = (
+            f"{case_name}-{args.execution_mode}-bs{args.batch_size}"
+            f"-in{args.input_len}-out{args.output_len}"
+        )
         cases.append(
             {
                 "case_id": case_id,
@@ -326,7 +335,8 @@ def build_manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
         "temperature": 0.0,
         "top_p": 1.0,
         "top_k": 1,
-        "graph_mode": True,
+        "execution_mode": args.execution_mode,
+        "graph_mode": args.execution_mode == "graph",
         "prompt_path": str(prompt_path),
         "infinilm_root": args.infinilm_root,
         "infini_device": args.infini_device,
@@ -458,11 +468,16 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
 
     distributed_executor_backend = manifest.get("distributed_executor_backend") or None
     if distributed_executor_backend == "ray":
-        from vllm_infinicore.ray import configure_ray_environment
+        from vllm_infinicore.ray import (
+            PLUGIN_ENV_VARS,
+            RUNTIME_ENV_VARS,
+            configure_ray_environment,
+        )
 
         configure_ray_environment(
             distributed_executor_backend=distributed_executor_backend,
         )
+        _ensure_ray_runtime_env((*PLUGIN_ENV_VARS, *RUNTIME_ENV_VARS))
 
     import torch
     from transformers import AutoTokenizer
@@ -473,12 +488,23 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
     tokenizer = AutoTokenizer.from_pretrained(manifest["model"], trust_remote_code=True)
     prompt_ids = prompt_payload["prompt_token_ids"]
     prompts = [TokensPrompt(prompt_token_ids=prompt_ids) for _ in range(manifest["batch_size"])]
-    comp_config = {
-        "cudagraph_mode": CUDAGraphMode.PIECEWISE,
-        "cudagraph_capture_sizes": [1, 2, 4, 8],
-        "cudagraph_num_of_warmups": 1,
-        "backend": "eager",
-    }
+    execution_mode = manifest.get("execution_mode", "graph")
+    if execution_mode == "eager":
+        comp_config = {
+            "cudagraph_mode": CUDAGraphMode.NONE,
+            "cudagraph_capture_sizes": [],
+            "cudagraph_num_of_warmups": 0,
+            "backend": "eager",
+        }
+        enforce_eager = True
+    else:
+        comp_config = {
+            "cudagraph_mode": CUDAGraphMode.PIECEWISE,
+            "cudagraph_capture_sizes": [1, 2, 4, 8],
+            "cudagraph_num_of_warmups": 1,
+            "backend": "eager",
+        }
+        enforce_eager = False
     llm_kwargs = {
         "model": manifest["model"],
         "dtype": manifest["dtype"],
@@ -486,7 +512,7 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
         "tensor_parallel_size": int(manifest.get("tensor_parallel_size", 1)),
         "gpu_memory_utilization": manifest["gpu_memory_utilization"],
         "max_model_len": manifest["max_model_len"],
-        "enforce_eager": False,
+        "enforce_eager": enforce_eager,
         "compilation_config": comp_config,
         "enable_prefix_caching": False,
     }
@@ -550,6 +576,7 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
     result.update(
         {
             "vllm_compilation_config": str(comp_config),
+            "vllm_enforce_eager": enforce_eager,
             "registration": _registration_dict(registration),
             "environment": {
                 "VLLM_PLUGINS": os.environ.get("VLLM_PLUGINS", ""),
@@ -746,7 +773,8 @@ def _base_result(case: dict[str, Any], manifest: dict[str, Any], prompt_payload:
         "repeats": manifest["repeats"],
         "tensor_parallel_size": manifest.get("tensor_parallel_size", 1),
         "distributed_executor_backend": manifest.get("distributed_executor_backend", ""),
-        "graph_mode_requested": True,
+        "execution_mode": manifest.get("execution_mode", "graph"),
+        "graph_mode_requested": manifest.get("execution_mode", "graph") == "graph",
         "sampling": {
             "temperature": 0.0,
             "top_p": 1.0,
@@ -768,7 +796,11 @@ def _finalize(result: dict[str, Any], iterations: list[dict[str, Any]]) -> dict[
         for error in item.get("validation_errors", [])
     ]
     graph_errors = []
-    if result["engine"].startswith("vllm") and result.get("graph_capture_count", 0) <= 0:
+    if (
+        result["engine"].startswith("vllm")
+        and result.get("graph_mode_requested", True)
+        and result.get("graph_capture_count", 0) <= 0
+    ):
         graph_errors.append("graph_capture_count=0")
     validation_errors.extend(graph_errors)
     if (
@@ -806,6 +838,27 @@ def _worker_env(manifest: dict[str, Any], engine: str) -> dict[str, str]:
     else:
         env["VLLM_PLUGINS"] = "metax"
     return env
+
+
+def _ensure_ray_runtime_env(env_names: tuple[str, ...]) -> None:
+    try:
+        import ray
+    except Exception:
+        return
+
+    env_vars = {
+        name: os.environ.get(name, "")
+        for name in env_names
+        if os.environ.get(name) is not None
+    }
+    if not env_vars:
+        return
+    try:
+        if ray.is_initialized():
+            return
+        ray.init(address="auto", runtime_env={"env_vars": env_vars})
+    except Exception:
+        return
 
 
 def _registration_dict(registration: Any) -> dict[str, Any] | None:
@@ -1069,14 +1122,15 @@ def _write_summary_md(
     lines = [
         "# Qwen3 Throughput",
         "",
-        "| Case | Engine | Routes | Disabled | Valid | Output TPS | Median | Min | Max | Stdev | Graph Captures | Result |",
-        "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|",
+        "| Case | Mode | Engine | Routes | Disabled | Valid | Output TPS | Median | Min | Max | Stdev | Graph Captures | Result |",
+        "|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for result in results:
         stats_ = result.get("iteration_tps_stats") or {}
         result_path = Path("results") / f"{result.get('case_id')}.json"
         lines.append(
             f"| {result.get('case_name', result.get('engine'))} | "
+            f"{result.get('execution_mode', '')} | "
             f"{result.get('engine')} | "
             f"{result.get('infinicore_routes', '')} | "
             f"{result.get('infinicore_disabled_routes', '')} | "

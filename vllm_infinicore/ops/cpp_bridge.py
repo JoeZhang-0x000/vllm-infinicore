@@ -35,6 +35,11 @@ DEFAULT_ROUTES = (
     FLASH_DECODE_ROUTE,
     MATMUL_ROUTE,
 )
+RAY_DEFAULT_ROUTES = (
+    FLASH_DECODE_ROUTE,
+    MATMUL_ROUTE,
+    STORE_KV_CACHE_ROUTE,
+)
 
 _MODULE: Any | None = None
 _LOAD_ERROR: str | None = None
@@ -91,6 +96,8 @@ def _parse_selected_routes() -> tuple[str, ...]:
 
     raw = os.environ.get(CPP_BRIDGE_ROUTES_ENV)
     if raw is None or not raw.strip():
+        if _env_truthy("VLLM_INFINICORE_RAY_BACKEND"):
+            return RAY_DEFAULT_ROUTES
         return DEFAULT_ROUTES
     routes = tuple(route.strip() for route in raw.split(",") if route.strip())
     if routes == ("all",):
