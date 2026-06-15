@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 
 from .patching import PatchUninstallSummary, RegistrationResult, get_default_registry
+from .ray import register_vllm_environment
+from .runtime_patches import apply_vllm_020_compat_patches
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,9 @@ def register() -> RegistrationResult:
     if _REGISTERED and _REGISTRATION_RESULT is not None:
         return _REGISTRATION_RESULT
 
+    register_vllm_environment()
+    compat_status = apply_vllm_020_compat_patches()
+
     registry = get_default_registry()
     result = registry.register_from_environment()
 
@@ -37,6 +42,8 @@ def register() -> RegistrationResult:
         ",".join(result.installed_routes) or "-",
         result.reason,
     )
+    if compat_status.applied:
+        logger.info("vllm-infinicore vLLM 0.20 compatibility patches: %s", compat_status)
     return result
 
 

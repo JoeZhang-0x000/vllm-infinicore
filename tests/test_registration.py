@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import types
 import unittest
 from unittest import mock
 
@@ -51,6 +52,44 @@ class RegistrationTests(unittest.TestCase):
             tuple(state.status for state in first.route_states),
             (ROUTE_STATE_DISABLED,) * 9,
         )
+
+    def test_register_exposes_environment_to_vllm_child_processes(self) -> None:
+        fake_vllm = types.ModuleType("vllm")
+        fake_envs = types.ModuleType("vllm.envs")
+        fake_envs.environment_variables = {}
+        fake_vllm.envs = fake_envs
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "vllm": fake_vllm,
+                    "vllm.envs": fake_envs,
+                },
+            ),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "VLLM_INFINICORE_ENABLE_PATCHES": "",
+                    "VLLM_INFINICORE_ROUTES": "all",
+                    "VLLM_INFINICORE_STRICT_BACKEND": "1",
+                    "INFINI_ROOT": "/root/.infini",
+                },
+                clear=True,
+            ),
+        ):
+            plugin.register()
+            registered_routes = fake_envs.environment_variables[
+                "VLLM_INFINICORE_ROUTES"
+            ]()
+            registered_infini_root = fake_envs.environment_variables["INFINI_ROOT"]()
+            registered_strict = fake_envs.environment_variables[
+                "VLLM_INFINICORE_STRICT_BACKEND"
+            ]()
+
+        self.assertEqual(registered_routes, "all")
+        self.assertEqual(registered_infini_root, "/root/.infini")
+        self.assertEqual(registered_strict, "1")
 
     def test_route_selector_installs_explicit_rmsnorm(self) -> None:
         calls: list[str] = []

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
+import importlib
 from typing import Iterable
 
 RAY_NOSET_CUDA_VISIBLE_DEVICES_ENV = "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"
@@ -28,6 +30,7 @@ PLUGIN_ENV_VARS: tuple[str, ...] = (
 RUNTIME_ENV_VARS: tuple[str, ...] = (
     "VLLM_PLUGINS",
     "VLLM_ENABLE_V1_MULTIPROCESSING",
+    "VLLM_WORKER_MULTIPROC_METHOD",
     "MACA_PATH",
     "MACA_HOME",
     "MACA_ROOT",
@@ -38,6 +41,7 @@ RUNTIME_ENV_VARS: tuple[str, ...] = (
     "LD_LIBRARY_PATH",
     "PATH",
     "PYTHONPATH",
+    "XMAKE_ROOT",
 )
 
 
@@ -76,8 +80,7 @@ def configure_ray_environment(
 
     os.environ.setdefault(RAY_NOSET_CUDA_VISIBLE_DEVICES_ENV, "1")
     os.environ[RAY_BACKEND_ENV] = "1"
-    names = _ordered_unique((*PLUGIN_ENV_VARS, *RUNTIME_ENV_VARS, *extra_env_vars))
-    registered = _register_vllm_env_vars(names)
+    registered = register_vllm_environment(extra_env_vars=extra_env_vars)
     return RayEnvironmentStatus(
         enabled=True,
         noset_cuda_visible_devices=os.environ.get(
@@ -88,10 +91,24 @@ def configure_ray_environment(
     )
 
 
+def register_vllm_environment(
+    *,
+    extra_env_vars: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Register plugin/runtime variables for vLLM child processes."""
+
+    names = _ordered_unique((*PLUGIN_ENV_VARS, *RUNTIME_ENV_VARS, *extra_env_vars))
+    return _register_vllm_env_vars(names)
+
+
 def _register_vllm_env_vars(names: tuple[str, ...]) -> tuple[str, ...]:
-    try:
-        import vllm.envs as vllm_envs
-    except Exception:
+    vllm_envs = sys.modules.get("vllm.envs")
+    if vllm_envs is None and "vllm" in sys.modules:
+        try:
+            vllm_envs = importlib.import_module("vllm.envs")
+        except Exception:
+            return ()
+    if vllm_envs is None:
         return ()
 
     environment_variables = getattr(vllm_envs, "environment_variables", None)
@@ -120,4 +137,5 @@ __all__ = [
     "RUNTIME_ENV_VARS",
     "RayEnvironmentStatus",
     "configure_ray_environment",
+    "register_vllm_environment",
 ]
