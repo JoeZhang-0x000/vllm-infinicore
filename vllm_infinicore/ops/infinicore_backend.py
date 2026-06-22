@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 _CALL_COUNTS: dict[str, int] = {}
 _PY_CAPSULE_GET_POINTER: Any | None = None
 _INFINICORE_STREAM_PTRS: dict[tuple[str, int], int] = {}
-_EXTERNAL_STREAMS: dict[tuple[str, int, int], torch.cuda.ExternalStream] = {}
+_EXTERNAL_STREAMS: dict[tuple[str, int, int], Any] = {}
 _INFINI_TENSOR_CACHE_MAX = 4096
 _INFINI_TENSOR_CACHE: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
 
@@ -316,7 +316,7 @@ def _record_call(op_name: str) -> None:
 
 
 def _should_use_infinicore(tensor: torch.Tensor) -> bool:
-    return tensor.is_cuda and not _env_truthy(REAL_BACKEND_DISABLE_ENV)
+    return _is_accelerator_tensor(tensor) and not _env_truthy(REAL_BACKEND_DISABLE_ENV)
 
 
 def strict_backend_enabled() -> bool:
@@ -340,7 +340,7 @@ def _as_infini(tensor: torch.Tensor) -> Any:
 
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
-    if tensor.is_cuda:
+    if _is_accelerator_tensor(tensor):
         wrapped = _as_infini_strided(tensor)
         wrapped._torch_ref = tensor
         return wrapped
@@ -383,7 +383,7 @@ def _as_infini_strided(tensor: torch.Tensor) -> Any:
         list(tensor.shape),
         list(tensor.stride()),
         dtype=to_infinicore_dtype(tensor.dtype),
-        device=infinicore.device(tensor.device.type, device_index),
+        device=infinicore.device(_infinicore_device_type(tensor), device_index),
     )
 
 
@@ -424,18 +424,28 @@ def _run_on_infinicore_stream(
 ) -> Any:
     """Launch InfiniCore work on its stream while joining PyTorch stream order."""
 
-    if not reference_tensor.is_cuda:
+    if not _is_accelerator_tensor(reference_tensor):
         return launch()
 
     stream = _infinicore_external_stream(reference_tensor)
     if stream is None:
-        if _is_cuda_graph_capturing(reference_tensor):
-            raise RuntimeError("InfiniCore stream is unavailable during CUDA graph capture")
+        if _is_graph_capturing(reference_tensor):
+            raise RuntimeError(
+                "InfiniCore stream is unavailable during accelerator graph capture"
+            )
         return launch()
 
-    original_stream = torch.cuda.current_stream(reference_tensor.device)
+    device_api = _torch_device_api(reference_tensor)
+    if device_api is None:
+        if _is_graph_capturing(reference_tensor):
+            raise RuntimeError(
+                "InfiniCore stream bridge is unavailable during accelerator graph capture"
+            )
+        return launch()
+
+    original_stream = device_api.current_stream(reference_tensor.device)
     stream.wait_stream(original_stream)
-    with torch.cuda.stream(stream):
+    with device_api.stream(stream):
         result = launch()
     original_stream.wait_stream(stream)
     return result
@@ -443,7 +453,10 @@ def _run_on_infinicore_stream(
 
 def _infinicore_external_stream(
     reference_tensor: torch.Tensor,
-) -> torch.cuda.ExternalStream | None:
+) -> Any | None:
+    device_api = _torch_device_api(reference_tensor)
+    if device_api is None or not hasattr(device_api, "ExternalStream"):
+        return None
     device_index = reference_tensor.device.index if reference_tensor.device.index is not None else 0
     device_key = (reference_tensor.device.type, device_index)
     ptr = _INFINICORE_STREAM_PTRS.get(device_key)
@@ -451,7 +464,7 @@ def _infinicore_external_stream(
         try:
             import infinicore
 
-            with torch.cuda.device(reference_tensor.device):
+            with device_api.device(reference_tensor.device):
                 _set_infinicore_device(reference_tensor)
                 ptr = _capsule_pointer(infinicore.get_stream())
         except Exception:
@@ -464,8 +477,8 @@ def _infinicore_external_stream(
     stream_key = device_key + (ptr,)
     stream = _EXTERNAL_STREAMS.get(stream_key)
     if stream is None:
-        with torch.cuda.device(reference_tensor.device):
-            stream = torch.cuda.ExternalStream(ptr)
+        with device_api.device(reference_tensor.device):
+            stream = device_api.ExternalStream(ptr)
         _EXTERNAL_STREAMS[stream_key] = stream
     return stream
 
@@ -482,24 +495,58 @@ def _capsule_pointer(capsule: Any) -> int:
 
 
 def _set_infinicore_device(tensor: torch.Tensor) -> None:
-    if not tensor.is_cuda:
+    if not _is_accelerator_tensor(tensor):
         return
     try:
         import infinicore
 
         device_index = tensor.device.index if tensor.device.index is not None else 0
-        infinicore.set_device(infinicore.device(tensor.device.type, device_index))
+        infinicore.set_device(
+            infinicore.device(_infinicore_device_type(tensor), device_index)
+        )
     except Exception:
         return
 
 
-def _is_cuda_graph_capturing(reference_tensor: torch.Tensor) -> bool:
-    if not reference_tensor.is_cuda:
+def _is_graph_capturing(reference_tensor: torch.Tensor) -> bool:
+    if not _is_accelerator_tensor(reference_tensor):
+        return False
+    device_api = _torch_device_api(reference_tensor)
+    if device_api is None or not hasattr(device_api, "is_current_stream_capturing"):
         return False
     try:
-        return bool(torch.cuda.is_current_stream_capturing())
+        return bool(device_api.is_current_stream_capturing())
     except Exception:
         return False
+
+
+def _is_accelerator_tensor(tensor: torch.Tensor) -> bool:
+    device = getattr(tensor, "device", None)
+    device_type = getattr(device, "type", "")
+    return (
+        bool(getattr(tensor, "is_cuda", False))
+        or bool(getattr(tensor, "is_musa", False))
+        or device_type in {"cuda", "musa", "privateuseone"}
+    )
+
+
+def _torch_device_api(tensor: torch.Tensor) -> Any | None:
+    device_type = getattr(getattr(tensor, "device", None), "type", "")
+    if bool(getattr(tensor, "is_cuda", False)) or device_type == "cuda":
+        return getattr(torch, "cuda", None)
+    if bool(getattr(tensor, "is_musa", False)) or device_type in {
+        "musa",
+        "privateuseone",
+    }:
+        return getattr(torch, "musa", None)
+    return None
+
+
+def _infinicore_device_type(tensor: torch.Tensor) -> str:
+    device_type = getattr(getattr(tensor, "device", None), "type", "")
+    if device_type == "privateuseone":
+        return "musa"
+    return device_type
 
 
 def _on_reference_device(tensor: torch.Tensor | None, reference: torch.Tensor) -> torch.Tensor | None:
@@ -582,11 +629,9 @@ def _silu_and_mul_infinicore(input_tensor: torch.Tensor) -> torch.Tensor:
 def _silu_and_mul_cpp_bridge(input_tensor: torch.Tensor) -> torch.Tensor:
     from . import cpp_bridge
 
-    d = input_tensor.shape[-1] // 2
-    gate = input_tensor[..., :d]
-    up = input_tensor[..., d:]
     module = cpp_bridge.module()
-    result = module.swiglu_current_stream(up, gate)
+    input_arg = input_tensor if input_tensor.is_contiguous() else input_tensor.contiguous()
+    result = module.silu_and_mul_current_stream(input_arg)
     cpp_bridge.record_call(cpp_bridge.SILU_AND_MUL_ROUTE)
     return result
 
@@ -642,10 +687,7 @@ def _lm_head_infinicore(
     from . import cpp_bridge
 
     if cpp_bridge.enabled_for(cpp_bridge.LM_HEAD_ROUTE):
-        return _run_on_infinicore_stream(
-            input_tensor,
-            lambda: _lm_head_cpp_bridge(input_tensor, weight, bias),
-        )
+        return _lm_head_cpp_bridge(input_tensor, weight, bias)
     return _linear_infinicore(input_tensor, weight, bias)
 
 
@@ -666,6 +708,11 @@ def _embedding_infinicore(
     input_tensor: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
+    from . import cpp_bridge
+
+    if cpp_bridge.enabled_for(cpp_bridge.EMBEDDING_ROUTE):
+        return _embedding_cpp_bridge(input_tensor, weight)
+
     import infinicore.nn.functional as IF
 
     out = torch.empty(
@@ -682,6 +729,19 @@ def _embedding_infinicore(
         ),
     )
     return out
+
+
+def _embedding_cpp_bridge(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    from . import cpp_bridge
+
+    module = cpp_bridge.module()
+    input_tensor = _on_reference_device(input_tensor.long(), weight)
+    result = module.embedding_current_stream(input_tensor, weight)
+    cpp_bridge.record_call(cpp_bridge.EMBEDDING_ROUTE)
+    return result
 
 
 def _rotary_embedding_infinicore(
@@ -704,6 +764,7 @@ def _rotary_embedding_infinicore(
             positions,
             query,
             key,
+            head_size,
             cos_sin_cache,
             is_neox_style,
         )
@@ -749,6 +810,7 @@ def _rotary_embedding_cpp_bridge(
     positions: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor | None,
+    head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox_style: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -765,7 +827,7 @@ def _rotary_embedding_cpp_bridge(
 
     def apply_one(tensor: torch.Tensor) -> torch.Tensor:
         original_shape = tensor.shape
-        view = tensor.view(positions.shape[0], -1, original_shape[-1])
+        view = tensor.view(positions.shape[0], -1, head_size)
         result = module.rope_current_stream(view, positions, sin, cos, is_neox_style)
         cpp_bridge.record_call(cpp_bridge.ROPE_ROUTE)
         return result.reshape(original_shape)
@@ -812,27 +874,30 @@ def _rotary_embedding_torch(
 
 
 def _cache_views(kv_cache: torch.Tensor, key: torch.Tensor) -> tuple[Any, Any]:
-    key_cache, value_cache = _split_kv_cache(kv_cache)
-    num_kv_heads = key.shape[1]
-    if key_cache.shape[1] == num_kv_heads:
-        return _as_infini_strided_cached(key_cache), _as_infini_strided_cached(value_cache)
-    if key_cache.shape[2] == num_kv_heads:
-        return _as_infini_strided_cached(
-            key_cache.permute(0, 2, 1, 3)
-        ), _as_infini_strided_cached(value_cache.permute(0, 2, 1, 3))
-    raise RuntimeError(f"cannot infer KV cache layout from key={key.shape}, cache={kv_cache.shape}")
+    key_cache, value_cache = _cache_tensors(kv_cache, key, heads_dim=1)
+    return _as_infini_strided_cached(key_cache), _as_infini_strided_cached(value_cache)
 
 
 def _cache_views_bshd(kv_cache: torch.Tensor, key: torch.Tensor) -> tuple[Any, Any]:
+    key_cache, value_cache = _cache_tensors(kv_cache, key, heads_dim=2)
+    return _as_infini_strided_cached(key_cache), _as_infini_strided_cached(value_cache)
+
+
+def _cache_tensors(
+    kv_cache: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    heads_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     key_cache, value_cache = _split_kv_cache(kv_cache)
     num_kv_heads = key.shape[1]
-    if key_cache.shape[1] == num_kv_heads:
-        return _as_infini_strided_cached(
-            key_cache.permute(0, 2, 1, 3)
-        ), _as_infini_strided_cached(value_cache.permute(0, 2, 1, 3))
-    if key_cache.shape[2] == num_kv_heads:
-        return _as_infini_strided_cached(key_cache), _as_infini_strided_cached(value_cache)
-    raise RuntimeError(f"cannot infer KV cache layout from key={key.shape}, cache={kv_cache.shape}")
+    if key_cache.shape[heads_dim] == num_kv_heads:
+        return key_cache, value_cache
+    if key_cache.shape[3 - heads_dim] == num_kv_heads:
+        return key_cache.permute(0, 2, 1, 3), value_cache.permute(0, 2, 1, 3)
+    raise RuntimeError(
+        f"cannot infer KV cache layout from key={key.shape}, cache={kv_cache.shape}"
+    )
 
 
 def _split_kv_cache(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -943,6 +1008,19 @@ def _paged_attention_prefill_infinicore(
     attn_metadata: Any,
     output: torch.Tensor,
 ) -> None:
+    from . import cpp_bridge
+
+    if cpp_bridge.enabled_for(cpp_bridge.PREFILL_ROUTE):
+        _paged_attention_prefill_cpp_bridge(
+            attn_impl,
+            query,
+            key,
+            kv_cache,
+            attn_metadata,
+            output,
+        )
+        return
+
     import infinicore
 
     key_cache, value_cache = _cache_views_bshd(kv_cache, key)
@@ -982,6 +1060,42 @@ def _paged_attention_prefill_infinicore(
     )
 
 
+def _paged_attention_prefill_cpp_bridge(
+    attn_impl: Any,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: Any,
+    output: torch.Tensor,
+) -> None:
+    from . import cpp_bridge
+
+    key_cache, value_cache = _cache_tensors(kv_cache, key, heads_dim=1)
+    num_decode_tokens = int(getattr(attn_metadata, "num_decode_tokens", 0))
+    num_actual_tokens = int(attn_metadata.num_actual_tokens)
+    q = query[num_decode_tokens:num_actual_tokens]
+    if q.numel() == 0:
+        return
+    total_lens = _on_reference_device(_prefill_total_lens(attn_metadata), query)
+    query_start_loc = _on_reference_device(attn_metadata.prefill_query_start_loc, query)
+    block_table = _on_reference_device(attn_metadata.prefill_block_table, query)
+    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
+
+    module = cpp_bridge.module()
+    module.paged_attention_prefill_current_stream(
+        q,
+        key_cache,
+        value_cache,
+        block_table,
+        total_lens,
+        query_start_loc,
+        alibi_slopes,
+        float(attn_impl.scale),
+        output[num_decode_tokens:num_actual_tokens].view(q.shape),
+    )
+    cpp_bridge.record_call(cpp_bridge.PREFILL_ROUTE)
+
+
 def _paged_attention_decode_infinicore(
     attn_impl: Any,
     query: torch.Tensor,
@@ -999,6 +1113,17 @@ def _paged_attention_decode_infinicore(
     from . import cpp_bridge
 
     if cpp_bridge.enabled_for(cpp_bridge.FLASH_DECODE_ROUTE):
+        if cpp_bridge.bridge_target() == cpp_bridge.MUSA_TARGET:
+            _paged_attention_decode_flash_musa(
+                attn_impl,
+                query,
+                key,
+                kv_cache,
+                attn_metadata,
+                output,
+                num_decode_tokens,
+            )
+            return
         _paged_attention_decode_flash_cpp_bridge(
             query,
             key,
@@ -1012,19 +1137,16 @@ def _paged_attention_decode_infinicore(
         )
         return
     if cpp_bridge.enabled_for(cpp_bridge.DECODE_ROUTE):
-        _run_on_infinicore_stream(
+        _paged_attention_decode_cpp_bridge(
             query,
-            lambda: _paged_attention_decode_cpp_bridge(
-                query,
-                key,
-                kv_cache,
-                attn_metadata,
-                output,
-                attn_impl.alibi_slopes,
-                attn_impl.scale,
-                num_decode_tokens,
-                num_decodes,
-            ),
+            key,
+            kv_cache,
+            attn_metadata,
+            output,
+            attn_impl.alibi_slopes,
+            attn_impl.scale,
+            num_decode_tokens,
+            num_decodes,
         )
         return
     import infinicore
@@ -1109,6 +1231,58 @@ def _paged_attention_decode_flash_cpp_bridge(
     cpp_bridge.record_call(cpp_bridge.FLASH_DECODE_ROUTE)
 
 
+def _paged_attention_decode_flash_musa(
+    attn_impl: Any,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: Any,
+    output: torch.Tensor,
+    num_decode_tokens: int,
+) -> None:
+    from . import cpp_bridge
+
+    try:
+        from flash_attn.vllm_interface import flash_attn_varlen_func
+    except Exception as exc:
+        raise RuntimeError("MUSA flash attention varlen interface is unavailable") from exc
+
+    q = query[:num_decode_tokens]
+    out = output[:num_decode_tokens].view(q.shape)
+    key_cache, value_cache = _cache_tensors(kv_cache, key, heads_dim=2)
+    decode_query_start_loc = _on_reference_device(
+        attn_metadata.decode_query_start_loc,
+        query,
+    )
+    decode_seq_lens = _on_reference_device(attn_metadata.decode_seq_lens, query)
+    decode_block_table = _on_reference_device(attn_metadata.decode_block_table, query)
+    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
+    sliding_window = getattr(attn_impl, "sliding_window", (-1, -1))
+    if sliding_window is not None and not isinstance(sliding_window, list):
+        sliding_window = list(sliding_window)
+
+    flash_attn_varlen_func(
+        q=q,
+        k=key_cache,
+        v=value_cache,
+        out=out,
+        cu_seqlens_q=decode_query_start_loc,
+        max_seqlen_q=1,
+        seqused_k=decode_seq_lens,
+        max_seqlen_k=int(getattr(attn_metadata, "max_seq_len", 0) or q.shape[0]),
+        softmax_scale=float(attn_impl.scale),
+        causal=True,
+        alibi_slopes=alibi_slopes,
+        window_size=sliding_window,
+        block_table=decode_block_table,
+        softcap=float(getattr(attn_impl, "logits_soft_cap", 0.0) or 0.0),
+        num_splits=cpp_bridge.flash_decode_num_splits(),
+        fa_version=getattr(attn_impl, "vllm_flash_attn_version", 3),
+        s_aux=getattr(attn_impl, "sinks", None),
+    )
+    cpp_bridge.record_call(cpp_bridge.FLASH_DECODE_ROUTE)
+
+
 def _paged_attention_decode_as_prefill_infinicore(
     attn_impl: Any,
     query: torch.Tensor,
@@ -1117,6 +1291,19 @@ def _paged_attention_decode_as_prefill_infinicore(
     attn_metadata: Any,
     output: torch.Tensor,
 ) -> None:
+    from . import cpp_bridge
+
+    if cpp_bridge.enabled_for(cpp_bridge.PREFILL_ROUTE):
+        _paged_attention_decode_as_prefill_cpp_bridge(
+            attn_impl,
+            query,
+            key,
+            kv_cache,
+            attn_metadata,
+            output,
+        )
+        return
+
     import infinicore
 
     num_actual_tokens = int(attn_metadata.num_actual_tokens)
@@ -1148,6 +1335,47 @@ def _paged_attention_decode_as_prefill_infinicore(
             out=_as_infini(out),
         ),
     )
+
+
+def _paged_attention_decode_as_prefill_cpp_bridge(
+    attn_impl: Any,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: Any,
+    output: torch.Tensor,
+) -> None:
+    from . import cpp_bridge
+
+    num_actual_tokens = int(attn_metadata.num_actual_tokens)
+    q = query[:num_actual_tokens]
+    if q.numel() == 0:
+        return
+    key_cache, value_cache = _cache_tensors(kv_cache, key, heads_dim=1)
+    query_start_loc = torch.tensor(
+        [0, num_actual_tokens],
+        dtype=torch.int32,
+        device=query.device,
+    )
+    decode_block_table = _on_reference_device(attn_metadata.decode_block_table, query)
+    decode_seq_lens = _on_reference_device(attn_metadata.decode_seq_lens, query)
+    total_lens = decode_seq_lens[:1].to(torch.int64)
+    out = output[:num_actual_tokens].view(q.shape)
+    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
+
+    module = cpp_bridge.module()
+    module.paged_attention_prefill_current_stream(
+        q,
+        key_cache,
+        value_cache,
+        decode_block_table[:1],
+        total_lens,
+        query_start_loc,
+        alibi_slopes,
+        float(attn_impl.scale),
+        out,
+    )
+    cpp_bridge.record_call(cpp_bridge.PREFILL_ROUTE)
 
 
 def _env_truthy(name: str) -> bool:

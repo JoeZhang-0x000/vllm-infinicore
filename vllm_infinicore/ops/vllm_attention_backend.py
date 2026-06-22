@@ -81,14 +81,17 @@ def _patch_native_flash_attention_module(module: Any) -> None:
     if getattr(module, "_vllm_infinicore_fa2_compat_patched", False):
         return
 
-    def get_flash_attn_version(requires_alibi: bool = False) -> int:
+    def get_flash_attn_version(*args: Any, **kwargs: Any) -> int:
+        requires_alibi = kwargs.get("requires_alibi", args[0] if args else False)
         del requires_alibi
         return 2
 
-    def flash_attn_supports_fp8() -> bool:
+    def flash_attn_supports_fp8(*args: Any, **kwargs: Any) -> bool:
+        del args, kwargs
         return False
 
-    def flash_attn_supports_sinks() -> bool:
+    def flash_attn_supports_sinks(*args: Any, **kwargs: Any) -> bool:
+        del args, kwargs
         return True
 
     module.get_flash_attn_version = get_flash_attn_version

@@ -8,6 +8,7 @@ from typing import Callable
 import torch
 
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
@@ -20,6 +21,7 @@ VLLM_LINEAR_ROUTE_NAMES = ("MatMul", "LMHead")
 _ACTIVE_ROUTES: set[str] = set()
 _ORIGINAL_LINEAR_APPLY: Callable[..., torch.Tensor] | None = None
 _ORIGINAL_LM_HEAD_APPLY: Callable[..., torch.Tensor] | None = None
+_ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS: Callable[..., torch.Tensor | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -58,12 +60,16 @@ def install_vllm_unquantized_linear_route(
         )
 
     global _ORIGINAL_LINEAR_APPLY, _ORIGINAL_LM_HEAD_APPLY
+    global _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS
     if route_name == "MatMul" and _ORIGINAL_LINEAR_APPLY is None:
         _ORIGINAL_LINEAR_APPLY = UnquantizedLinearMethod.apply
         UnquantizedLinearMethod.apply = _patched_linear_apply
     if route_name == "LMHead" and _ORIGINAL_LM_HEAD_APPLY is None:
         _ORIGINAL_LM_HEAD_APPLY = UnquantizedEmbeddingMethod.apply
         UnquantizedEmbeddingMethod.apply = _patched_lm_head_apply
+    if route_name == "LMHead" and _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS is None:
+        _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS = LogitsProcessor._get_logits
+        LogitsProcessor._get_logits = _patched_logits_processor_get_logits
 
     _ACTIVE_ROUTES.add(route_name)
     return VllmLinearInstallStatus(
@@ -87,12 +93,19 @@ def uninstall_vllm_unquantized_linear_route(
 
     _ACTIVE_ROUTES.remove(route_name)
     global _ORIGINAL_LINEAR_APPLY, _ORIGINAL_LM_HEAD_APPLY
+    global _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS
     if route_name == "MatMul" and _ORIGINAL_LINEAR_APPLY is not None:
         UnquantizedLinearMethod.apply = _ORIGINAL_LINEAR_APPLY
         _ORIGINAL_LINEAR_APPLY = None
     if route_name == "LMHead" and _ORIGINAL_LM_HEAD_APPLY is not None:
         UnquantizedEmbeddingMethod.apply = _ORIGINAL_LM_HEAD_APPLY
         _ORIGINAL_LM_HEAD_APPLY = None
+    if (
+        route_name == "LMHead"
+        and _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS is not None
+    ):
+        LogitsProcessor._get_logits = _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS
+        _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS = None
 
     return VllmLinearUninstallStatus(
         uninstalled=True,
@@ -129,6 +142,37 @@ def _patched_lm_head_apply(
         if _ORIGINAL_LM_HEAD_APPLY is None:
             raise RuntimeError("original vLLM LMHead apply is unavailable")
         return _ORIGINAL_LM_HEAD_APPLY(self, layer, x, bias)
+
+
+def _patched_logits_processor_get_logits(
+    self: LogitsProcessor,
+    hidden_states: torch.Tensor,
+    lm_head: torch.nn.Module,
+    embedding_bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    try:
+        logits = torch.ops.vllm_infinicore.lm_head(
+            hidden_states,
+            lm_head.weight,
+            embedding_bias,
+        )
+        logits = self._gather_logits(logits)
+        if logits is not None:
+            logits = logits[..., : self.org_vocab_size]
+        return logits
+    except Exception:
+        from .infinicore_backend import strict_backend_enabled
+
+        if strict_backend_enabled():
+            raise
+        if _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS is None:
+            raise
+        return _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS(
+            self,
+            hidden_states,
+            lm_head,
+            embedding_bias,
+        )
     try:
         return torch.ops.vllm_infinicore.lm_head(x, layer.weight, bias)
     except Exception:

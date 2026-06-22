@@ -1,17 +1,24 @@
 #include <torch/extension.h>
 
+#if defined(ENABLE_MUSA_API)
+#include <torch_musa/csrc/core/MUSAStream.h>
+#elif defined(ENABLE_METAX_API) || defined(ENABLE_CUDA_API)
 #include <ATen/cuda/CUDAContext.h>
+#endif
+#include <infiniop/ops/embedding.h>
 #include <infiniop/ops/gemm.h>
+#include <infiniop/ops/paged_attention.h>
 #include <infiniop/ops/paged_caching.h>
+#include <infiniop/ops/paged_attention_prefill.h>
 #include <infiniop/ops/rms_norm.h>
 #include <infiniop/ops/rope.h>
+#include <infiniop/ops/silu_and_mul.h>
 #include <infiniop/ops/swiglu.h>
 #include <infinicore/adaptor/flash_attention_adaptor.hpp>
 #include <infinicore/context/context.hpp>
 #include <infinicore/device.hpp>
 #include <infinicore/dtype.hpp>
 #include <infinicore/ops/linear.hpp>
-#include <infinicore/ops/mha_kvcache.hpp>
 #include <infinicore/tensor.hpp>
 
 #include <optional>
@@ -19,9 +26,9 @@
 #include <string>
 #include <vector>
 
-#if defined(ENABLE_METAX_API)
+#if defined(ENABLE_FLASH_ATTN) && defined(ENABLE_METAX_API)
 #define VLLM_INFINICORE_FLASH_OP(name) ::name
-#else
+#elif defined(ENABLE_FLASH_ATTN)
 #define VLLM_INFINICORE_FLASH_OP(name) flash::name
 #endif
 
@@ -52,12 +59,36 @@ infinicore::DataType dtype_from_torch(const at::Tensor &tensor) {
 }
 
 infinicore::Device device_from_torch(const at::Tensor &tensor) {
-    if (!tensor.is_cuda()) {
-        return infinicore::Device::cpu();
-    }
     auto index = tensor.device().index();
-    return infinicore::Device(infinicore::Device::Type::METAX,
-                              index < 0 ? 0 : static_cast<size_t>(index));
+#if defined(ENABLE_MUSA_API)
+    if (tensor.device().type() == c10::musa::kMUSA) {
+        return infinicore::Device(infinicore::Device::Type::MOORE,
+                                  index < 0 ? 0 : static_cast<size_t>(index));
+    }
+#endif
+#if defined(ENABLE_METAX_API) || defined(ENABLE_CUDA_API)
+    if (tensor.is_cuda()) {
+        return infinicore::Device(infinicore::Device::Type::METAX,
+                                  index < 0 ? 0 : static_cast<size_t>(index));
+    }
+#endif
+    return infinicore::Device::cpu();
+}
+
+void *current_stream_from_torch(const at::Tensor &tensor) {
+    auto index = tensor.device().index();
+    auto device_index = index < 0 ? 0 : index;
+#if defined(ENABLE_MUSA_API)
+    if (tensor.device().type() == c10::musa::kMUSA) {
+        return c10::musa::getCurrentMUSAStream(device_index).stream();
+    }
+#endif
+#if defined(ENABLE_METAX_API) || defined(ENABLE_CUDA_API)
+    if (tensor.is_cuda()) {
+        return at::cuda::getCurrentCUDAStream(device_index).stream();
+    }
+#endif
+    return nullptr;
 }
 
 infinicore::Shape shape_from_torch(const at::Tensor &tensor) {
@@ -158,6 +189,10 @@ int64_t flattened_rows(const at::Tensor &tensor) {
 
 } // namespace
 
+at::Tensor linear_current_stream(at::Tensor input,
+                                 at::Tensor weight,
+                                 c10::optional<at::Tensor> bias);
+
 void paged_attention_decode_out(at::Tensor query,
                                 at::Tensor key,
                                 at::Tensor kv_cache,
@@ -179,26 +214,75 @@ void paged_attention_decode_out(at::Tensor query,
     }
 
     auto q = query.narrow(0, 0, num_decode_tokens);
-    auto q_for_fa = q.view({num_decode_tokens, 1, q.size(1), q.size(2)});
-    auto out = output.narrow(0, 0, num_decode_tokens).view(q_for_fa.sizes());
-    auto caches = split_kv_cache_bshd(kv_cache, key.size(1));
+    auto out = output.narrow(0, 0, num_decode_tokens).view(q.sizes());
+    auto caches = split_kv_cache_hbsd(kv_cache, key.size(1));
 
+    auto out_tensor = wrap_strided(out);
+    auto q_tensor = wrap_strided(q);
+    auto k_tensor = wrap_strided(std::get<0>(caches));
+    auto v_tensor = wrap_strided(std::get<1>(caches));
+    auto block_tensor = wrap_strided(decode_block_table);
+    auto len_tensor = wrap_strided(decode_seq_lens);
     std::optional<infinicore::Tensor> alibi;
     if (alibi_slopes.has_value() && alibi_slopes.value().defined()) {
         alibi = wrap_strided(alibi_slopes.value());
     }
 
-    infinicore::op::mha_kvcache_(
-        wrap_strided(out),
-        wrap_strided(q_for_fa),
-        wrap_strided(std::get<0>(caches)),
-        wrap_strided(std::get<1>(caches)),
-        wrap_strided(decode_seq_lens),
-        wrap_strided(decode_block_table),
-        alibi,
-        static_cast<float>(scale));
+    infiniopPagedAttentionDescriptor_t desc = nullptr;
+    auto handle = infinicore::context::getInfiniopHandle(device_from_torch(query));
+    check_infini_status(
+        infiniopCreatePagedAttentionDescriptor(
+            handle,
+            &desc,
+            out_tensor->desc(),
+            q_tensor->desc(),
+            k_tensor->desc(),
+            v_tensor->desc(),
+            block_tensor->desc(),
+            len_tensor->desc(),
+            alibi.has_value() ? alibi.value()->desc() : nullptr,
+            static_cast<float>(scale)),
+        "infiniopCreatePagedAttentionDescriptor");
+
+    size_t workspace_size = 0;
+    try {
+        check_infini_status(
+            infiniopGetPagedAttentionWorkspaceSize(desc, &workspace_size),
+            "infiniopGetPagedAttentionWorkspaceSize");
+        at::Tensor workspace;
+        void *workspace_ptr = nullptr;
+        if (workspace_size > 0) {
+            workspace = at::empty(
+                {static_cast<int64_t>(workspace_size)},
+                query.options().dtype(at::kByte));
+            workspace_ptr = workspace.data_ptr();
+        }
+        check_infini_status(
+            infiniopPagedAttention(
+                desc,
+                workspace_ptr,
+                workspace_size,
+                out.data_ptr(),
+                q.data_ptr(),
+                std::get<0>(caches).data_ptr(),
+                std::get<1>(caches).data_ptr(),
+                decode_block_table.data_ptr(),
+                decode_seq_lens.data_ptr(),
+                alibi_slopes.has_value() && alibi_slopes.value().defined()
+                    ? alibi_slopes.value().data_ptr()
+                    : nullptr,
+                current_stream_from_torch(query)),
+            "infiniopPagedAttention");
+    } catch (...) {
+        infiniopDestroyPagedAttentionDescriptor(desc);
+        throw;
+    }
+    check_infini_status(
+        infiniopDestroyPagedAttentionDescriptor(desc),
+        "infiniopDestroyPagedAttentionDescriptor");
 }
 
+#if defined(ENABLE_FLASH_ATTN)
 void paged_attention_decode_flash_out(at::Tensor query,
                                       at::Tensor key,
                                       at::Tensor kv_cache,
@@ -274,28 +358,17 @@ void paged_attention_decode_flash_out(at::Tensor query,
         out_tensor.copy_(result[0]);
     }
 }
+#endif
 
 at::Tensor lm_head(at::Tensor input,
                    at::Tensor weight,
                    c10::optional<at::Tensor> bias) {
-    std::vector<int64_t> out_shape(input.sizes().begin(), input.sizes().end());
-    if (out_shape.empty()) {
-        throw std::runtime_error("expected non-scalar LMHead input");
-    }
-    out_shape.back() = weight.size(0);
-    at::Tensor out = at::empty(out_shape, input.options());
-
-    std::optional<infinicore::Tensor> infini_bias;
     if (bias.has_value() && bias.value().defined()) {
-        infini_bias = wrap_strided(bias.value());
+        at::Tensor out = linear_current_stream(input, weight, c10::optional<at::Tensor>());
+        out.add_(bias.value());
+        return out;
     }
-
-    infinicore::op::linear_(
-        wrap_strided(out),
-        wrap_strided(input),
-        wrap_strided(weight),
-        infini_bias);
-    return out;
+    return linear_current_stream(input, weight, c10::optional<at::Tensor>());
 }
 
 at::Tensor linear_current_stream(at::Tensor input,
@@ -344,10 +417,7 @@ at::Tensor linear_current_stream(at::Tensor input,
                 input.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
-        void *stream = nullptr;
-        if (input.is_cuda()) {
-            stream = at::cuda::getCurrentCUDAStream(input.device().index()).stream();
-        }
+        void *stream = current_stream_from_torch(input);
         check_infini_status(
             infiniopGemm(
                 desc,
@@ -365,6 +435,50 @@ at::Tensor linear_current_stream(at::Tensor input,
         throw;
     }
     check_infini_status(infiniopDestroyGemmDescriptor(desc), "infiniopDestroyGemmDescriptor");
+    return out;
+}
+
+at::Tensor embedding_current_stream(at::Tensor input, at::Tensor weight) {
+    if (weight.dim() != 2) {
+        throw std::runtime_error("embedding_current_stream expects a 2D weight tensor");
+    }
+    if (input.device() != weight.device()) {
+        throw std::runtime_error("embedding_current_stream expects input and weight on the same device");
+    }
+    if (input.scalar_type() != at::kInt && input.scalar_type() != at::kLong) {
+        throw std::runtime_error("embedding_current_stream expects int32 or int64 input");
+    }
+
+    std::vector<int64_t> out_shape(input.sizes().begin(), input.sizes().end());
+    out_shape.push_back(weight.size(1));
+    at::Tensor out = at::empty(out_shape, weight.options());
+
+    auto y = wrap_strided(out);
+    auto x = wrap_strided(input);
+    auto w = wrap_strided(weight);
+
+    infiniopEmbeddingDescriptor_t desc = nullptr;
+    auto handle = infinicore::context::getInfiniopHandle(device_from_torch(weight));
+    check_infini_status(
+        infiniopCreateEmbeddingDescriptor(handle, &desc, y->desc(), x->desc(), w->desc()),
+        "infiniopCreateEmbeddingDescriptor");
+
+    try {
+        check_infini_status(
+            infiniopEmbedding(
+                desc,
+                out.data_ptr(),
+                input.data_ptr(),
+                weight.data_ptr(),
+                current_stream_from_torch(weight)),
+            "infiniopEmbedding");
+    } catch (...) {
+        infiniopDestroyEmbeddingDescriptor(desc);
+        throw;
+    }
+    check_infini_status(
+        infiniopDestroyEmbeddingDescriptor(desc),
+        "infiniopDestroyEmbeddingDescriptor");
     return out;
 }
 
@@ -401,10 +515,7 @@ at::Tensor rms_norm_current_stream(at::Tensor input,
                 input.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
-        void *stream = nullptr;
-        if (input.is_cuda()) {
-            stream = at::cuda::getCurrentCUDAStream(input.device().index()).stream();
-        }
+        void *stream = current_stream_from_torch(input);
         check_infini_status(
             infiniopRMSNorm(
                 desc,
@@ -451,10 +562,7 @@ at::Tensor swiglu_current_stream(at::Tensor up, at::Tensor gate) {
                 up.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
-        void *stream = nullptr;
-        if (up.is_cuda()) {
-            stream = at::cuda::getCurrentCUDAStream(up.device().index()).stream();
-        }
+        void *stream = current_stream_from_torch(up);
         check_infini_status(
             infiniopSwiGLU(
                 desc,
@@ -470,6 +578,56 @@ at::Tensor swiglu_current_stream(at::Tensor up, at::Tensor gate) {
         throw;
     }
     check_infini_status(infiniopDestroySwiGLUDescriptor(desc), "infiniopDestroySwiGLUDescriptor");
+    return out;
+}
+
+at::Tensor silu_and_mul_current_stream(at::Tensor input) {
+    if (input.dim() < 1 || input.size(input.dim() - 1) % 2 != 0) {
+        throw std::runtime_error("silu_and_mul_current_stream expects input last dimension to be even");
+    }
+    auto output_sizes = input.sizes().vec();
+    output_sizes.back() /= 2;
+    at::Tensor out = at::empty(output_sizes, input.options());
+
+    auto y = wrap_strided(out);
+    auto x = wrap_strided(input);
+
+    infiniopSiluAndMulDescriptor_t desc = nullptr;
+    auto handle = infinicore::context::getInfiniopHandle(device_from_torch(input));
+    check_infini_status(
+        infiniopCreateSiluAndMulDescriptor(handle, &desc, y->desc(), x->desc()),
+        "infiniopCreateSiluAndMulDescriptor");
+
+    size_t workspace_size = 0;
+    try {
+        check_infini_status(
+            infiniopGetSiluAndMulWorkspaceSize(desc, &workspace_size),
+            "infiniopGetSiluAndMulWorkspaceSize");
+        at::Tensor workspace;
+        void *workspace_ptr = nullptr;
+        if (workspace_size > 0) {
+            workspace = at::empty(
+                {static_cast<int64_t>(workspace_size)},
+                input.options().dtype(at::kByte));
+            workspace_ptr = workspace.data_ptr();
+        }
+        void *stream = current_stream_from_torch(input);
+        check_infini_status(
+            infiniopSiluAndMul(
+                desc,
+                workspace_ptr,
+                workspace_size,
+                out.data_ptr(),
+                input.data_ptr(),
+                stream),
+            "infiniopSiluAndMul");
+    } catch (...) {
+        infiniopDestroySiluAndMulDescriptor(desc);
+        throw;
+    }
+    check_infini_status(
+        infiniopDestroySiluAndMulDescriptor(desc),
+        "infiniopDestroySiluAndMulDescriptor");
     return out;
 }
 
@@ -516,10 +674,7 @@ at::Tensor rope_current_stream(at::Tensor input,
                 input.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
-        void *stream = nullptr;
-        if (input.is_cuda()) {
-            stream = at::cuda::getCurrentCUDAStream(input.device().index()).stream();
-        }
+        void *stream = current_stream_from_torch(input);
         check_infini_status(
             infiniopRoPE(
                 desc,
@@ -578,10 +733,7 @@ void store_kv_cache_current_stream(at::Tensor kv_cache,
                 key.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
-        void *stream = nullptr;
-        if (key.is_cuda()) {
-            stream = at::cuda::getCurrentCUDAStream(key.device().index()).stream();
-        }
+        void *stream = current_stream_from_torch(key);
         check_infini_status(
             infiniopPagedCaching(
                 desc,
@@ -603,13 +755,102 @@ void store_kv_cache_current_stream(at::Tensor kv_cache,
         "infiniopDestroyPagedCachingDescriptor");
 }
 
+void paged_attention_prefill_current_stream(at::Tensor query,
+                                            at::Tensor key_cache,
+                                            at::Tensor value_cache,
+                                            at::Tensor block_table,
+                                            at::Tensor total_kv_lens,
+                                            at::Tensor query_start_loc,
+                                            c10::optional<at::Tensor> alibi_slopes,
+                                            double scale,
+                                            at::Tensor output) {
+    if (query.numel() == 0) {
+        return;
+    }
+    if (query.dim() != 3 || output.sizes() != query.sizes()) {
+        throw std::runtime_error("paged_attention_prefill_current_stream expects query/output [tokens, heads, head_dim]");
+    }
+
+    auto out_tensor = wrap_strided(output);
+    auto q_tensor = wrap_strided(query);
+    auto k_tensor = wrap_strided(key_cache);
+    auto v_tensor = wrap_strided(value_cache);
+    auto block_tensor = wrap_strided(block_table);
+    auto len_tensor = wrap_strided(total_kv_lens);
+    auto q_start_tensor = wrap_strided(query_start_loc);
+    std::optional<infinicore::Tensor> alibi;
+    if (alibi_slopes.has_value() && alibi_slopes.value().defined()) {
+        alibi = wrap_strided(alibi_slopes.value());
+    }
+
+    infiniopPagedAttentionPrefillDescriptor_t desc = nullptr;
+    auto handle = infinicore::context::getInfiniopHandle(device_from_torch(query));
+    check_infini_status(
+        infiniopCreatePagedAttentionPrefillDescriptor(
+            handle,
+            &desc,
+            out_tensor->desc(),
+            q_tensor->desc(),
+            k_tensor->desc(),
+            v_tensor->desc(),
+            block_tensor->desc(),
+            len_tensor->desc(),
+            q_start_tensor->desc(),
+            alibi.has_value() ? alibi.value()->desc() : nullptr,
+            static_cast<float>(scale)),
+        "infiniopCreatePagedAttentionPrefillDescriptor");
+
+    size_t workspace_size = 0;
+    try {
+        check_infini_status(
+            infiniopGetPagedAttentionPrefillWorkspaceSize(desc, &workspace_size),
+            "infiniopGetPagedAttentionPrefillWorkspaceSize");
+        at::Tensor workspace;
+        void *workspace_ptr = nullptr;
+        if (workspace_size > 0) {
+            workspace = at::empty(
+                {static_cast<int64_t>(workspace_size)},
+                query.options().dtype(at::kByte));
+            workspace_ptr = workspace.data_ptr();
+        }
+        check_infini_status(
+            infiniopPagedAttentionPrefill(
+                desc,
+                workspace_ptr,
+                workspace_size,
+                output.data_ptr(),
+                query.data_ptr(),
+                key_cache.data_ptr(),
+                value_cache.data_ptr(),
+                block_table.data_ptr(),
+                total_kv_lens.data_ptr(),
+                query_start_loc.data_ptr(),
+                alibi_slopes.has_value() && alibi_slopes.value().defined()
+                    ? alibi_slopes.value().data_ptr()
+                    : nullptr,
+                current_stream_from_torch(query)),
+            "infiniopPagedAttentionPrefill");
+    } catch (...) {
+        infiniopDestroyPagedAttentionPrefillDescriptor(desc);
+        throw;
+    }
+    check_infini_status(
+        infiniopDestroyPagedAttentionPrefillDescriptor(desc),
+        "infiniopDestroyPagedAttentionPrefillDescriptor");
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("paged_attention_decode_out", &paged_attention_decode_out);
+#if defined(ENABLE_FLASH_ATTN)
     m.def("paged_attention_decode_flash_out", &paged_attention_decode_flash_out);
+#endif
+    m.def("embedding_current_stream", &embedding_current_stream);
     m.def("linear_current_stream", &linear_current_stream);
     m.def("rms_norm_current_stream", &rms_norm_current_stream);
     m.def("swiglu_current_stream", &swiglu_current_stream);
+    m.def("silu_and_mul_current_stream", &silu_and_mul_current_stream);
     m.def("rope_current_stream", &rope_current_stream);
     m.def("store_kv_cache_current_stream", &store_kv_cache_current_stream);
+    m.def("paged_attention_prefill_current_stream", &paged_attention_prefill_current_stream);
     m.def("lm_head", &lm_head);
 }
