@@ -218,18 +218,98 @@ print("vllm" in sys.modules)
             )
             expected_dispatch_key = "MUSA" if hasattr(torch, "musa") else "CUDA"
             expected_dist_backend = "mccl" if hasattr(torch, "musa") else "nccl"
-            expected_communicator = (
-                "vllm.distributed.device_communicators.xpu_communicator.XpuCommunicator"
-                if hasattr(torch, "musa")
-                else "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"
-            )
             self.assertTrue(platform_cls.opaque_attention_op())
             self.assertFalse(platform_cls.use_custom_allreduce())
             self.assertEqual(platform_cls.dispatch_key, expected_dispatch_key)
             self.assertEqual(platform_cls.dist_backend, expected_dist_backend)
-            self.assertEqual(platform_cls.get_device_communicator_cls(), expected_communicator)
+            expected_communicator = (
+                "vllm_infinicore.communicator.InfiniCoreMusaCommunicator"
+                if hasattr(torch, "musa")
+                else "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"
+            )
+            self.assertEqual(
+                platform_cls.get_device_communicator_cls(),
+                expected_communicator,
+            )
+
+            class GraphMode:
+                def has_piecewise_cudagraphs(self) -> bool:
+                    return True
+
+            fake_vllm_config = types.SimpleNamespace(
+                parallel_config=types.SimpleNamespace(worker_cls="auto"),
+                cache_config=types.SimpleNamespace(block_size=None),
+                model_config=types.SimpleNamespace(
+                    enforce_eager=False,
+                    disable_cascade_attn=False,
+                ),
+                compilation_config=types.SimpleNamespace(cudagraph_mode=GraphMode()),
+            )
+            with (
+                mock.patch.object(torch, "musa", types.SimpleNamespace(), create=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "vllm": vllm_pkg,
+                        "vllm.platforms": platforms_pkg,
+                        "vllm.platforms.interface": interface_mod,
+                        "vllm.v1": v1_pkg,
+                        "vllm.v1.attention": attention_pkg,
+                        "vllm.v1.attention.backends": backends_pkg,
+                        "vllm.v1.attention.backends.registry": registry_mod,
+                    },
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {},
+                    clear=True,
+                ),
+                mock.patch(
+                    "vllm_infinicore.runtime_patches.apply_vllm_020_compat_patches"
+                ),
+                mock.patch(
+                    "vllm_infinicore.runtime_patches."
+                    "patch_gpu_model_runner_dummy_run_real_reqs"
+                ),
+            ):
+                os.environ.pop("TORCH_COMPILE_DISABLE", None)
+                os.environ.pop("TORCHINDUCTOR_FORCE_DISABLE_CACHES", None)
+                platform._build_platform_class.cache_clear()
+                musa_platform_cls = platform._build_platform_class()
+                self.assertEqual(
+                    musa_platform_cls.get_device_communicator_cls(),
+                    "vllm_infinicore.communicator.InfiniCoreMusaCommunicator",
+                )
+                musa_platform_cls.check_and_update_config(fake_vllm_config)
+                self.assertEqual(os.environ.get("TORCH_COMPILE_DISABLE"), "1")
+                self.assertEqual(
+                    os.environ.get("TORCHINDUCTOR_FORCE_DISABLE_CACHES"),
+                    "1",
+                )
+
+            self.assertEqual(
+                fake_vllm_config.parallel_config.worker_cls,
+                "vllm.v1.worker.gpu_worker.Worker",
+            )
+            self.assertEqual(fake_vllm_config.cache_config.block_size, 16)
+            self.assertTrue(fake_vllm_config.model_config.disable_cascade_attn)
         finally:
             platform._build_platform_class.cache_clear()
+
+    def test_musa_communicator_satisfies_cuda_graph_type_check(self) -> None:
+        try:
+            from vllm.distributed.device_communicators.cuda_communicator import (
+                CudaCommunicator,
+            )
+            from vllm.distributed.device_communicators.xpu_communicator import (
+                XpuCommunicator,
+            )
+            from vllm_infinicore.communicator import InfiniCoreMusaCommunicator
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"vLLM communicator dependencies unavailable: {exc}")
+
+        self.assertTrue(issubclass(InfiniCoreMusaCommunicator, CudaCommunicator))
+        self.assertTrue(issubclass(InfiniCoreMusaCommunicator, XpuCommunicator))
 
     def test_platform_attention_registration_respects_explicit_routes(self) -> None:
         try:

@@ -8,6 +8,7 @@ selected this platform plugin.
 from __future__ import annotations
 
 from functools import cache
+import os
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -247,7 +248,7 @@ def _build_platform_class() -> type:
         @classmethod
         def get_device_communicator_cls(cls) -> str:
             if is_musa_runtime:
-                return "vllm.distributed.device_communicators.xpu_communicator.XpuCommunicator"
+                return "vllm_infinicore.communicator.InfiniCoreMusaCommunicator"
             return "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"
 
         @classmethod
@@ -293,6 +294,7 @@ def _build_platform_class() -> type:
             parallel_config = vllm_config.parallel_config
             cache_config = vllm_config.cache_config
             model_config = vllm_config.model_config
+            compilation_config = vllm_config.compilation_config
 
             if parallel_config.worker_cls == "auto":
                 parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
@@ -300,6 +302,8 @@ def _build_platform_class() -> type:
                 cache_config.block_size = 16
             if model_config is not None:
                 model_config.disable_cascade_attn = True
+            if is_musa_runtime and _uses_cudagraph(model_config, compilation_config):
+                _set_musa_graph_env_defaults()
 
     def _validate_attention_backend(
         backend: AttentionBackendEnum,
@@ -321,4 +325,24 @@ def _build_platform_class() -> type:
                 f"Attention backend {backend.name} is not valid: {reasons}"
             )
 
+    def _uses_cudagraph(model_config: object | None, compilation_config: object) -> bool:
+        if getattr(model_config, "enforce_eager", False):
+            return False
+
+        mode = getattr(compilation_config, "cudagraph_mode", None)
+        if mode is None:
+            return False
+
+        has_piecewise_cudagraphs = getattr(mode, "has_piecewise_cudagraphs", None)
+        if callable(has_piecewise_cudagraphs):
+            return bool(has_piecewise_cudagraphs())
+
+        mode_name = getattr(mode, "name", str(mode))
+        return str(mode_name).upper() != "NONE"
+
     return InfiniCorePlatform
+
+
+def _set_musa_graph_env_defaults() -> None:
+    os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+    os.environ.setdefault("TORCHINDUCTOR_FORCE_DISABLE_CACHES", "1")
