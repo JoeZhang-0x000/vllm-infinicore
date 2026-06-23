@@ -69,13 +69,15 @@ def _build_platform_class() -> type:
             if (dtype := getattr(torch, name, None)) is not None
         )
 
+    is_musa_runtime = hasattr(torch, "musa")
+
     class InfiniCorePlatform(Platform):
         _enum = PlatformEnum.OOT
-        device_name: str = "infinicore"
-        device_type: str = "cuda"
-        dispatch_key: str = "CUDA"
+        device_name: str = "musa" if is_musa_runtime else "infinicore"
+        device_type: str = "musa" if is_musa_runtime else "cuda"
+        dispatch_key: str = "MUSA" if is_musa_runtime else "CUDA"
         ray_device_key: str = "GPU"
-        dist_backend: str = "nccl"
+        dist_backend: str = "mccl" if is_musa_runtime else "nccl"
         device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
         supported_quantization: list[str] = [
@@ -89,6 +91,12 @@ def _build_platform_class() -> type:
         @classmethod
         def set_device(cls, device: torch.device) -> None:
             torch.cuda.set_device(device)
+            if is_musa_runtime:
+                _ = torch.zeros(1, device=device)
+
+        @classmethod
+        def manual_seed_all(cls, seed: int) -> None:
+            torch.cuda.manual_seed_all(seed)
 
         @classmethod
         @cache
@@ -108,6 +116,11 @@ def _build_platform_class() -> type:
             return torch.cuda.get_device_properties(device_id).total_memory
 
         @classmethod
+        def num_compute_units(cls, device_id: int = 0) -> int:
+            properties = torch.cuda.get_device_properties(device_id)
+            return int(getattr(properties, "multi_processor_count", 64))
+
+        @classmethod
         def get_current_memory_usage(
             cls,
             device: torch.types.Device | None = None,
@@ -116,7 +129,10 @@ def _build_platform_class() -> type:
 
         @classmethod
         def device_count(cls) -> int:
-            from vllm.utils.torch_utils import cuda_device_count_stateless
+            try:
+                from vllm.utils.torch_utils import cuda_device_count_stateless
+            except ImportError:
+                return torch.cuda.device_count()
 
             return cuda_device_count_stateless()
 
@@ -156,19 +172,28 @@ def _build_platform_class() -> type:
         @classmethod
         def get_attn_backend_cls(
             cls,
-            selected_backend: AttentionBackendEnum,
+            selected_backend: AttentionBackendEnum | None,
             attn_selector_config: "AttentionSelectorConfig",
+            num_heads: int | None = None,
         ) -> str:
+            del num_heads
             device_capability = cls.get_device_capability()
             config = attn_selector_config._replace(block_size=None)
 
             if selected_backend is not None:
+                if selected_backend is AttentionBackendEnum.FLASH_ATTN:
+                    register_attention_backends()
                 _validate_attention_backend(selected_backend, device_capability, config)
+                if selected_backend is AttentionBackendEnum.FLASH_ATTN:
+                    return ATTENTION_BACKEND_CLASS_PATH
                 return selected_backend.get_path()
 
+            register_attention_backends()
             valid_backends = cls._valid_backends(device_capability, config)
             if not valid_backends:
                 raise ValueError(f"No valid attention backend found for {cls.device_name}.")
+            if valid_backends[0] is AttentionBackendEnum.FLASH_ATTN:
+                return ATTENTION_BACKEND_CLASS_PATH
             return valid_backends[0].get_path()
 
         @classmethod
@@ -221,6 +246,8 @@ def _build_platform_class() -> type:
 
         @classmethod
         def get_device_communicator_cls(cls) -> str:
+            if is_musa_runtime:
+                return "vllm.distributed.device_communicators.xpu_communicator.XpuCommunicator"
             return "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"
 
         @classmethod
@@ -233,7 +260,12 @@ def _build_platform_class() -> type:
 
         @classmethod
         def import_kernels(cls) -> None:
-            for module_name in ("mcoplib._C", "mcoplib._moe_C"):
+            for module_name in (
+                "vllm._C",
+                "vllm._moe_C",
+                "mcoplib._C",
+                "mcoplib._moe_C",
+            ):
                 try:
                     __import__(module_name)
                 except ImportError:
@@ -274,9 +306,12 @@ def _build_platform_class() -> type:
         device_capability: DeviceCapability,
         config: "AttentionSelectorConfig",
     ) -> None:
+        validation_capability = device_capability
+        if backend is AttentionBackendEnum.FLASH_ATTN and device_capability.major < 8:
+            validation_capability = DeviceCapability(major=8, minor=0)
         try:
             reasons = backend.get_class().validate_configuration(
-                device_capability=device_capability,
+                device_capability=validation_capability,
                 **config._asdict(),
             )
         except ImportError as exc:
