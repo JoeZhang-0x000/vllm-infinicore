@@ -13,6 +13,7 @@ from pathlib import Path
 import statistics
 import subprocess
 import sys
+import sysconfig
 import time
 import traceback
 from typing import Any
@@ -40,6 +41,29 @@ ATTENTION_ROUTE_NAMES = (
     "StoreKVCache",
     "PagedAttentionPrefill",
     "PagedAttentionDecode",
+)
+SINGLE_ROUTE_ABLATION_CASE_SPECS = (
+    {
+        "case_name": "native",
+        "engine": "vllm-native",
+        "routes": "",
+        "disabled_routes": "",
+    },
+    {
+        "case_name": "all",
+        "engine": "vllm-infinicore",
+        "routes": "all",
+        "disabled_routes": "",
+    },
+    *(
+        {
+            "case_name": f"all-minus-{route_name.lower()}",
+            "engine": "vllm-infinicore",
+            "routes": "all",
+            "disabled_routes": route_name,
+        }
+        for route_name in ALL_ROUTE_NAMES
+    ),
 )
 ABLATION_CASE_SPECS = (
     {
@@ -119,6 +143,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=5120)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=0,
+        help="Override vLLM scheduler max_num_batched_tokens when greater than zero.",
+    )
+    parser.add_argument(
+        "--disable-chunked-prefill",
+        action="store_true",
+        help="Disable vLLM chunked prefill for every compared vLLM case.",
+    )
+    parser.add_argument(
+        "--disable-async-scheduling",
+        action="store_true",
+        help="Disable vLLM async scheduling for every compared vLLM case.",
+    )
+    parser.add_argument(
+        "--allow-backend-fallback",
+        action="store_true",
+        help="Allow unsupported InfiniCore attention branches to use the base backend.",
+    )
     parser.add_argument("--distributed-executor-backend", default="")
     parser.add_argument(
         "--execution-mode",
@@ -151,6 +196,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--single-route-ablation",
+        action="store_true",
+        help="Run native, all routes, and one all-minus-one case per InfiniCore route.",
+    )
+    parser.add_argument(
         "--ablation-cases",
         default="",
         help=(
@@ -166,10 +216,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_runtime_environment() -> None:
-    site_packages = "/opt/conda/lib/python3.12/site-packages"
-    maca_path = "/opt/maca-3.5.3"
+    site_packages = os.environ.get(
+        "PYTHON_SITE_PACKAGES",
+        sysconfig.get_paths()["purelib"],
+    )
+    maca_path = os.environ.get("MACA_PATH", "/opt/maca-3.5.3")
     infini_root = os.path.expanduser("~/.infini")
     torch_lib = f"{site_packages}/torch/lib"
+    extension_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
 
     os.environ.setdefault("MACA_PATH", maca_path)
     os.environ.setdefault("MACA_HOME", maca_path)
@@ -179,7 +233,7 @@ def configure_runtime_environment() -> None:
     os.environ.setdefault("TORCH_LIB", torch_lib)
     os.environ.setdefault(
         "FLASH_ATTN_2_CUDA_SO",
-        f"{site_packages}/flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so",
+        f"{site_packages}/flash_attn_2_cuda{extension_suffix}",
     )
     os.environ.setdefault("XMAKE_ROOT", "y")
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -272,8 +326,14 @@ def build_manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
     write_json(prompt_path, prompt_payload)
 
     cases = []
-    if args.ablation_matrix:
-        case_specs = list(ABLATION_CASE_SPECS)
+    if args.ablation_matrix and args.single_route_ablation:
+        raise ValueError("choose only one ablation matrix mode")
+    if args.ablation_matrix or args.single_route_ablation:
+        case_specs = list(
+            SINGLE_ROUTE_ABLATION_CASE_SPECS
+            if args.single_route_ablation
+            else ABLATION_CASE_SPECS
+        )
         if args.ablation_cases:
             requested_cases = [
                 case.strip() for case in args.ablation_cases.split(",") if case.strip()
@@ -330,6 +390,10 @@ def build_manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "enable_chunked_prefill": not args.disable_chunked_prefill,
+        "async_scheduling": False if args.disable_async_scheduling else None,
+        "strict_backend": not args.allow_backend_fallback,
         "distributed_executor_backend": args.distributed_executor_backend,
         "dtype": args.dtype,
         "temperature": 0.0,
@@ -348,7 +412,8 @@ def build_manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
         "vllm_native_plugins": args.vllm_native_plugins,
         "vllm_infinicore_plugins": args.vllm_infinicore_plugins,
         "forbid_metax_load": args.forbid_metax_load,
-        "ablation_matrix": args.ablation_matrix,
+        "ablation_matrix": args.ablation_matrix or args.single_route_ablation,
+        "single_route_ablation": args.single_route_ablation,
         "all_route_names": list(ALL_ROUTE_NAMES),
         "attention_route_names": list(ATTENTION_ROUTE_NAMES),
         "cases": cases,
@@ -424,7 +489,12 @@ def worker_main(args: argparse.Namespace) -> int:
     except BaseException as exc:
         result = {
             "case_id": case["case_id"],
+            "case_name": case.get("case_name", case["engine"]),
             "engine": case["engine"],
+            "infinicore_routes": case.get("infinicore_routes", ""),
+            "infinicore_disabled_routes": case.get(
+                "infinicore_disabled_routes", ""
+            ),
             "valid": False,
             "error": repr(exc),
             "traceback": traceback.format_exc(),
@@ -442,7 +512,9 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
             case.get("infinicore_routes") or manifest["infinicore_routes"]
         )
         os.environ["VLLM_INFINICORE_FORCE_NATIVE_FALLBACK"] = "0"
-        os.environ["VLLM_INFINICORE_STRICT_BACKEND"] = "1"
+        os.environ["VLLM_INFINICORE_STRICT_BACKEND"] = (
+            "1" if manifest.get("strict_backend", True) else "0"
+        )
         os.environ["VLLM_INFINICORE_DISABLE_REAL_BACKEND"] = "0"
         cpp_bridge_routes = manifest.get("cpp_bridge_routes") or ""
         if cpp_bridge_routes:
@@ -515,7 +587,15 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
         "enforce_eager": enforce_eager,
         "compilation_config": comp_config,
         "enable_prefix_caching": False,
+        "enable_chunked_prefill": bool(
+            manifest.get("enable_chunked_prefill", True)
+        ),
     }
+    max_num_batched_tokens = int(manifest.get("max_num_batched_tokens", 0))
+    if max_num_batched_tokens > 0:
+        llm_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
+    if manifest.get("async_scheduling") is not None:
+        llm_kwargs["async_scheduling"] = bool(manifest["async_scheduling"])
     if distributed_executor_backend:
         llm_kwargs["distributed_executor_backend"] = distributed_executor_backend
     llm = LLM(**llm_kwargs)
@@ -772,6 +852,10 @@ def _base_result(case: dict[str, Any], manifest: dict[str, Any], prompt_payload:
         "warmup": manifest["warmup"],
         "repeats": manifest["repeats"],
         "tensor_parallel_size": manifest.get("tensor_parallel_size", 1),
+        "max_num_batched_tokens": manifest.get("max_num_batched_tokens", 0),
+        "enable_chunked_prefill": manifest.get("enable_chunked_prefill", True),
+        "async_scheduling": manifest.get("async_scheduling"),
+        "strict_backend": manifest.get("strict_backend", True),
         "distributed_executor_backend": manifest.get("distributed_executor_backend", ""),
         "execution_mode": manifest.get("execution_mode", "graph"),
         "graph_mode_requested": manifest.get("execution_mode", "graph") == "graph",

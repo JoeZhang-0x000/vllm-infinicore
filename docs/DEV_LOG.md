@@ -1,5 +1,248 @@
 # Development Log
 
+## 2026-09-01 Qwen3-0.6B Bring-Up On MACA 3.8
+
+Configured the remote MetaX C550 host
+`ssh.v5000-prod-gw.nhss.zhejianglab.com:30278` with upstream InfiniCore and
+installed this plugin from `/root/vllm-infinicore` in editable mode. The
+validated runtime differs from the original MACA 3.5.3 development target:
+
+- MACA `3.8.0.23`, Python `3.10.10`
+- PyTorch `2.10.0+metax3.8.0.7`
+- vLLM `0.22.0` and matching `vllm-metax`
+- FlashAttention `2.6.3+metax3.8.0.7torch2.10`
+- InfiniCore upstream commit `35b46277bd666772c11bb417ad4231c5be492822`
+- Model `/mnt/geogpt-doc-new/default/infinilm-models/Qwen3-0.6B`
+
+Installed the missing OpenMPI runtime and build prerequisites. Upstream
+InfiniCore was configured with `--metax-gpu=y --use-mc=y --aten=y` and linked
+to the installed MetaX FlashAttention extension. MACA 3.8's dense and varlen
+FlashAttention exports add both a Mars workspace tensor and a trailing boolean,
+while its KV-cache export retains the older signature. The upstream checkout
+therefore has a local three-file compatibility patch guarded by
+`INFINICORE_METAX_FLASHATTN_38_ABI`; it is built with
+`--cxxflags=-DINFINICORE_METAX_FLASHATTN_38_ABI`. Do not discard these remote
+changes when updating `/root/InfiniCore`.
+
+Validation:
+
+- `import infinicore` succeeds with the configured runtime environment.
+- Upstream MetaX RMSNorm suite passed `108/108` cases.
+- Native vLLM MetaX baseline generated exactly eight tokens from Qwen3-0.6B.
+- Plugin strict-backend eager smoke registered all nine routes with no skips or
+  native fallbacks and generated exactly eight tokens, ending in
+  `VLLM_SMOKE_OK`.
+- A separate two-token execution probe reported nonzero backend calls for every
+  scoped route family: `embedding=4`, `rms_norm=228`, `linear=448`,
+  `rotary_embedding=112`, `silu_and_mul=112`, `lm_head=4`,
+  `store_kv_cache=84`, `paged_attention_prefill=28`, and
+  `paged_attention_decode=28`. C++ bridge counts were `MatMul=452` and
+  `PagedAttentionDecodeFlash=28`.
+
+The smoke used `VLLM_PLUGINS=metax,vllm_infinicore`, strict backend mode, and
+`enforce_eager=True`; it is a correctness bring-up, not a cudagraph or
+performance claim. The conservative persistent profile at
+`/etc/profile.d/infinicore.sh` leaves plugin patches disabled by default.
+
+The same Qwen3-0.6B two-token smoke also passed without loading `vllm-metax`:
+`VLLM_PLUGINS=infinicore,vllm_infinicore`,
+`VLLM_SMOKE_FORBID_METAX_LOAD=1`, and `vllm_metax_loaded=false`. vLLM 0.22 must
+also use `VLLM_USE_V2_MODEL_RUNNER=0`; otherwise its V2 warmup emits a
+speculative-decode shape (`512` query tokens for `256` requests) that the
+strict InfiniCore attention wrapper rejects. With V1 and
+`VLLM_INFINICORE_DISABLE_METAX_COMPAT_FA=1`, attention is forced through the
+InfiniCore path rather than the direct FlashAttention compatibility shortcut.
+All route-family counters were nonzero, including
+`paged_attention_prefill=28`, `paged_attention_decode=28`, and bridge counter
+`PagedAttentionDecodeFlash=28`, and the run ended in `VLLM_SMOKE_OK`.
+
+Strict no-`vllm_metax` PIECEWISE cudagraph validation also passed on this
+stack. The run used `backend="eager"`, `enforce_eager=False`, capture sizes
+`[1, 2, 4, 8]`, `VLLM_USE_V2_MODEL_RUNNER=0`, and
+`VLLM_INFINICORE_DISABLE_METAX_COMPAT_FA=1`. Evidence:
+
+- Graph artifact:
+  `/root/vllm-infinicore/artifacts/qwen3-06b-no-metax-infinicore-cudagraph-20260901.json`
+- Eager reference artifact:
+  `/root/vllm-infinicore/artifacts/qwen3-06b-no-metax-infinicore-eager-reference-20260901.json`
+- Shape `input_len=128`, `output_len=32`, one warmup and one measured request.
+- `valid=true`, `validation_errors=[]`, `graph_capture_count=116`, and
+  `vllm_metax_loaded=false`.
+- All nine route families had nonzero measured-call evidence. Attention counts
+  included `paged_attention_prefill=28`, `paged_attention_decode=868`, and
+  bridge `PagedAttentionDecodeFlash=868`.
+- The graph and eager reference produced the exact same 32 output token IDs.
+- Text-health counters reported zero control and replacement characters.
+
+This is graph-safety and exact-token correctness evidence only. The single
+measured request is not a formal performance comparison.
+
+Formal Qwen3-0.6B CUDA Graph comparison was then run at `batch_size=8`,
+`input_len=2048`, `output_len=512`, BF16, TP=1, one warmup, and three measured
+iterations. Both cases reused prompt token IDs with SHA-256
+`c77a630e4d4f5449b67d49876d9a4cf4d94872a3dc12ede238b41ccc5c12e141`
+and used deterministic sampling with EOS disabled. To keep the scheduler shape
+inside the current strict InfiniCore attention contract, both cases used
+`async_scheduling=False`, `enable_chunked_prefill=False`, and
+`max_num_batched_tokens=16384`. The benchmark script now exposes and records
+these scheduler controls.
+
+| Plugin set | Output TPS | Median | Min | Max | Graph captures |
+|---|---:|---:|---:|---:|---:|
+| `VLLM_PLUGINS=metax` | 738.99 | 738.95 | 738.15 | 739.87 | 116 |
+| `VLLM_PLUGINS=infinicore,vllm_infinicore` | 433.64 | 439.21 | 415.82 | 447.13 | 116 |
+
+The strict no-MetaX result reached `58.68%` of the same-run vLLM-MetaX
+throughput (`41.32%` lower, or vLLM-MetaX was `1.70x` as fast). Both results
+were valid: every request generated exactly 512 output tokens, all three
+iterations were text-healthy, and the recorded 64-token output previews were
+identical across engines and repeats. The no-MetaX worker reported
+`vllm_metax_loaded=false`, installed all nine scoped routes with no skips or
+native fallbacks, and recorded nonzero backend calls for every route family.
+
+Artifact:
+`/root/vllm-infinicore/artifacts/qwen3-06b-metax-vs-no-metax-infinicore-bs8-in2048-out512-graph-synced-scheduler-20260901`.
+
+Known scheduler limitation: with vLLM 0.22 defaults at the same `bs=8/in=2048`
+shape, the MetaX case reached `962.42` output tok/s, but strict no-MetaX
+InfiniCore rejected the warmup as
+`unsupported_spec_decode:11!=8`. This was a mixed scheduled-token step from
+chunked prefill under the default `8192` token budget, not configured
+speculative decoding. Disabling async scheduling alone reproduced the same
+failure, while disabling chunked prefill with `max_num_batched_tokens=16384`
+passed with async scheduling enabled. The immediate plugin bug is the strict
+metadata builder's stale `reorder_batch_threshold=128`: it classifies the
+mixed query lengths `[1,1,1,1,1,1,1,4]` as eight decode requests and then
+rejects `11` decode tokens for eight requests. The installed vLLM-MetaX 0.22
+builder uses threshold `1` and correctly leaves the four-token tail in the
+prefill partition. Do not use the failed attempt as an InfiniCore throughput
+result.
+
+Single-GPU multi-model CUDA Graph comparison with chunked prefill disabled:
+
+- One MetaX C550, TP=1, BF16, `batch_size=8`, `input_len=2048`,
+  `output_len=512`, one warmup, and three measured iterations.
+- PIECEWISE CUDA Graph with capture sizes `[1,2,4,8]`, `backend="eager"`,
+  and `enforce_eager=False`.
+- `enable_chunked_prefill=False`, `max_num_batched_tokens=16384`; async
+  scheduling remained enabled for both engines.
+- Every same-model pair reused the exact same prompt token IDs and deterministic
+  sampling configuration.
+
+| Model | vLLM-MetaX TPS | strict no-MetaX InfiniCore TPS | InfiniCore / MetaX | Gap | Graph captures |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B-Instruct | 1080.83 | 483.74 | 44.76% | -55.24% | 100 / 100 |
+| Qwen3-0.6B | 961.42 | 433.03 | 45.04% | -54.96% | 116 / 116 |
+| Qwen3-4B-Instruct-2507 | 549.26 | 329.89 | 60.06% | -39.94% | 148 / 148 |
+| DeepSeek-R1-Distill-Qwen-7B | 470.24 | 323.40 | 68.77% | -31.23% | 116 / 116 |
+
+All eight engine results reported `valid=True` and `validation_errors=[]`.
+Every request generated exactly 512 output tokens, text-health checks passed,
+and the recorded output token previews matched across engines and repeats for
+each model. Each strict InfiniCore worker reported
+`vllm_metax_loaded=false`, installed all nine scoped routes with no skips or
+native fallbacks, and recorded nonzero calls for every backend route family.
+
+Artifacts:
+
+- `/root/vllm-infinicore/artifacts/single-gpu-cudagraph-no-chunked-qwen25-05b-bs8-in2048-out512-20260901`
+- `/root/vllm-infinicore/artifacts/single-gpu-cudagraph-no-chunked-qwen3-06b-bs8-in2048-out512-20260901`
+- `/root/vllm-infinicore/artifacts/single-gpu-cudagraph-no-chunked-qwen3-4b-bs8-in2048-out512-20260901`
+- `/root/vllm-infinicore/artifacts/single-gpu-cudagraph-no-chunked-deepseek-qwen7b-bs8-in2048-out512-20260901`
+
+The gap narrows as model compute grows in this tested set: strict InfiniCore is
+roughly `45%` of MetaX throughput on the two sub-billion models and `69%` on
+the 7B model. This is consistent with fixed per-step Python/backend/stream
+handoff costs having a larger relative impact on small models, but profiling
+is still required before assigning the remaining gap to a specific route.
+
+### DeepSeek-Qwen-7B Single-Route Ablation
+
+Ran one-at-a-time route ablation on DeepSeek-R1-Distill-Qwen-7B with the same
+single-GPU graph shape: TP=1, BF16, `bs=8`, `input_len=2048`,
+`output_len=512`, one warmup, three repeats, chunked prefill disabled,
+`max_num_batched_tokens=16384`, and async scheduling enabled.
+
+The strict no-MetaX matrix used an in-run native baseline of `470.83` output
+tok/s and an all-route baseline of `317.33` output tok/s. The six
+non-attention switches were valid:
+
+| Disabled route | Output TPS | Delta vs `all` | Relative delta | Gap recovered |
+|---|---:|---:|---:|---:|
+| none (`all`) | 317.33 | 0.00 | 0.00% | 0.00% |
+| `RMSNorm` | 314.78 | -2.55 | -0.80% | -1.66% |
+| `SiluAndMul` | 326.02 | +8.68 | +2.74% | 5.66% |
+| `RoPE` | 320.05 | +2.72 | +0.86% | 1.77% |
+| `Embedding` | 321.85 | +4.52 | +1.42% | 2.94% |
+| `MatMul` | 328.92 | +11.59 | +3.65% | 7.55% |
+| `LMHead` | 324.88 | +7.55 | +2.38% | 4.92% |
+
+`StoreKVCache`, `PagedAttentionPrefill`, and `PagedAttentionDecode` cannot be
+disabled into a valid base-vLLM fallback on this no-MetaX stack. The installed
+base backend lacks `reshape_and_cache_flash` / `flash_attn_varlen_func`, so
+these attempts fail before producing throughput. They were not treated as
+ablation data.
+
+The three attention/KV routes were therefore measured in a separate diagnostic
+matrix with `VLLM_PLUGINS=metax,vllm_infinicore`, where only the disabled route
+falls back to the MetaX implementation. Its own all-route baseline was
+`351.60` output tok/s:
+
+| Disabled route | Output TPS | Delta vs diagnostic `all` | Relative delta | Diagnostic gap recovered |
+|---|---:|---:|---:|---:|
+| none (`all`) | 351.60 | 0.00 | 0.00% | 0.00% |
+| `StoreKVCache` | 395.19 | +43.59 | +12.40% | 36.56% |
+| `PagedAttentionPrefill` | 355.41 | +3.81 | +1.08% | 3.19% |
+| `PagedAttentionDecode` | 343.72 | -7.88 | -2.24% | -6.61% |
+
+The diagnostic all-route case still installed and executed all nine InfiniCore
+routes. Loading the MetaX platform/metadata context raised the all-route result
+from `317.33` to `351.60` output tok/s (`+10.80%`) even before disabling a
+route, so that context effect must remain separate from strict no-MetaX route
+attribution.
+
+StoreKV root-cause confirmation used the existing plugin-owned current-stream
+C++ bridge while retaining all nine InfiniCore routes and no `vllm_metax`
+modules. Adding `StoreKVCache` to the then-default
+`PagedAttentionDecodeFlash,MatMul` bridge set produced `366.14` output tok/s:
+
+- `+48.81` output tok/s / `+15.38%` versus strict no-MetaX all routes.
+- `77.77%` of the same-run `470.83` native baseline.
+- `graph_capture_count=116`, `validation_errors=[]`, exact 512 output tokens
+  per request, healthy text, and stable token previews.
+- C++ bridge count `StoreKVCache=43008`; every InfiniCore route-family counter
+  remained nonzero with no route fallback.
+
+The previous Python StoreKV implementation calls `infinicore.paged_caching` through
+the InfiniCore external stream and joins the PyTorch stream before and after
+every launch. At this benchmark shape StoreKV ran `43008` times. The
+current-stream bridge removes that repeated stream handoff while preserving
+the InfiniCore `infiniopPagedCaching` kernel, so the A/B identifies the primary
+bottleneck as the StoreKV Python/external-stream boundary, not the paged-caching
+math alone. `MatMul`, `SiluAndMul`, and `LMHead` are secondary candidates;
+sub-2% deltas are close to run variability and should not be overinterpreted.
+
+Artifacts:
+
+- `/root/vllm-infinicore/artifacts/single-gpu-cudagraph-no-chunked-deepseek7b-single-route-ablation-no-metax-20260901`
+- `/root/vllm-infinicore/artifacts/single-gpu-cudagraph-no-chunked-deepseek7b-attention-route-ablation-metax-fallback-20260901`
+- `/root/vllm-infinicore/artifacts/single-gpu-cudagraph-no-chunked-deepseek7b-storekv-current-stream-bridge-20260901`
+
+The minimal production change makes `StoreKVCache` part of the existing
+current-stream C++ bridge default; no alternative StoreKV implementation was
+added. A fresh same-run comparison after syncing the local source measured
+`366.44` output tok/s for strict no-MetaX InfiniCore versus `469.60` output
+tok/s for vLLM-MetaX. InfiniCore reached `78.03%` of native throughput, a
+`21.97%` gap. Both results were valid with 116 graph captures and exactly 512
+output tokens per request. The InfiniCore worker reported
+`vllm_metax_loaded=false`, default bridge routes
+`PagedAttentionDecodeFlash,MatMul,StoreKVCache`, and
+`StoreKVCache=43008` bridge calls.
+
+Artifact:
+
+- `/root/vllm-infinicore/artifacts/single-gpu-cudagraph-no-chunked-deepseek7b-default-storekv-current-stream-vs-metax-final-20260902`
+
 ## 2026-06-05 Strict InfiniCore FA Metadata Builder Port
 
 Root-caused the remaining Qwen2.5 TP=1 throughput gap after the direct FA2
