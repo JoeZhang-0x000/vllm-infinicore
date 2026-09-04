@@ -9,7 +9,7 @@ import torch
 from vllm.model_executor.custom_op import CustomOp, op_registry_oot
 from vllm.model_executor.layers.layernorm import RMSNorm as VllmRMSNorm
 
-from .custom_ops import RMS_NORM_OP, load_custom_ops
+from .custom_ops import FUSED_ADD_RMS_NORM_OP, RMS_NORM_OP, load_custom_ops
 
 VLLM_RMS_NORM_CLASS = "RMSNorm"
 
@@ -29,11 +29,13 @@ class VllmRMSNormUninstallStatus:
 
 
 class InfiniCoreRMSNorm(VllmRMSNorm):
-    """Narrow vLLM RMSNorm replacement backed by the prototype custom op.
+    """Narrow vLLM RMSNorm replacement backed by the prototype custom ops.
 
-    Only the non-residual, weighted, no variance override path is routed. All
-    fused-add/residual and variant paths intentionally use vLLM's native
-    PyTorch implementation.
+    Both the plain and the fused residual-add paths are routed when the layer
+    is weighted and has no variance override. The fused path matters: in a
+    decoder layer all but one RMSNorm site carries a residual, and leaving
+    those on vLLM's native lowering cost a separate add plus a slower
+    non-fused norm. Variant paths still use vLLM's native implementation.
     """
 
     def forward_cuda(
@@ -77,8 +79,12 @@ class InfiniCoreRMSNorm(VllmRMSNorm):
         residual: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self._should_use_infinicore(x, residual):
-            return torch.ops.vllm_infinicore.rms_norm(
-                x, self.weight.data, self.variance_epsilon
+            if residual is None:
+                return torch.ops.vllm_infinicore.rms_norm(
+                    x, self.weight.data, self.variance_epsilon
+                )
+            return torch.ops.vllm_infinicore.fused_add_rms_norm(
+                x, residual, self.weight.data, self.variance_epsilon
             )
         return super().forward_native(x, residual)
 
@@ -87,18 +93,27 @@ class InfiniCoreRMSNorm(VllmRMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> bool:
-        return (
-            residual is None
-            and self.variance_size_override is None
+        if not (
+            self.variance_size_override is None
             and self.has_weight
             and x.shape[-1] == self.hidden_size
-        )
+        ):
+            return False
+        if residual is None:
+            return True
+        # vLLM applies the weight on the fused path only when pass_weight_add
+        # is set, while this route always applies it.
+        if not getattr(self, "pass_weight_add", False):
+            return False
+        return residual.shape == x.shape and residual.dtype == x.dtype
 
 
 def install_vllm_rms_norm_oot() -> VllmRMSNormInstallStatus:
     """Install the vLLM OOT RMSNorm class replacement idempotently."""
 
-    custom_op_status = load_custom_ops(force=True, required_ops=(RMS_NORM_OP,))
+    custom_op_status = load_custom_ops(
+        force=True, required_ops=(RMS_NORM_OP, FUSED_ADD_RMS_NORM_OP)
+    )
     if not custom_op_status.available:
         return VllmRMSNormInstallStatus(
             installed=False,

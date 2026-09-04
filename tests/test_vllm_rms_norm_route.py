@@ -95,7 +95,7 @@ class VllmRMSNormRouteTests(unittest.TestCase):
                     actual = candidate.forward_oot(x.clone())
                 torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
 
-    def test_residual_path_falls_back_to_native(self) -> None:
+    def test_residual_path_routes_and_matches_vllm_native(self) -> None:
         torch = self.torch
         hidden_size = 8
         dtype = torch.float32
@@ -112,11 +112,46 @@ class VllmRMSNormRouteTests(unittest.TestCase):
             expected = native.forward_native(x.clone(), residual.clone())
             actual = candidate.forward_oot(x.clone(), residual.clone())
 
+            self.assertTrue(candidate._should_use_infinicore(x, residual))
+
         self.assertIsInstance(actual, tuple)
         self.assertEqual(len(actual), 2)
         torch.testing.assert_close(actual[0], expected[0])
         torch.testing.assert_close(actual[1], expected[1])
-        self.assertFalse(candidate._should_use_infinicore(x, residual))
+
+    def test_residual_path_falls_back_when_weight_is_not_applied(self) -> None:
+        torch = self.torch
+        hidden_size = 8
+        dtype = torch.float32
+        x = torch.randn((2, hidden_size), dtype=dtype)
+        residual = torch.randn((2, hidden_size), dtype=dtype)
+
+        with self.set_current_vllm_config(self.vllm_config, check_compile=False):
+            candidate = self.InfiniCoreRMSNorm(hidden_size, eps=1e-6, dtype=dtype)
+            # vLLM only applies the weight on the fused path when this flag is
+            # set; the InfiniCore route always applies it, so it must decline.
+            candidate.pass_weight_add = False
+            self.assertFalse(candidate._should_use_infinicore(x, residual))
+
+    def test_residual_path_falls_back_on_shape_or_dtype_mismatch(self) -> None:
+        torch = self.torch
+        hidden_size = 8
+        x = torch.randn((2, hidden_size), dtype=torch.float32)
+
+        with self.set_current_vllm_config(self.vllm_config, check_compile=False):
+            candidate = self.InfiniCoreRMSNorm(
+                hidden_size, eps=1e-6, dtype=torch.float32
+            )
+            self.assertFalse(
+                candidate._should_use_infinicore(
+                    x, torch.randn((3, hidden_size), dtype=torch.float32)
+                )
+            )
+            self.assertFalse(
+                candidate._should_use_infinicore(
+                    x, torch.randn((2, hidden_size), dtype=torch.float64)
+                )
+            )
 
     def test_variance_override_and_no_weight_do_not_route(self) -> None:
         torch = self.torch

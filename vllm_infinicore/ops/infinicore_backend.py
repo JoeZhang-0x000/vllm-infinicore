@@ -40,6 +40,20 @@ def rms_norm(input_tensor: torch.Tensor, weight: torch.Tensor, eps: float) -> to
     )
 
 
+def fused_add_rms_norm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _route_or_fallback(
+        "rms_norm",
+        input_tensor,
+        lambda: _fused_add_rms_norm_infinicore(input_tensor, residual, weight, eps),
+        lambda: _fused_add_rms_norm_torch(input_tensor, residual, weight, eps),
+    )
+
+
 def silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
     return _route_or_fallback(
         "silu_and_mul",
@@ -592,6 +606,50 @@ def _rms_norm_cpp_bridge(
     result = module.rms_norm_current_stream(input_tensor, weight, float(eps))
     cpp_bridge.record_call(cpp_bridge.RMS_NORM_ROUTE)
     return result
+
+
+def _fused_add_rms_norm_infinicore(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from . import cpp_bridge
+
+    if cpp_bridge.enabled_for(cpp_bridge.RMS_NORM_ROUTE):
+        module = cpp_bridge.module()
+        out, residual_out = module.add_rms_norm_current_stream(
+            input_tensor, residual, weight, float(eps)
+        )
+        cpp_bridge.record_call(cpp_bridge.RMS_NORM_ROUTE)
+        return out, residual_out
+
+    from infinicore.ops.add_rms_norm import add_rms_norm as infini_add_rms_norm
+
+    out = torch.empty_like(input_tensor)
+    residual_out = torch.empty_like(input_tensor)
+    _run_on_infinicore_stream(
+        input_tensor,
+        lambda: infini_add_rms_norm(
+            _as_infini(input_tensor),
+            _as_infini(residual),
+            _as_infini(weight),
+            float(eps),
+            out=_as_infini(out),
+            residual=_as_infini(residual_out),
+        ),
+    )
+    return out, residual_out
+
+
+def _fused_add_rms_norm_torch(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    merged = input_tensor + residual
+    return _rms_norm_torch(merged, weight, eps), merged
 
 
 def _rms_norm_torch(
