@@ -535,6 +535,30 @@ at::Tensor rms_norm_current_stream(at::Tensor input,
     return out;
 }
 
+// Builds the descriptor shared by the capability probe and the launch path.
+// The wrapped tensors are only needed while the descriptor is created; the
+// launch passes raw data pointers, so they do not need to outlive this call.
+infiniStatus_t create_add_rms_norm_descriptor(infiniopAddRMSNormDescriptor_t *desc,
+                                              const at::Tensor &input,
+                                              const at::Tensor &residual,
+                                              const at::Tensor &weight,
+                                              double epsilon) {
+    auto y = wrap_strided(input);
+    auto r_out = wrap_strided(residual);
+    auto a = wrap_strided(input);
+    auto b = wrap_strided(residual);
+    auto w = wrap_strided(weight);
+    return infiniopCreateAddRMSNormDescriptor(
+        infinicore::context::getInfiniopHandle(device_from_torch(input)),
+        desc,
+        y->desc(),
+        r_out->desc(),
+        a->desc(),
+        b->desc(),
+        w->desc(),
+        static_cast<float>(epsilon));
+}
+
 // Capability probe for the fused add + RMSNorm. Creates and destroys the
 // descriptor only: no workspace, no launch, no extra allocation. Returns false
 // when this backend simply has no kernel for the op, and rethrows anything else
@@ -546,23 +570,9 @@ bool add_rms_norm_supported(at::Tensor input,
     if (input.sizes() != residual.sizes()) {
         return false;
     }
-    auto y = wrap_strided(input);
-    auto r_out = wrap_strided(residual);
-    auto a = wrap_strided(input);
-    auto b = wrap_strided(residual);
-    auto w = wrap_strided(weight);
-
     infiniopAddRMSNormDescriptor_t desc = nullptr;
-    auto handle = infinicore::context::getInfiniopHandle(device_from_torch(input));
-    infiniStatus_t status = infiniopCreateAddRMSNormDescriptor(
-        handle,
-        &desc,
-        y->desc(),
-        r_out->desc(),
-        a->desc(),
-        b->desc(),
-        w->desc(),
-        static_cast<float>(epsilon));
+    infiniStatus_t status =
+        create_add_rms_norm_descriptor(&desc, input, residual, weight, epsilon);
 
     if (status == INFINI_STATUS_SUCCESS) {
         check_infini_status(
@@ -591,24 +601,10 @@ std::vector<at::Tensor> add_rms_norm_current_stream(at::Tensor input,
     }
     at::Tensor out = at::empty_like(input);
     at::Tensor residual_out = at::empty_like(input);
-    auto y = wrap_strided(out);
-    auto r_out = wrap_strided(residual_out);
-    auto a = wrap_strided(input);
-    auto b = wrap_strided(residual);
-    auto w = wrap_strided(weight);
 
     infiniopAddRMSNormDescriptor_t desc = nullptr;
-    auto handle = infinicore::context::getInfiniopHandle(device_from_torch(input));
     check_infini_status(
-        infiniopCreateAddRMSNormDescriptor(
-            handle,
-            &desc,
-            y->desc(),
-            r_out->desc(),
-            a->desc(),
-            b->desc(),
-            w->desc(),
-            static_cast<float>(epsilon)),
+        create_add_rms_norm_descriptor(&desc, input, residual, weight, epsilon),
         "infiniopCreateAddRMSNormDescriptor");
 
     size_t workspace_size = 0;
