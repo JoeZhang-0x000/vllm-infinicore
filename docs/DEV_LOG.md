@@ -145,6 +145,29 @@ Same-run A/B at `in256/out2048`, on top of fix one:
 | Meta-Llama-3-8B-Instruct | 377.75 | 403.63 | `+6.9%` | 81.01% -> 86.62% |
 | Qwen3-0.6B | 793.32 | 826.15 | `+4.1%` | 75.09% -> 81.31% |
 
+`infiniopAddRMSNorm` is not registered for every backend that registers plain
+`infiniopRMSNorm`. Comparing the InfiniCore dispatch tables, `add_rms_norm`
+covers `ALI CAMBRICON CPU HYGON ILUVATAR KUNLUN METAX MOORE NVIDIA QY` while
+`rms_norm` additionally covers `ASCEND`. Routing the residual path
+unconditionally would therefore turn a missing kernel into a failed run under
+strict mode, on a path that previously never touched InfiniCore at all. MUSA is
+covered, so the MOORE work is unaffected.
+
+The bridge gained a descriptor-only capability probe -- no workspace, no launch,
+no extra allocation -- returning false for `NOT_IMPLEMENTED`,
+`DEVICE_TYPE_NOT_SUPPORTED` and `DEVICE_ARCHITECTURE_NOT_SUPPORTED` and
+rethrowing every other status so a genuine failure is never misread as a missing
+capability. The verdict is cached for the process and the residual path falls
+back when the device has no kernel.
+
+The probe runs inside the custom op, where the tensors are real. Probing from
+`_should_use_infinicore` would run under torch.compile tracing on fake tensors,
+and that branch is baked into the graph before any device call happens, so
+keeping the decision inside the opaque op is what lets a late capability verdict
+change behaviour without changing the traced graph. On this MetaX C550 the probe
+reports supported and the fused path still takes `1008` of the `2034` RMSNorm
+calls.
+
 ### Combined Result
 
 Full matrix after both fixes (`artifacts/bench-tp1-*-rmsfused-20260904`),

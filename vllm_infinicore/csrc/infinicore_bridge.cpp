@@ -535,6 +535,50 @@ at::Tensor rms_norm_current_stream(at::Tensor input,
     return out;
 }
 
+// Capability probe for the fused add + RMSNorm. Creates and destroys the
+// descriptor only: no workspace, no launch, no extra allocation. Returns false
+// when this backend simply has no kernel for the op, and rethrows anything else
+// so a genuine failure is never mistaken for a missing capability.
+bool add_rms_norm_supported(at::Tensor input,
+                            at::Tensor residual,
+                            at::Tensor weight,
+                            double epsilon) {
+    if (input.sizes() != residual.sizes()) {
+        return false;
+    }
+    auto y = wrap_strided(input);
+    auto r_out = wrap_strided(residual);
+    auto a = wrap_strided(input);
+    auto b = wrap_strided(residual);
+    auto w = wrap_strided(weight);
+
+    infiniopAddRMSNormDescriptor_t desc = nullptr;
+    auto handle = infinicore::context::getInfiniopHandle(device_from_torch(input));
+    infiniStatus_t status = infiniopCreateAddRMSNormDescriptor(
+        handle,
+        &desc,
+        y->desc(),
+        r_out->desc(),
+        a->desc(),
+        b->desc(),
+        w->desc(),
+        static_cast<float>(epsilon));
+
+    if (status == INFINI_STATUS_SUCCESS) {
+        check_infini_status(
+            infiniopDestroyAddRMSNormDescriptor(desc),
+            "infiniopDestroyAddRMSNormDescriptor");
+        return true;
+    }
+    if (status == INFINI_STATUS_NOT_IMPLEMENTED
+        || status == INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED
+        || status == INFINI_STATUS_DEVICE_ARCHITECTURE_NOT_SUPPORTED) {
+        return false;
+    }
+    check_infini_status(status, "infiniopCreateAddRMSNormDescriptor");
+    return false;
+}
+
 // Fused residual-add + RMSNorm. Mirrors vLLM's fused_add_rms_norm contract:
 // residual_out = input + residual, y = rms_norm(residual_out) * weight.
 std::vector<at::Tensor> add_rms_norm_current_stream(at::Tensor input,
@@ -917,6 +961,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("linear_current_stream", &linear_current_stream);
     m.def("rms_norm_current_stream", &rms_norm_current_stream);
     m.def("add_rms_norm_current_stream", &add_rms_norm_current_stream);
+    m.def("add_rms_norm_supported", &add_rms_norm_supported);
     m.def("swiglu_current_stream", &swiglu_current_stream);
     m.def("silu_and_mul_current_stream", &silu_and_mul_current_stream);
     m.def("rope_current_stream", &rope_current_stream);
