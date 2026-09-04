@@ -303,6 +303,49 @@ Verified with one unmodified user script: the InfiniCore wrapper reports
 are HTTP clients, so prefixing them changes nothing; the backend is fixed when
 the server starts.
 
+### Measurement Noise And Which Metric To Trust
+
+The short profiler window in `scripts/decode_gap_profile.py` carries far more
+run-to-run noise on end-to-end timing than on device time. Three consecutive
+repeats of the same build at `bs=8`, `in=256`, 64 measured decode steps:
+
+| Repeat | Decode step | Device kernel | Host CPU | GPU idle |
+|---|---:|---:|---:|---:|
+| 1 | `9.864` ms | `463.54` ms | `834.93` ms | `800.05` ms |
+| 2 | `10.485` ms | `464.35` ms | `846.70` ms | `817.88` ms |
+| 3 | `9.090` ms | `464.21` ms | `772.04` ms | `737.19` ms |
+| Spread | `+-7%` | `+-0.09%` | `+-4.8%` | `+-5.2%` |
+
+This is not GPU frequency. Kernel time holding to `0.09%` across the three runs
+rules that out: the same kernel sequence at a varying clock could not land
+within half a millisecond of `464`. `mx-smi` reports `Idle` as the only active
+throttle reason, with power, temperature and application limits all inactive,
+and this card exposes no clock lock at all -- only `--set-persistence-mode` and
+`--set-power-mode`, with no equivalent of `nvidia-smi -lgc`. The host CPU
+governor is `performance`, pinned at `3000` MHz.
+
+The variance sits entirely in host CPU time and in GPU idle time, and the two
+move together. Within a single process the timings are tight (repeat 3 measured
+`0.952 / 0.959 / 0.953` s) while the offset between processes is large, which is
+process placement rather than frequency: the container has a `16` CPU quota
+(`1600000/100000`) on a shared 192-core Xeon 8558, so which physical cores and
+NUMA node a launch lands on varies. At this shape GPU busy is only about `36%`,
+so the decode loop is host-bound and any scheduling difference shows up directly
+in wall time.
+
+Practical consequence for future passes:
+
+- Judging a host-side optimization needs the full benchmark harness with
+  repeats, not this short window. The bridge target cache was worth `+0.7%` on
+  Llama-3-8B, which this window cannot resolve at all.
+- The short window is reliable for structural evidence -- device kernel time,
+  GPU busy fraction, device event counts, and per-op host self time. Those are
+  what localized the gap in this entry, and the C++ descriptor refactor was
+  cleared on kernel time precisely because it is the metric this noise does not
+  touch.
+- `taskset` would cut the placement component if a host-side measurement ever
+  has to be made with this script.
+
 ### Remaining Gap
 
 After both fixes the largest remaining item is device-side glue. On Llama-3-8B,
