@@ -290,13 +290,6 @@ def _bridge_target() -> str:
     return target
 
 
-def reset_bridge_target_cache() -> None:
-    global _TORCH_MUSA_DIRS_CACHE
-
-    _BRIDGE_TARGET_CACHE.clear()
-    _TORCH_MUSA_DIRS_CACHE = None
-
-
 def _normalize_bridge_target(value: str) -> str | None:
     normalized = value.strip().lower()
     for target, aliases in BRIDGE_TARGET_ALIASES.items():

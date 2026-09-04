@@ -154,7 +154,6 @@ def measure_decode_window(
         "device_event_count": int(sum(e.count for e in kernel_events)),
         "top_device_kernels": rows(kernel_events, "self_device_time_total", device_us),
         "top_host_ops": rows(host_events, "self_cpu_time_total", host_us),
-        "top_host_ops_by_device_time": rows(host_events, "self_device_time_total", device_us),
     }
 
 

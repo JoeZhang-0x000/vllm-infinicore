@@ -26,11 +26,12 @@ every prefill lands in one scheduler step and never mixes with decode.
 `VLLM_USE_V2_MODEL_RUNNER=0` and `VLLM_INFINICORE_DISABLE_METAX_COMPAT_FA=1`.
 
 Two traffic shapes: short-input/long-output `in=256/out=2048` and
-long-input/short-output `in=4096/out=256`. `input_len=128` cannot be used: the
-strict metadata builder still hardcodes `reorder_batch_threshold = 128` in
-`vllm_infinicore/ops/vllm_attention_backend.py`, so a 128-token prefill is
-classified as decode and rejected as `unsupported_spec_decode:1024!=8`. The
-installed vLLM-MetaX 0.22 builder uses threshold `1`. This defect is unfixed.
+long-input/short-output `in=4096/out=256`. `input_len=128` could not be used
+while these numbers were taken: the strict metadata builder hardcoded
+`reorder_batch_threshold = 128`, so a 128-token prefill was classified as decode
+and rejected as `unsupported_spec_decode:1024!=8`. That defect is fixed further
+down in this entry; the measurements above predate the fix and are unaffected by
+it, because every shape they use has `input_len >= 256`.
 
 Baseline before either fix (`artifacts/bench-tp1-*-20260903`):
 
@@ -209,6 +210,98 @@ exceeds the stream-handoff cost it removes. This is the opposite of the
 StoreKV result, where the bridge won because that route ran `43008` times per
 benchmark shape. The bridge entry point is kept as an opt-in
 (`--cpp-bridge-routes ...,RMSNorm`) but is not a default route.
+
+### Separate Counters For The Two RMSNorm Ops
+
+The fused op initially reported into the shared `rms_norm` backend counter. That
+hid the very thing this pass was about: these counters are the only evidence
+that a route reaches the hot path, and the RMSNorm route had been installed with
+nonzero counts while missing 98% of its own calls. `fused_add_rms_norm` now has
+its own counter. Both ops stay on the `RMSNorm` route, so ablation and
+`VLLM_INFINICORE_DISABLED_ROUTES` semantics are unchanged. A Qwen3-0.6B decode
+window now reports `rms_norm=1026` against `fused_add_rms_norm=1008`, where
+before it reported a single conflated `2034`.
+
+### Falling Back When A Device Has No Fused Kernel
+
+`infiniopAddRMSNorm` is not registered for every backend that registers plain
+`infiniopRMSNorm`. Checking the dispatch tables in the InfiniCore source:
+
+| Op | Backends |
+|---|---|
+| `rms_norm` | ALI CAMBRICON CPU HYGON ILUVATAR KUNLUN METAX MOORE NVIDIA QY **ASCEND** |
+| `add_rms_norm` | ALI CAMBRICON CPU HYGON ILUVATAR KUNLUN METAX MOORE NVIDIA QY |
+
+MetaX and Moore are both covered, so this host and the MUSA work are unaffected,
+but Ascend would have hit a descriptor-creation failure. Routing the residual
+path introduced that failure mode, since before this pass the residual path
+never reached InfiniCore at all.
+
+A device with no kernel is a capability fact, not a failure, so it must not fail
+a strict run. `add_rms_norm_supported()` in the bridge creates and destroys the
+descriptor only -- no workspace, no launch -- and returns false for
+`INFINI_STATUS_NOT_IMPLEMENTED`, `DEVICE_TYPE_NOT_SUPPORTED` and
+`DEVICE_ARCHITECTURE_NOT_SUPPORTED`, while rethrowing anything else so a genuine
+failure is never mistaken for a missing capability. The result is cached for the
+process.
+
+The probe lives inside the custom op, not in `_should_use_infinicore()`. The
+latter runs under torch.compile tracing on fake tensors, and its branch is baked
+into the graph before any device call happens; probing there would be both
+impossible and too late. Probing inside the opaque op means an unsupported
+device changes only the op body, never the traced graph.
+
+Verified on this host: the probe returns supported, and unit tests cover both a
+supported device (probed once, keeps routing) and an unsupported one (probed
+once, falls back, does not raise under strict mode).
+
+### Single-Token Decode Threshold
+
+`reorder_batch_threshold` was `128`, so any prefill of 128 tokens or fewer was
+classified as decode and the strict wrapper rejected the step. It is now `1`,
+matching the installed vLLM-MetaX 0.22 builder and the correct non-speculative
+semantics: a decode step contributes exactly one query token per request.
+
+This was not only an offline benchmark limit. It made the plugin unusable for
+serving. Against `vllm serve` on Qwen3-0.6B, a single short request happened to
+survive, but eight concurrent `hello`-sized requests crashed the engine core
+with `unsupported_spec_decode:64!=8` and took the API server down with it --
+the most ordinary traffic a deployment sees.
+
+| Case | Before | After |
+|---|---|---|
+| 1 short prompt (9 tokens) | OK | OK |
+| 1 long prompt (140 tokens) | OK | OK |
+| 8 concurrent short prompts | 8/8 fail, engine dies | 8/8 OK |
+| 16 concurrent short prompts | connection refused | 16/16 OK |
+
+Zero `attention skipped` lines in the server log after the fix. The offline
+paths are unaffected: the route self-check still installs all nine routes with
+no skips or fallbacks, and the suite is unchanged.
+
+Note on running the suite: it needs `VLLM_PLUGINS` set. With it unset only 80
+tests run and four platform/registration cases error out. Run it through a
+backend wrapper (`./run-infinicore.sh python -m unittest discover -s tests`) to
+get the full 90. This is pre-existing behaviour, confirmed by reproducing the
+same 80/4 result with the threshold reverted.
+
+### Deployment Wrappers
+
+`~/infini-vllm` on the single-card host holds `InfiniCore/`, `infini/`
+(`INFINI_ROOT`), `vllm-infinicore/`, a shared `env.sh`, and two wrappers that
+set the backend and then `exec "$@"`:
+
+- `run-infinicore.sh` -- `VLLM_PLUGINS=infinicore,vllm_infinicore` plus the
+  strict route settings, every value overridable from the caller.
+- `run-metax.sh` -- `VLLM_PLUGINS=metax`, and it actively unsets every
+  `VLLM_INFINICORE_*` variable so a stray value cannot quietly turn a baseline
+  into a mixed run.
+
+Verified with one unmodified user script: the InfiniCore wrapper reports
+`InfiniCorePlatform` with `vllm_metax` not loaded, the MetaX wrapper reports
+`MxsmlMacaPlatform` with it loaded. Note that `vllm chat` and `vllm complete`
+are HTTP clients, so prefixing them changes nothing; the backend is fixed when
+the server starts.
 
 ### Remaining Gap
 
