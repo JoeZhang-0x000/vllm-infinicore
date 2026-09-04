@@ -1,5 +1,204 @@
 # Development Log
 
+## 2026-09-04 Decode Gap Localization And Two Fixes
+
+Moved to a dedicated single-card host,
+`ssh.v5000-prod-gw.nhss.zhejianglab.com:31919` (one MetaX C550, MACA `3.8.0.23`,
+Python `3.10.10`, PyTorch `2.10.0+metax3.8.0.7`, vLLM `0.22.0` and matching
+`vllm-metax`). The previous host was shared with unrelated GPU jobs that held
+all four cards, which invalidated any throughput measurement taken there.
+`/root/InfiniCore` was migrated whole from the old host over the shared
+`/mnt/geogpt-doc-new` mount, preserving upstream commit `35b4627` and its local
+`INFINICORE_METAX_FLASHATTN_38_ABI` compatibility patch; a copy of that patch is
+kept at
+`/mnt/geogpt-doc-new/default/zx/xfer-20260903/infinicore-metax-fa38-abi.patch`.
+The only missing prerequisite on the new host was the OpenMPI runtime
+(`libmpi.so.40`); installing `libopenmpi-dev` `4.1.2` matched the old host.
+
+### Benchmark Shape
+
+TP=1, BF16, `batch_size=8`, PIECEWISE CUDA Graph with capture sizes
+`[1,2,4,8]` and `backend="eager"`, one warmup and three measured iterations,
+deterministic sampling with EOS disabled, `min_tokens == max_tokens`, and the
+same prompt token IDs shared by both engines per model. Chunked prefill is
+disabled with `max_num_batched_tokens = max(16384, batch_size * input_len)` so
+every prefill lands in one scheduler step and never mixes with decode.
+`VLLM_USE_V2_MODEL_RUNNER=0` and `VLLM_INFINICORE_DISABLE_METAX_COMPAT_FA=1`.
+
+Two traffic shapes: short-input/long-output `in=256/out=2048` and
+long-input/short-output `in=4096/out=256`. `input_len=128` cannot be used: the
+strict metadata builder still hardcodes `reorder_batch_threshold = 128` in
+`vllm_infinicore/ops/vllm_attention_backend.py`, so a 128-token prefill is
+classified as decode and rejected as `unsupported_spec_decode:1024!=8`. The
+installed vLLM-MetaX 0.22 builder uses threshold `1`. This defect is unfixed.
+
+Baseline before either fix (`artifacts/bench-tp1-*-20260903`):
+
+| Shape | Model | vLLM-MetaX | InfiniCore | Ratio |
+|---|---|---:|---:|---:|
+| `in256/out2048` | Qwen3-0.6B | 1057.98 | 662.21 | 62.59% |
+| `in256/out2048` | Qwen3-4B-Instruct-2507 | 614.89 | 458.89 | 74.63% |
+| `in256/out2048` | Meta-Llama-3-8B-Instruct | 466.57 | 375.08 | 80.39% |
+| `in4096/out256` | Qwen3-0.6B | 742.43 | 477.59 | 64.33% |
+| `in4096/out256` | Qwen3-4B-Instruct-2507 | 367.45 | 248.63 | 67.66% |
+| `in4096/out256` | Meta-Llama-3-8B-Instruct | 285.47 | 220.52 | 77.25% |
+
+### Where The Gap Was
+
+`scripts/decode_gap_profile.py` was added to separate kernel time from host
+stalls. It measures a clean steady-state decode step latency with the profiler
+off (differencing two output lengths so prefill and sampling setup cancel), then
+profiles a decode window for device kernel time, GPU busy fraction, and host op
+breakdown. Note that its `self_device_time_total` sum must be restricted to
+`DeviceType.CUDA` events; summing host op events too double counts and reports a
+GPU busy fraction above 100%.
+
+Llama-3-8B, `bs=8`, `in=256`, 128 steady-state decode steps, before either fix:
+
+| Metric | vLLM-MetaX | InfiniCore |
+|---|---:|---:|
+| Decode step | 16.83 ms | 20.47 ms |
+| Device kernel time | 2605.9 ms | 2870.0 ms |
+| GPU busy | 87.64% | 75.55% |
+| Host CPU total | 2230.9 ms | 2990.1 ms |
+| `unified_attention_with_output` host self | 336.1 ms | 800.9 ms |
+| `unified_kv_cache_update` host self | 92.1 ms | 343.7 ms |
+
+The core math was never the problem. The same `mcblas` GEMMs and the same
+`flash_fwd_splitkv_kernel` run on both paths at matching cost
+(`1904.11` vs `1893.99` ms and `86.95` vs `90.08` ms). The gap was host-side
+starvation plus extra glue kernels.
+
+Normalized per layer per decode step, the host overhead was `+90.8` us for
+attention and `+49.1` us for the KV update, totalling `+139.9` us. The same two
+numbers came out of Qwen3-0.6B to within `0.1` us despite a different layer
+count and hidden size, which identified a fixed per-call cost rather than
+anything proportional to model size. That also explains the original ratio
+trend: at `45.8%` GPU busy Qwen3-0.6B was already host-bound, so the same
+absolute overhead cost it far more than it cost Llama-3-8B at `87.6%`.
+
+### Fix One: Cache The C++ Bridge Target
+
+`cpp_bridge._bridge_target()` had no cache. Every decode attention call reached
+`_torch_musa_package_dirs()` and ran `importlib.util.find_spec("torch_musa")`,
+probing for a Moore Threads runtime on a MetaX machine. cProfile recorded
+`5088` calls, exactly one per layer per decode step, expanding into `152640`
+`_path_join` calls and `31008` `posix.stat` calls.
+
+`_bridge_target()` now memoizes per distinct `VLLM_INFINICORE_CPP_BRIDGE_TARGET`
+value, mirroring the existing `_ROUTES_CACHE_KEY` pattern so the env override
+still works, and `_torch_musa_package_dirs()` caches its probe for the process.
+`reset_bridge_target_cache()` exists for tests.
+
+Same-run A/B at `in256/out2048`:
+
+| Model | Before | After | Delta | Ratio |
+|---|---:|---:|---:|---|
+| Qwen3-0.6B | 662.21 | 793.32 | `+19.8%` | 62.59% -> 75.09% |
+| Meta-Llama-3-8B-Instruct | 375.08 | 377.75 | `+0.7%` | 80.39% -> 81.01% |
+
+The metax baselines moved by less than `0.5%` across the same pair of runs, so
+the delta is real. The split is the point: removing host work only helps where
+the host is the limiter. On Llama-3-8B the freed host time converted directly
+into more blocking `mcStreamSynchronize` wait (`1018` -> `1380` ms) and the
+decode step did not move at all.
+
+cProfile attributed `0.733` s of a `4.09` s window to this call chain, which
+would have predicted a far larger win. Almost all of it was cProfile's own
+per-call overhead across roughly 400k tiny frames. Do not size an optimization
+from cProfile cumtime on a call-heavy path; A/B it.
+
+### Fix Two: Route The Fused Residual-Add RMSNorm
+
+`InfiniCoreRMSNorm._should_use_infinicore()` required `residual is None`, and
+its docstring stated the fused-add path intentionally used vLLM's native
+implementation. A runtime branch count showed that in a decoder layer **56 of
+57 RMSNorm sites carry a residual**, so the RMSNorm route was installed,
+reported nonzero backend counts, and was still absent from 98% of its own calls.
+torch.compile resolves that Python branch at trace time, so nonzero
+`backend_call_counts` is not evidence that a route is live in the hot path.
+
+`infiniop` already exposed `infiniopAddRMSNorm`
+(`y`, `residual_out`, `a`, `b`, `weight`, `epsilon`), which matches vLLM's
+`fused_add_rms_norm` contract exactly; nothing had been wired to it. Added:
+
+- `add_rms_norm_current_stream` in `vllm_infinicore/csrc/infinicore_bridge.cpp`
+- `vllm_infinicore::fused_add_rms_norm` in `vllm_infinicore/ops/custom_ops.py`
+- backend dispatch and a torch fallback in `ops/infinicore_backend.py`
+- the residual path in `ops/vllm_rms_norm.py`, gated on `pass_weight_add`
+  because vLLM only applies the weight on the fused path when that flag is set,
+  and on matching residual shape and dtype
+
+Numerics were checked against an fp32 reference before any throughput run:
+bf16 and fp16 agree within `2` ULP at every shape tested and `residual_out` is
+bit-exact. fp32 shows up to `5.7` ULP at `3.4e-7` relative error, which is
+summation-order noise.
+
+Post-fix branch counts confirm `56/56` residual sites route to InfiniCore with
+zero fallbacks, `pass_weight_add=True` on all sites, and backend `rms_norm`
+counts roughly doubling.
+
+Same-run A/B at `in256/out2048`, on top of fix one:
+
+| Model | Before | After | Delta | Ratio |
+|---|---:|---:|---:|---|
+| Meta-Llama-3-8B-Instruct | 377.75 | 403.63 | `+6.9%` | 81.01% -> 86.62% |
+| Qwen3-0.6B | 793.32 | 826.15 | `+4.1%` | 75.09% -> 81.31% |
+
+### Combined Result
+
+Full matrix after both fixes (`artifacts/bench-tp1-*-rmsfused-20260904`),
+`12/12` valid. Every InfiniCore case installed all nine routes with zero skips
+and zero native fallbacks, reported `vllm_metax_loaded=false`, had nonzero
+counters for every backend route family, and produced exactly the requested
+output token count. The recorded output token previews are **identical to the
+pre-change baseline for all six model/shape pairs**.
+
+| Shape | Model | Baseline | Both fixes | Ratio then -> now | Gain |
+|---|---|---:|---:|---|---:|
+| `in256/out2048` | Qwen3-0.6B | 662.2 | 834.6 | 62.6% -> 77.4% | `+26.0%` |
+| `in256/out2048` | Qwen3-4B-Instruct-2507 | 458.9 | 531.4 | 74.6% -> 85.4% | `+15.8%` |
+| `in256/out2048` | Meta-Llama-3-8B-Instruct | 375.1 | 405.7 | 80.4% -> 86.0% | `+8.2%` |
+| `in4096/out256` | Qwen3-0.6B | 477.6 | 523.1 | 64.3% -> 66.9% | `+9.5%` |
+| `in4096/out256` | Qwen3-4B-Instruct-2507 | 248.6 | 269.7 | 67.7% -> 72.7% | `+8.5%` |
+| `in4096/out256` | Meta-Llama-3-8B-Instruct | 220.5 | 240.8 | 77.2% -> 83.6% | `+9.2%` |
+
+The two fixes are complementary. The bridge target cache only pays off where the
+host is the limiter, so it is worth `+19.8%` on Qwen3-0.6B and nothing on
+Llama-3-8B, and it does not help the prefill-heavy shape. The RMSNorm fusion
+pays off everywhere, including `in4096/out256`.
+
+Measurement caveat: the Qwen3-0.6B `in256/out2048` pair is the only noisy cell.
+Its InfiniCore iterations were `859.8 / 815.9 / 829.4` (stdev `22.51`) and its
+metax denominator drifts between `1016` and `1085` across runs, so the isolated
+A/B put the same build at `81.3%` while the matrix run put it at `77.4%`. The
+InfiniCore absolute figure is stable at `826-835`. Every other cell has stdev
+under `11`.
+
+### Rejected Variant
+
+Routing the fused RMSNorm through the C++ bridge instead of the InfiniCore
+stream path was measured and rejected: Llama-3-8B `401.91` versus `403.63`, and
+Qwen3-0.6B `825.01` at stdev `19.68` versus `826.15` at stdev `4.79`.
+`add_rms_norm_current_stream` creates and destroys its descriptor on every call,
+and after fusion RMSNorm runs only 57 times per step, so the descriptor cost
+exceeds the stream-handoff cost it removes. This is the opposite of the
+StoreKV result, where the bridge won because that route ran `43008` times per
+benchmark shape. The bridge entry point is kept as an opt-in
+(`--cpp-bridge-routes ...,RMSNorm`) but is not a default route.
+
+### Remaining Gap
+
+After both fixes the largest remaining item is device-side glue. On Llama-3-8B,
+InfiniCore issues `210312` device events against MetaX's `158503`, and nearly
+all of the excess is `elementwise_kernel` work: `376.50` ms over `138496` calls
+against `208.84` ms over `77886`. MetaX also still fuses the QKV split through
+`MACA_CatArrayBatchedCopy` (`65.06` ms) where InfiniCore emits separate
+elementwise copies. Reducing cast and contiguity churn in InfiniCore tensor view
+construction is the next target. `unified_kv_cache_update` also remains around
+`3.3x` MetaX's host cost, and that cost is in torch C++ dispatch rather than in
+any Python frame.
+
 ## 2026-09-01 Qwen3-0.6B Bring-Up On MACA 3.8
 
 Configured the remote MetaX C550 host
