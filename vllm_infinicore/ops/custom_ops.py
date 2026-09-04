@@ -8,6 +8,7 @@ from typing import Any
 
 CUSTOM_OP_ENABLE_ENV = "VLLM_INFINICORE_ENABLE_CUSTOM_OPS"
 RMS_NORM_OP = "vllm_infinicore::rms_norm"
+FUSED_ADD_RMS_NORM_OP = "vllm_infinicore::fused_add_rms_norm"
 SILU_AND_MUL_OP = "vllm_infinicore::silu_and_mul"
 LINEAR_OP = "vllm_infinicore::linear"
 LM_HEAD_OP = "vllm_infinicore::lm_head"
@@ -16,6 +17,7 @@ ROTARY_EMBEDDING_OP = "vllm_infinicore::rotary_embedding"
 
 ALL_CUSTOM_OPS = (
     RMS_NORM_OP,
+    FUSED_ADD_RMS_NORM_OP,
     SILU_AND_MUL_OP,
     LINEAR_OP,
     LM_HEAD_OP,
@@ -106,6 +108,22 @@ def rms_norm(input_tensor: Any, weight: Any, eps: float = 1e-6) -> Any:
     return torch.ops.vllm_infinicore.rms_norm(input_tensor, weight, float(eps))
 
 
+def fused_add_rms_norm(
+    input_tensor: Any,
+    residual: Any,
+    weight: Any,
+    eps: float = 1e-6,
+) -> Any:
+    """Run the default-off fused residual-add + RMSNorm custom op wrapper."""
+
+    _ensure_direct_api_enabled((FUSED_ADD_RMS_NORM_OP,))
+    import torch
+
+    return torch.ops.vllm_infinicore.fused_add_rms_norm(
+        input_tensor, residual, weight, float(eps)
+    )
+
+
 def silu_and_mul(input_tensor: Any) -> Any:
     """Run the default-off SiluAndMul custom op wrapper."""
 
@@ -184,6 +202,37 @@ def _register_rms_norm(torch: Any) -> None:
     library.impl("rms_norm", _rms_norm_impl, "CompositeExplicitAutograd")
 
     _REGISTERED_OPS = (*_REGISTERED_OPS, RMS_NORM_OP)
+
+
+def _register_fused_add_rms_norm(torch: Any) -> None:
+    global _REGISTERED_OPS
+
+    if FUSED_ADD_RMS_NORM_OP in _REGISTERED_OPS:
+        return
+
+    library = _library(torch)
+    library.define(
+        "fused_add_rms_norm(Tensor input, Tensor residual, Tensor weight, float eps) "
+        "-> (Tensor, Tensor)"
+    )
+
+    def _fused_add_rms_norm_impl(
+        input_tensor: Any,
+        residual: Any,
+        weight: Any,
+        eps: float,
+    ) -> Any:
+        from . import infinicore_backend
+
+        return infinicore_backend.fused_add_rms_norm(
+            input_tensor, residual, weight, float(eps)
+        )
+
+    library.impl(
+        "fused_add_rms_norm", _fused_add_rms_norm_impl, "CompositeExplicitAutograd"
+    )
+
+    _REGISTERED_OPS = (*_REGISTERED_OPS, FUSED_ADD_RMS_NORM_OP)
 
 
 def _register_silu_and_mul(torch: Any) -> None:
@@ -326,6 +375,7 @@ def _env_truthy(name: str) -> bool:
 
 _REGISTERERS = {
     RMS_NORM_OP: _register_rms_norm,
+    FUSED_ADD_RMS_NORM_OP: _register_fused_add_rms_norm,
     SILU_AND_MUL_OP: _register_silu_and_mul,
     LINEAR_OP: _register_linear,
     LM_HEAD_OP: _register_lm_head,

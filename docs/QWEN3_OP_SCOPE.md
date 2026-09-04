@@ -161,9 +161,9 @@ This expands to all nine scoped Qwen3 routes:
 
 Isolation data remains useful for diagnosis only. It must not be used as the
 delivery configuration when the requirement is that every scoped called
-operator routes through InfiniCore. The current bottleneck is the
-paged-attention kernel pair, not KV cache update. Isolation at `bs=8`,
-`input_len=4096`, `output_len=128`, graph mode showed:
+operator routes through InfiniCore. Older isolation at `bs=8`,
+`input_len=4096`, `output_len=128`, graph mode pointed to the paged-attention
+kernel pair:
 
 | Routes | Output TPS | Artifact |
 |---|---:|---|
@@ -171,6 +171,18 @@ paged-attention kernel pair, not KV cache update. Isolation at `bs=8`,
 | `StoreKVCache,PagedAttentionPrefill` | 60.84 | `artifacts/attention-no-decode-bs8-in4096-out128-graph-20260505-142722` |
 | `PagedAttentionPrefill` | 61.65 | `artifacts/attention-prefill-only-bs8-in4096-out128-graph-20260505-143036` |
 | `StoreKVCache` | 168.66 | `artifacts/attention-storekv-only-bs8-in4096-out128-graph-20260505-142918` |
+
+Current DeepSeek-R1-Distill-Qwen-7B one-at-a-time ablation at `bs=8`,
+`input_len=2048`, `output_len=512`, strict no-MetaX PIECEWISE graph mode shows
+that the primary bottleneck has moved to the default StoreKVCache execution
+boundary. A MetaX-fallback diagnostic recovered `43.59` output tok/s
+(`+12.40%`) by disabling only StoreKVCache. More directly, retaining the
+InfiniCore StoreKV route and switching it from the Python/external-stream path
+to the existing current-stream C++ `infiniopPagedCaching` bridge raised strict
+no-MetaX all-route throughput from `317.33` to `366.14` output tok/s
+(`+15.38%`) with 116 graph captures and no fallback. MatMul was the largest
+non-attention secondary route (`+3.65%` when disabled); PagedAttentionDecode
+was a net benefit relative to its MetaX fallback (`-2.24%` when disabled).
 
 The latest full-route benchmark at `bs=8`, `input_len=4096`,
 `output_len=512`, graph mode was:
@@ -195,10 +207,10 @@ wrapper optimization. A later 95% follow-up retained per-device InfiniCore
 stream pointer caching and measured `262.97` output tok/s for
 `VLLM_INFINICORE_ROUTES=all` against `280.93` same-run vLLM native (`93.61%`).
 
-`PagedAttentionDecode` and bias-free `MatMul` now route through the plugin C++
-bridge by default. The default bridge routes are
-`PagedAttentionDecodeFlash,MatMul`; Flash decode uses the InfiniCore-vendored
-FlashAttention adaptor from the current vLLM stream and records bridge
+`PagedAttentionDecode`, bias-free `MatMul`, and `StoreKVCache` now route through
+the plugin C++ bridge by default. The default bridge routes are
+`PagedAttentionDecodeFlash,MatMul,StoreKVCache`; Flash decode uses the
+InfiniCore-vendored FlashAttention adaptor from the current vLLM stream and records bridge
 counters. The older external-stream `mha_kvcache_` bridge can be selected for
 A/B tests with
 `VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode`.

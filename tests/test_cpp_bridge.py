@@ -25,7 +25,7 @@ class CppBridgeTests(unittest.TestCase):
         os.environ.pop(cpp_bridge.FLASH_DECODE_NUM_SPLITS_ENV, None)
         cpp_bridge.reset_bridge_call_counts()
 
-    def test_flash_decode_enabled_by_default(self) -> None:
+    def test_current_stream_routes_enabled_by_default(self) -> None:
         os.environ[cpp_bridge.CPP_BRIDGE_TARGET_ENV] = "cuda"
 
         self.assertEqual(
@@ -33,11 +33,12 @@ class CppBridgeTests(unittest.TestCase):
             (
                 cpp_bridge.FLASH_DECODE_ROUTE,
                 cpp_bridge.MATMUL_ROUTE,
+                cpp_bridge.STORE_KV_CACHE_ROUTE,
             ),
         )
         self.assertTrue(cpp_bridge.enabled_for(cpp_bridge.FLASH_DECODE_ROUTE))
         self.assertTrue(cpp_bridge.enabled_for(cpp_bridge.MATMUL_ROUTE))
-        self.assertFalse(cpp_bridge.enabled_for(cpp_bridge.STORE_KV_CACHE_ROUTE))
+        self.assertTrue(cpp_bridge.enabled_for(cpp_bridge.STORE_KV_CACHE_ROUTE))
         self.assertFalse(cpp_bridge.enabled_for(cpp_bridge.RMS_NORM_ROUTE))
         self.assertFalse(cpp_bridge.enabled_for(cpp_bridge.SILU_AND_MUL_ROUTE))
         self.assertFalse(cpp_bridge.enabled_for(cpp_bridge.DECODE_ROUTE))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+import unittest.mock
 
 
 def _prepare_vllm_env() -> None:
@@ -95,7 +96,7 @@ class VllmRMSNormRouteTests(unittest.TestCase):
                     actual = candidate.forward_oot(x.clone())
                 torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
 
-    def test_residual_path_falls_back_to_native(self) -> None:
+    def test_residual_path_routes_and_matches_vllm_native(self) -> None:
         torch = self.torch
         hidden_size = 8
         dtype = torch.float32
@@ -112,11 +113,127 @@ class VllmRMSNormRouteTests(unittest.TestCase):
             expected = native.forward_native(x.clone(), residual.clone())
             actual = candidate.forward_oot(x.clone(), residual.clone())
 
+            self.assertTrue(candidate._should_use_infinicore(x, residual))
+
         self.assertIsInstance(actual, tuple)
         self.assertEqual(len(actual), 2)
         torch.testing.assert_close(actual[0], expected[0])
         torch.testing.assert_close(actual[1], expected[1])
-        self.assertFalse(candidate._should_use_infinicore(x, residual))
+
+    def test_unsupported_device_falls_back_instead_of_failing(self) -> None:
+        from vllm_infinicore.ops import cpp_bridge, infinicore_backend
+
+        torch = self.torch
+        hidden_size = 8
+        x = torch.randn((2, hidden_size), dtype=torch.float32)
+        residual = torch.randn((2, hidden_size), dtype=torch.float32)
+        weight = torch.randn((hidden_size,), dtype=torch.float32).abs() + 0.25
+
+        infinicore_backend.reset_fused_add_rms_norm_support()
+        self.addCleanup(infinicore_backend.reset_fused_add_rms_norm_support)
+
+        probes: list[int] = []
+
+        def unsupported(*_args: object, **_kwargs: object) -> bool:
+            probes.append(1)
+            return False
+
+        with unittest.mock.patch.object(
+            infinicore_backend, "_should_use_infinicore", return_value=True
+        ), unittest.mock.patch.object(
+            cpp_bridge, "enabled_for", return_value=True
+        ), unittest.mock.patch.object(
+            cpp_bridge,
+            "module",
+            return_value=unittest.mock.Mock(add_rms_norm_supported=unsupported),
+        ), unittest.mock.patch.object(
+            infinicore_backend, "strict_backend_enabled", return_value=True
+        ):
+            # A device with no kernel is a capability fact, not a failure: even
+            # in strict mode it must produce the fallback result, not raise.
+            first = infinicore_backend.fused_add_rms_norm(x, residual, weight, 1e-6)
+            second = infinicore_backend.fused_add_rms_norm(x, residual, weight, 1e-6)
+
+        expected = infinicore_backend._fused_add_rms_norm_torch(x, residual, weight, 1e-6)
+        torch.testing.assert_close(first[0], expected[0])
+        torch.testing.assert_close(first[1], expected[1])
+        torch.testing.assert_close(second[0], expected[0])
+        self.assertEqual(probes, [1], "capability must be probed once and cached")
+
+    def test_supported_device_probes_once_and_routes(self) -> None:
+        from vllm_infinicore.ops import cpp_bridge, infinicore_backend
+
+        torch = self.torch
+        hidden_size = 8
+        x = torch.randn((2, hidden_size), dtype=torch.float32)
+        residual = torch.randn((2, hidden_size), dtype=torch.float32)
+        weight = torch.randn((hidden_size,), dtype=torch.float32).abs() + 0.25
+
+        infinicore_backend.reset_fused_add_rms_norm_support()
+        self.addCleanup(infinicore_backend.reset_fused_add_rms_norm_support)
+
+        probes: list[int] = []
+
+        def supported(*_args: object, **_kwargs: object) -> bool:
+            probes.append(1)
+            return True
+
+        routed: list[int] = []
+
+        def fake_route(*args: object, **_kwargs: object) -> object:
+            routed.append(1)
+            return infinicore_backend._fused_add_rms_norm_torch(x, residual, weight, 1e-6)
+
+        with unittest.mock.patch.object(
+            infinicore_backend, "_should_use_infinicore", return_value=True
+        ), unittest.mock.patch.object(
+            cpp_bridge, "enabled_for", return_value=True
+        ), unittest.mock.patch.object(
+            cpp_bridge,
+            "module",
+            return_value=unittest.mock.Mock(add_rms_norm_supported=supported),
+        ), unittest.mock.patch.object(
+            infinicore_backend, "_fused_add_rms_norm_infinicore", fake_route
+        ):
+            infinicore_backend.fused_add_rms_norm(x, residual, weight, 1e-6)
+            infinicore_backend.fused_add_rms_norm(x, residual, weight, 1e-6)
+
+        self.assertEqual(probes, [1], "capability must be probed once and cached")
+        self.assertEqual(len(routed), 2, "a supported device must keep routing")
+
+    def test_residual_path_falls_back_when_weight_is_not_applied(self) -> None:
+        torch = self.torch
+        hidden_size = 8
+        dtype = torch.float32
+        x = torch.randn((2, hidden_size), dtype=dtype)
+        residual = torch.randn((2, hidden_size), dtype=dtype)
+
+        with self.set_current_vllm_config(self.vllm_config, check_compile=False):
+            candidate = self.InfiniCoreRMSNorm(hidden_size, eps=1e-6, dtype=dtype)
+            # vLLM only applies the weight on the fused path when this flag is
+            # set; the InfiniCore route always applies it, so it must decline.
+            candidate.pass_weight_add = False
+            self.assertFalse(candidate._should_use_infinicore(x, residual))
+
+    def test_residual_path_falls_back_on_shape_or_dtype_mismatch(self) -> None:
+        torch = self.torch
+        hidden_size = 8
+        x = torch.randn((2, hidden_size), dtype=torch.float32)
+
+        with self.set_current_vllm_config(self.vllm_config, check_compile=False):
+            candidate = self.InfiniCoreRMSNorm(
+                hidden_size, eps=1e-6, dtype=torch.float32
+            )
+            self.assertFalse(
+                candidate._should_use_infinicore(
+                    x, torch.randn((3, hidden_size), dtype=torch.float32)
+                )
+            )
+            self.assertFalse(
+                candidate._should_use_infinicore(
+                    x, torch.randn((2, hidden_size), dtype=torch.float64)
+                )
+            )
 
     def test_variance_override_and_no_weight_do_not_route(self) -> None:
         torch = self.torch

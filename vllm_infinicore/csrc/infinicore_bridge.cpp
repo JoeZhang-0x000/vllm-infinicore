@@ -10,6 +10,7 @@
 #include <infiniop/ops/paged_attention.h>
 #include <infiniop/ops/paged_caching.h>
 #include <infiniop/ops/paged_attention_prefill.h>
+#include <infiniop/ops/add_rms_norm.h>
 #include <infiniop/ops/rms_norm.h>
 #include <infiniop/ops/rope.h>
 #include <infiniop/ops/silu_and_mul.h>
@@ -534,6 +535,114 @@ at::Tensor rms_norm_current_stream(at::Tensor input,
     return out;
 }
 
+// Builds the descriptor shared by the capability probe and the launch path.
+// The wrapped tensors are only needed while the descriptor is created; the
+// launch passes raw data pointers, so they do not need to outlive this call.
+infiniStatus_t create_add_rms_norm_descriptor(infiniopAddRMSNormDescriptor_t *desc,
+                                              const at::Tensor &input,
+                                              const at::Tensor &residual,
+                                              const at::Tensor &weight,
+                                              double epsilon) {
+    auto y = wrap_strided(input);
+    auto r_out = wrap_strided(residual);
+    auto a = wrap_strided(input);
+    auto b = wrap_strided(residual);
+    auto w = wrap_strided(weight);
+    return infiniopCreateAddRMSNormDescriptor(
+        infinicore::context::getInfiniopHandle(device_from_torch(input)),
+        desc,
+        y->desc(),
+        r_out->desc(),
+        a->desc(),
+        b->desc(),
+        w->desc(),
+        static_cast<float>(epsilon));
+}
+
+// Capability probe for the fused add + RMSNorm. Creates and destroys the
+// descriptor only: no workspace, no launch, no extra allocation. Returns false
+// when this backend simply has no kernel for the op, and rethrows anything else
+// so a genuine failure is never mistaken for a missing capability.
+bool add_rms_norm_supported(at::Tensor input,
+                            at::Tensor residual,
+                            at::Tensor weight,
+                            double epsilon) {
+    if (input.sizes() != residual.sizes()) {
+        return false;
+    }
+    infiniopAddRMSNormDescriptor_t desc = nullptr;
+    infiniStatus_t status =
+        create_add_rms_norm_descriptor(&desc, input, residual, weight, epsilon);
+
+    if (status == INFINI_STATUS_SUCCESS) {
+        check_infini_status(
+            infiniopDestroyAddRMSNormDescriptor(desc),
+            "infiniopDestroyAddRMSNormDescriptor");
+        return true;
+    }
+    if (status == INFINI_STATUS_NOT_IMPLEMENTED
+        || status == INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED
+        || status == INFINI_STATUS_DEVICE_ARCHITECTURE_NOT_SUPPORTED) {
+        return false;
+    }
+    check_infini_status(status, "infiniopCreateAddRMSNormDescriptor");
+    return false;
+}
+
+// Fused residual-add + RMSNorm. Mirrors vLLM's fused_add_rms_norm contract:
+// residual_out = input + residual, y = rms_norm(residual_out) * weight.
+std::vector<at::Tensor> add_rms_norm_current_stream(at::Tensor input,
+                                                    at::Tensor residual,
+                                                    at::Tensor weight,
+                                                    double epsilon) {
+    if (input.sizes() != residual.sizes()) {
+        throw std::runtime_error(
+            "add_rms_norm_current_stream expects matching input/residual shapes");
+    }
+    at::Tensor out = at::empty_like(input);
+    at::Tensor residual_out = at::empty_like(input);
+
+    infiniopAddRMSNormDescriptor_t desc = nullptr;
+    check_infini_status(
+        create_add_rms_norm_descriptor(&desc, input, residual, weight, epsilon),
+        "infiniopCreateAddRMSNormDescriptor");
+
+    size_t workspace_size = 0;
+    try {
+        check_infini_status(
+            infiniopGetAddRMSNormWorkspaceSize(desc, &workspace_size),
+            "infiniopGetAddRMSNormWorkspaceSize");
+        at::Tensor workspace;
+        void *workspace_ptr = nullptr;
+        if (workspace_size > 0) {
+            workspace = at::empty(
+                {static_cast<int64_t>(workspace_size)},
+                input.options().dtype(at::kByte));
+            workspace_ptr = workspace.data_ptr();
+        }
+        void *stream = current_stream_from_torch(input);
+        check_infini_status(
+            infiniopAddRMSNorm(
+                desc,
+                workspace_ptr,
+                workspace_size,
+                out.data_ptr(),
+                residual_out.data_ptr(),
+                input.data_ptr(),
+                residual.data_ptr(),
+                weight.data_ptr(),
+                stream),
+            "infiniopAddRMSNorm");
+    } catch (...) {
+        infiniopDestroyAddRMSNormDescriptor(desc);
+        throw;
+    }
+    check_infini_status(
+        infiniopDestroyAddRMSNormDescriptor(desc),
+        "infiniopDestroyAddRMSNormDescriptor");
+    return {out, residual_out};
+}
+
 at::Tensor swiglu_current_stream(at::Tensor up, at::Tensor gate) {
     if (up.sizes() != gate.sizes()) {
         throw std::runtime_error("swiglu_current_stream expects matching input shapes");
@@ -847,6 +956,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("embedding_current_stream", &embedding_current_stream);
     m.def("linear_current_stream", &linear_current_stream);
     m.def("rms_norm_current_stream", &rms_norm_current_stream);
+    m.def("add_rms_norm_current_stream", &add_rms_norm_current_stream);
+    m.def("add_rms_norm_supported", &add_rms_norm_supported);
     m.def("swiglu_current_stream", &swiglu_current_stream);
     m.def("silu_and_mul_current_stream", &silu_and_mul_current_stream);
     m.def("rope_current_stream", &rope_current_stream);

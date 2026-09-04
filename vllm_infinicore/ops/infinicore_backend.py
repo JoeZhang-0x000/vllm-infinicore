@@ -24,6 +24,7 @@ RAY_STORE_KV_CACHE_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_RAY_STORE_KV_CACHE"
 
 logger = logging.getLogger(__name__)
 _CALL_COUNTS: dict[str, int] = {}
+_FUSED_ADD_RMS_NORM_SUPPORTED: bool | None = None
 _PY_CAPSULE_GET_POINTER: Any | None = None
 _INFINICORE_STREAM_PTRS: dict[tuple[str, int], int] = {}
 _EXTERNAL_STREAMS: dict[tuple[str, int, int], Any] = {}
@@ -37,6 +38,27 @@ def rms_norm(input_tensor: torch.Tensor, weight: torch.Tensor, eps: float) -> to
         input_tensor,
         lambda: _rms_norm_infinicore(input_tensor, weight, eps),
         lambda: _rms_norm_torch(input_tensor, weight, eps),
+    )
+
+
+def fused_add_rms_norm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Counted separately from the plain norm: both belong to the RMSNorm route,
+    # but a shared counter cannot show whether the fused path is actually live,
+    # and these counters are the only evidence that a route reaches the hot path.
+    if _should_use_infinicore(input_tensor) and not fused_add_rms_norm_supported(
+        input_tensor, residual, weight, eps
+    ):
+        return _fused_add_rms_norm_torch(input_tensor, residual, weight, eps)
+    return _route_or_fallback(
+        "fused_add_rms_norm",
+        input_tensor,
+        lambda: _fused_add_rms_norm_infinicore(input_tensor, residual, weight, eps),
+        lambda: _fused_add_rms_norm_torch(input_tensor, residual, weight, eps),
     )
 
 
@@ -592,6 +614,122 @@ def _rms_norm_cpp_bridge(
     result = module.rms_norm_current_stream(input_tensor, weight, float(eps))
     cpp_bridge.record_call(cpp_bridge.RMS_NORM_ROUTE)
     return result
+
+
+def fused_add_rms_norm_supported(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> bool:
+    """Whether this device has a fused add + RMSNorm kernel, probed once.
+
+    ``infiniopAddRMSNorm`` is not registered for every backend that registers
+    plain ``infiniopRMSNorm`` -- Ascend is the current example. A device with no
+    kernel is a capability fact, not a failure, so it must not fail a strict
+    run; it falls back for the life of the process instead.
+
+    Probed from inside the custom op, where the tensors are real. Probing from
+    ``_should_use_infinicore`` would run under torch.compile tracing on fake
+    tensors, and the traced branch is baked in before any device call happens.
+    """
+
+    global _FUSED_ADD_RMS_NORM_SUPPORTED
+
+    if _FUSED_ADD_RMS_NORM_SUPPORTED is not None:
+        return _FUSED_ADD_RMS_NORM_SUPPORTED
+
+    from . import cpp_bridge
+
+    supported = True
+    try:
+        if cpp_bridge.enabled_for(cpp_bridge.RMS_NORM_ROUTE):
+            supported = bool(
+                cpp_bridge.module().add_rms_norm_supported(
+                    input_tensor, residual, weight, float(eps)
+                )
+            )
+        else:
+            _fused_add_rms_norm_stream(input_tensor, residual, weight, eps)
+    except Exception as exc:
+        # The InfiniCore stream path reports no status code, so treat any probe
+        # failure there as "unsupported" and keep the run alive on the fallback.
+        supported = False
+        logger.warning(
+            "InfiniCore fused add+RMSNorm probe failed; using the native "
+            "residual path for this process: %s",
+            exc,
+        )
+
+    if not supported:
+        logger.warning(
+            "InfiniCore fused add+RMSNorm is unavailable on this device; "
+            "the RMSNorm route keeps its non-residual path and falls back "
+            "for residual calls."
+        )
+    _FUSED_ADD_RMS_NORM_SUPPORTED = supported
+    return supported
+
+
+def reset_fused_add_rms_norm_support() -> None:
+    """Forget the probed capability. For tests."""
+
+    global _FUSED_ADD_RMS_NORM_SUPPORTED
+
+    _FUSED_ADD_RMS_NORM_SUPPORTED = None
+
+
+def _fused_add_rms_norm_stream(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from infinicore.ops.add_rms_norm import add_rms_norm as infini_add_rms_norm
+
+    out = torch.empty_like(input_tensor)
+    residual_out = torch.empty_like(input_tensor)
+    _run_on_infinicore_stream(
+        input_tensor,
+        lambda: infini_add_rms_norm(
+            _as_infini(input_tensor),
+            _as_infini(residual),
+            _as_infini(weight),
+            float(eps),
+            out=_as_infini(out),
+            residual=_as_infini(residual_out),
+        ),
+    )
+    return out, residual_out
+
+
+def _fused_add_rms_norm_infinicore(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from . import cpp_bridge
+
+    if cpp_bridge.enabled_for(cpp_bridge.RMS_NORM_ROUTE):
+        module = cpp_bridge.module()
+        out, residual_out = module.add_rms_norm_current_stream(
+            input_tensor, residual, weight, float(eps)
+        )
+        cpp_bridge.record_call(cpp_bridge.RMS_NORM_ROUTE)
+        return out, residual_out
+
+    return _fused_add_rms_norm_stream(input_tensor, residual, weight, eps)
+
+
+def _fused_add_rms_norm_torch(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    merged = input_tensor + residual
+    return _rms_norm_torch(merged, weight, eps), merged
 
 
 def _rms_norm_torch(

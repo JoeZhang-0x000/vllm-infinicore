@@ -144,7 +144,11 @@ class InfiniCoreFlashAttentionBackend(_BaseFlashAttentionBackend):
 class InfiniCoreFlashAttentionMetadataBuilder(_FlashAttentionMetadataBuilder):
     """FlashAttention metadata builder with MetaX-compatible decode split fields."""
 
-    reorder_batch_threshold: int = 128
+    # Only a single-token query is a decode step. A larger threshold classifies
+    # short prefills as decode, and the strict wrapper then rejects the step
+    # because the token count no longer matches the request count. The installed
+    # vLLM-MetaX 0.22 builder uses 1 for the same reason.
+    reorder_batch_threshold: int = 1
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
