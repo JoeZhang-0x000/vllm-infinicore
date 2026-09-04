@@ -70,6 +70,8 @@ RAY_DEFAULT_ROUTES = (
 _MODULE: Any | None = None
 _LOAD_ERROR: str | None = None
 _CALL_COUNTS: dict[str, int] = {}
+_BRIDGE_TARGET_CACHE: dict[str, str] = {}
+_TORCH_MUSA_DIRS_CACHE: tuple[Path, ...] | None = None
 _ROUTES_CACHE_KEY: tuple[str | None, str | None, str | None, str | None] | None = None
 _ROUTES_CACHE: tuple[str, ...] | None = None
 _ROUTES_SET_CACHE: frozenset[str] | None = None
@@ -262,20 +264,37 @@ def _bridge_build_config() -> dict[str, Any]:
 
 
 def _bridge_target() -> str:
+    # Resolved once per distinct override value. The auto-detected target is a
+    # machine property, and probing it ran once per decode attention call, which
+    # cost more host time than the bridge kernel launches themselves.
     raw = os.environ.get(CPP_BRIDGE_TARGET_ENV)
-    if raw is not None and raw.strip():
-        normalized = _normalize_bridge_target(raw)
-        if normalized is not None:
-            return normalized
-        valid = sorted(
-            alias for aliases in BRIDGE_TARGET_ALIASES.values() for alias in aliases
-        )
-        raise CppBridgeError(
-            f"{CPP_BRIDGE_TARGET_ENV} must be one of {', '.join(valid)}"
-        )
-    if _torch_musa_package_dirs():
-        return MUSA_TARGET
-    return CUDA_TARGET
+    key = raw.strip() if raw is not None else ""
+    cached = _BRIDGE_TARGET_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if key:
+        normalized = _normalize_bridge_target(key)
+        if normalized is None:
+            valid = sorted(
+                alias for aliases in BRIDGE_TARGET_ALIASES.values() for alias in aliases
+            )
+            raise CppBridgeError(
+                f"{CPP_BRIDGE_TARGET_ENV} must be one of {', '.join(valid)}"
+            )
+        target = normalized
+    elif _torch_musa_package_dirs():
+        target = MUSA_TARGET
+    else:
+        target = CUDA_TARGET
+    _BRIDGE_TARGET_CACHE[key] = target
+    return target
+
+
+def reset_bridge_target_cache() -> None:
+    global _TORCH_MUSA_DIRS_CACHE
+
+    _BRIDGE_TARGET_CACHE.clear()
+    _TORCH_MUSA_DIRS_CACHE = None
 
 
 def _normalize_bridge_target(value: str) -> str | None:
@@ -315,10 +334,17 @@ def _musa_link_flags() -> tuple[str, ...]:
 
 
 def _torch_musa_package_dirs() -> tuple[Path, ...]:
+    global _TORCH_MUSA_DIRS_CACHE
+
+    if _TORCH_MUSA_DIRS_CACHE is not None:
+        return _TORCH_MUSA_DIRS_CACHE
     spec = importlib.util.find_spec("torch_musa")
     if spec is None or spec.submodule_search_locations is None:
-        return ()
-    return tuple(Path(location) for location in spec.submodule_search_locations)
+        dirs: tuple[Path, ...] = ()
+    else:
+        dirs = tuple(Path(location) for location in spec.submodule_search_locations)
+    _TORCH_MUSA_DIRS_CACHE = dirs
+    return dirs
 
 
 def _musa_roots() -> tuple[Path, ...]:
