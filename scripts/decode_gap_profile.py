@@ -22,6 +22,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,9 +86,129 @@ def configure_engine(engine: str) -> dict[str, str] | None:
     }
 
 
-def out_path_with_suffix(path: str, suffix: str) -> str:
-    base = Path(path)
-    return str(base.with_suffix(suffix))
+def measure_decode_window(
+    run: Callable[[int], float],
+    output_len: int,
+    top_k: int,
+) -> dict[str, Any]:
+    """Profile one decode window and summarize where its wall time went."""
+
+    import torch
+    from torch.autograd import DeviceType
+    from torch.profiler import ProfilerActivity, profile
+
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+
+    with profile(activities=activities, record_shapes=False, with_stack=False) as prof:
+        wall = run(output_len)
+
+    events = prof.key_averages()
+    # Only device-side events (kernels, memcpy, memset) carry real GPU occupancy.
+    # Host op events also report attributed device time, so summing both double
+    # counts and yields a GPU busy fraction above 100%.
+    kernel_events = [e for e in events if e.device_type == DeviceType.CUDA]
+    host_events = [e for e in events if e.device_type != DeviceType.CUDA]
+    device_us = sum(max(0.0, e.self_device_time_total) for e in kernel_events)
+    host_us = sum(max(0.0, e.self_cpu_time_total) for e in host_events)
+
+    def rows(source: list[Any], attr: str, denom: float) -> list[dict[str, Any]]:
+        ranked = sorted(source, key=lambda event: getattr(event, attr), reverse=True)
+        out: list[dict[str, Any]] = []
+        for event in ranked[:top_k]:
+            value = getattr(event, attr)
+            if value <= 0:
+                break
+            out.append(
+                {
+                    "name": event.key[:110],
+                    "count": int(event.count),
+                    "self_ms": round(value / 1000.0, 3),
+                    "share_pct": round(value / denom * 100.0, 2) if denom > 0 else None,
+                }
+            )
+        return out
+
+    def host_us_matching(tokens: tuple[str, ...]) -> float:
+        return sum(
+            max(0.0, e.self_cpu_time_total)
+            for e in host_events
+            if any(token in e.key.lower() for token in tokens)
+        )
+
+    sync_us = host_us_matching(("synchronize", "streamwait", "eventquery"))
+    launch_us = host_us_matching(("launchkernel", "graphlaunch", "mclaunch"))
+    return {
+        "prof": prof,
+        "wall_s": round(wall, 4),
+        "device_kernel_ms": round(device_us / 1000.0, 2),
+        "host_cpu_ms": round(host_us / 1000.0, 2),
+        "gpu_busy_pct": round(device_us / (wall * 1e6) * 100.0, 2) if wall > 0 else None,
+        "gpu_idle_ms": round(wall * 1000.0 - device_us / 1000.0, 2),
+        "host_sync_ms": round(sync_us / 1000.0, 2),
+        "host_launch_ms": round(launch_us / 1000.0, 2),
+        "kernel_launch_count": sum(
+            int(e.count) for e in host_events if "launchkernel" in e.key.lower()
+        ),
+        "device_event_count": int(sum(e.count for e in kernel_events)),
+        "top_device_kernels": rows(kernel_events, "self_device_time_total", device_us),
+        "top_host_ops": rows(host_events, "self_cpu_time_total", host_us),
+        "top_host_ops_by_device_time": rows(host_events, "self_device_time_total", device_us),
+    }
+
+
+def profile_python_frames(
+    run: Callable[[int], float],
+    output_len: int,
+    out_json: Path,
+) -> dict[str, Any]:
+    """cProfile one decode window for function-level attribution.
+
+    cProfile inflates call-heavy paths badly, so treat its ranking as a lead to
+    A/B rather than as an estimate of what a fix is worth.
+    """
+
+    import cProfile
+    import io
+    import pstats
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+    run(output_len)
+    profiler.disable()
+
+    stats_path = out_json.with_suffix(".prof")
+    profiler.dump_stats(str(stats_path))
+
+    stream = io.StringIO()
+    stats = pstats.Stats(profiler, stream=stream)
+    stats.sort_stats("tottime").print_stats(40)
+    stream.write("\n\n===== CALLERS: import machinery =====\n")
+    stats.print_callers("find_spec|_find_and_load|_handle_fromlist|__import__")
+    stream.write("\n\n===== CALLERS: os.environ lookups =====\n")
+    stats.print_callers("_collections_abc.py:821")
+    text = stream.getvalue()
+
+    text_path = out_json.with_suffix(".pyprof.txt")
+    text_path.write_text(text, encoding="utf-8")
+    return {
+        "stats_path": str(stats_path),
+        "text_path": str(text_path),
+        "tottime_top40": text,
+    }
+
+
+def infinicore_counters() -> dict[str, Any]:
+    try:
+        from vllm_infinicore.ops import cpp_bridge, infinicore_backend
+
+        return {
+            "infinicore_backend_call_counts": dict(infinicore_backend.backend_call_counts()),
+            "infinicore_cpp_bridge_call_counts": dict(cpp_bridge.bridge_call_counts()),
+        }
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        return {"infinicore_backend_call_counts_error": repr(exc)}
 
 
 def main() -> int:
@@ -153,56 +274,13 @@ def main() -> int:
         (statistics.median(long_times) - statistics.median(short_times)) / decode_steps * 1000.0
     )
 
-    from torch.profiler import ProfilerActivity, profile
+    out_path = Path(args.output_json)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    activities = [ProfilerActivity.CPU]
-    if torch.cuda.is_available():
-        activities.append(ProfilerActivity.CUDA)
+    window = measure_decode_window(run, args.long_output_len, args.top_k_rows)
+    prof = window.pop("prof")
 
-    with profile(activities=activities, record_shapes=False, with_stack=False) as prof:
-        profiled_wall = run(args.long_output_len)
-
-    from torch.autograd import DeviceType
-
-    events = prof.key_averages()
-    # Only device-side events (kernels, memcpy, memset) carry real GPU occupancy.
-    # Host op events also report attributed device time, so summing both double counts.
-    kernel_events = [e for e in events if e.device_type == DeviceType.CUDA]
-    host_events = [e for e in events if e.device_type != DeviceType.CUDA]
-    device_total_us = sum(max(0.0, e.self_device_time_total) for e in kernel_events)
-    cpu_total_us = sum(max(0.0, e.self_cpu_time_total) for e in host_events)
-
-    def rows(source: list[Any], attr: str, denom: float, limit: int) -> list[dict[str, Any]]:
-        ranked = sorted(source, key=lambda e: getattr(e, attr), reverse=True)
-        out = []
-        for e in ranked[:limit]:
-            value = getattr(e, attr)
-            if value <= 0:
-                break
-            out.append(
-                {
-                    "name": e.key[:110],
-                    "count": int(e.count),
-                    "self_ms": round(value / 1000.0, 3),
-                    "share_pct": round(value / denom * 100.0, 2) if denom > 0 else None,
-                }
-            )
-        return out
-
-    def _host_us(tokens: tuple[str, ...]) -> float:
-        return sum(
-            max(0.0, e.self_cpu_time_total)
-            for e in host_events
-            if any(token in e.key.lower() for token in tokens)
-        )
-
-    sync_us = _host_us(("synchronize", "streamwait", "eventquery"))
-    launch_us = _host_us(("launchkernel", "graphlaunch", "mclaunch"))
-    kernel_launches = sum(
-        int(e.count) for e in host_events if "launchkernel" in e.key.lower()
-    )
-
-    payload = {
+    payload: dict[str, Any] = {
         "engine": args.engine,
         "model": args.model,
         "batch_size": args.batch_size,
@@ -217,70 +295,16 @@ def main() -> int:
             "long_times_s": long_times,
             "decode_step_ms": round(step_ms, 4),
             "decode_tps_per_request": round(1000.0 / step_ms, 2) if step_ms > 0 else None,
-            "decode_tps_batch": round(args.batch_size * 1000.0 / step_ms, 2) if step_ms > 0 else None,
-        },
-        "profiled": {
-            "wall_s": round(profiled_wall, 4),
-            "device_kernel_ms": round(device_total_us / 1000.0, 2),
-            "host_cpu_ms": round(cpu_total_us / 1000.0, 2),
-            "gpu_busy_pct": round(device_total_us / 1000.0 / (profiled_wall * 1000.0) * 100.0, 2)
-            if profiled_wall > 0
+            "decode_tps_batch": round(args.batch_size * 1000.0 / step_ms, 2)
+            if step_ms > 0
             else None,
-            "gpu_idle_ms": round(profiled_wall * 1000.0 - device_total_us / 1000.0, 2),
-            "host_sync_ms": round(sync_us / 1000.0, 2),
-            "host_launch_ms": round(launch_us / 1000.0, 2),
-            "kernel_launch_count": kernel_launches,
-            "device_event_count": int(sum(e.count for e in kernel_events)),
-            "top_device_kernels": rows(
-                kernel_events, "self_device_time_total", device_total_us, args.top_k_rows
-            ),
-            "top_host_ops": rows(host_events, "self_cpu_time_total", cpu_total_us, args.top_k_rows),
-            "top_host_ops_by_device_time": rows(
-                host_events, "self_device_time_total", device_total_us, args.top_k_rows
-            ),
         },
+        "profiled": window,
     }
-
-    out_path = Path(args.output_json)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
     if args.python_profile:
-        import cProfile
-        import pstats
-        import io as _io
-
-        pr = cProfile.Profile()
-        pr.enable()
-        run(args.long_output_len)
-        pr.disable()
-        prof_path = out_path_with_suffix(args.output_json, ".prof")
-        pr.dump_stats(prof_path)
-        payload["python_profile_stats_path"] = prof_path
-        stream = _io.StringIO()
-        stats = pstats.Stats(pr, stream=stream)
-        stats.sort_stats("tottime").print_stats(40)
-        stream.write("\n\n===== CALLERS: find_spec / _find_and_load / __import__ =====\n")
-        stats.print_callers("find_spec|_find_and_load|_handle_fromlist|__import__")
-        stream.write("\n\n===== CALLERS: os.environ __getitem__ =====\n")
-        stats.print_callers("_collections_abc.py:821")
-        text = stream.getvalue()
-        payload["python_profile_tottime_top40"] = text
-        py_out = out_path_with_suffix(args.output_json, ".pyprof.txt")
-        Path(py_out).write_text(text, encoding="utf-8")
-        payload["python_profile_path"] = py_out
-
+        payload["python_profile"] = profile_python_frames(run, args.long_output_len, out_path)
     if args.engine == "vllm-infinicore":
-        try:
-            from vllm_infinicore.ops import cpp_bridge, infinicore_backend
-
-            payload["infinicore_backend_call_counts"] = dict(
-                infinicore_backend.backend_call_counts()
-            )
-            payload["infinicore_cpp_bridge_call_counts"] = dict(
-                cpp_bridge.bridge_call_counts()
-            )
-        except Exception as exc:  # pragma: no cover - diagnostic only
-            payload["infinicore_backend_call_counts_error"] = repr(exc)
+        payload.update(infinicore_counters())
 
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 

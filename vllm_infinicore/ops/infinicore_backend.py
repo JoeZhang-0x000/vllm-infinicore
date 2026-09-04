@@ -46,8 +46,11 @@ def fused_add_rms_norm(
     weight: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # Counted separately from the plain norm: both belong to the RMSNorm route,
+    # but a shared counter cannot show whether the fused path is actually live,
+    # and these counters are the only evidence that a route reaches the hot path.
     return _route_or_fallback(
-        "rms_norm",
+        "fused_add_rms_norm",
         input_tensor,
         lambda: _fused_add_rms_norm_infinicore(input_tensor, residual, weight, eps),
         lambda: _fused_add_rms_norm_torch(input_tensor, residual, weight, eps),
