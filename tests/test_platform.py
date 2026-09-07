@@ -116,18 +116,26 @@ print("vllm" in sys.modules)
 
             import torch
 
-            device = "musa:0" if hasattr(torch, "musa") else "cuda:0"
+            device = "musa:1" if hasattr(torch, "musa") else "cuda:1"
             with (
                 mock.patch("torch.cuda.set_device") as set_device,
                 mock.patch("torch.zeros") as zeros,
+                mock.patch.dict(os.environ, {}, clear=False),
             ):
+                os.environ.pop("INFINICORE_DEFAULT_DEVICE_INDEX", None)
                 platform_cls.set_device(device)
+                infinicore_index = os.environ.get("INFINICORE_DEFAULT_DEVICE_INDEX")
 
             set_device.assert_called_once_with(device)
-            if hasattr(torch, "musa"):
-                zeros.assert_called_once_with(1, device=device)
-            else:
-                zeros.assert_not_called()
+            # The eager allocation is unconditional, not MUSA-only: on MACA a
+            # tensor-parallel worker above rank 0 otherwise keeps a lazy device
+            # context and dies in vLLM's Triton sampler with "Pointer argument
+            # (at 0) cannot be accessed from Triton". vllm_metax does the same.
+            zeros.assert_called_once_with(1, device=device)
+            # InfiniCore must be pointed at this worker's own card before it
+            # builds its default runtime, or every worker also opens a context
+            # on card 0 and the MACA driver runs out of queue blocks.
+            self.assertEqual(infinicore_index, "1")
 
             with mock.patch("torch.cuda.manual_seed_all") as manual_seed_all:
                 platform_cls.manual_seed_all(123)
