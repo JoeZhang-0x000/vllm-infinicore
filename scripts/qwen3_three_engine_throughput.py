@@ -539,14 +539,6 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
         registration = None
 
     distributed_executor_backend = manifest.get("distributed_executor_backend") or None
-    # Any tensor-parallel run puts the model in separate worker processes, so the
-    # driver's own counters stay at zero and every counter has to be collected
-    # over collective RPC. That is true for the multiprocessing executor too, not
-    # just for ray.
-    use_worker_rpc = (
-        distributed_executor_backend == "ray"
-        or int(manifest.get("tensor_parallel_size", 1)) > 1
-    )
     if distributed_executor_backend == "ray":
         from vllm_infinicore.ray import (
             PLUGIN_ENV_VARS,
@@ -635,7 +627,7 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
     for _ in range(manifest["warmup"]):
         generate_once()
 
-    _reset_infinicore_counts(llm, use_workers=use_worker_rpc)
+    _reset_infinicore_counts(llm, use_ray=distributed_executor_backend == "ray")
     iterations = []
     for index in range(1, manifest["repeats"] + 1):
         torch.cuda.synchronize()
@@ -654,7 +646,9 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
         )
 
     selected_cpp_bridge_routes = (
-        _infinicore_cpp_bridge_selected_routes(llm, use_workers=use_worker_rpc)
+        _infinicore_cpp_bridge_selected_routes(
+            llm, use_ray=distributed_executor_backend == "ray"
+        )
         if case["engine"] == "vllm-infinicore"
         else ()
     )
@@ -702,27 +696,27 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
             "forbid_metax_load": bool(manifest.get("forbid_metax_load")),
             "vllm_metax_loaded": _vllm_metax_loaded(
                 llm,
-                use_workers=use_worker_rpc,
+                use_ray=distributed_executor_backend == "ray",
             ),
             "vllm_platform": _vllm_platform_name(),
             "infinicore_backend_call_counts": _infinicore_backend_counts(
-                llm, use_workers=use_worker_rpc
+                llm, use_ray=distributed_executor_backend == "ray"
             ),
             "infinicore_attention_route_counts": _infinicore_attention_counts(
-                llm, use_workers=use_worker_rpc
+                llm, use_ray=distributed_executor_backend == "ray"
             ),
             "infinicore_attention_backend_route_counts": _infinicore_attention_backend_counts(
-                llm, use_workers=use_worker_rpc
+                llm, use_ray=distributed_executor_backend == "ray"
             ),
             "infinicore_cpp_bridge_call_counts": _infinicore_cpp_bridge_counts(
-                llm, use_workers=use_worker_rpc
+                llm, use_ray=distributed_executor_backend == "ray"
             ),
             "cpp_bridge_enabled": bool(selected_cpp_bridge_routes),
             "cpp_bridge_routes": ",".join(selected_cpp_bridge_routes),
             "vllm_attention_backend": _vllm_attention_backend_path(),
             "graph_capture_count": _vllm_graph_count(
                 llm,
-                use_workers=use_worker_rpc,
+                use_ray=distributed_executor_backend == "ray",
             ),
         }
     )
@@ -962,10 +956,10 @@ def _registration_dict(registration: Any) -> dict[str, Any] | None:
     }
 
 
-def _vllm_graph_count(llm: Any | None = None, *, use_workers: bool = False) -> int:
+def _vllm_graph_count(llm: Any | None = None, *, use_ray: bool = False) -> int:
     local_count = _local_vllm_graph_count()
-    if use_workers and llm is not None:
-        worker_counts = _worker_collective_rpc(llm, _worker_vllm_graph_count)
+    if use_ray and llm is not None:
+        worker_counts = _ray_collective_rpc(llm, _worker_vllm_graph_count)
         return local_count + sum(
             int(count) for count in worker_counts if isinstance(count, int)
         )
@@ -981,7 +975,7 @@ def _local_vllm_graph_count() -> int:
         return 0
 
 
-def _reset_infinicore_counts(llm: Any | None = None, *, use_workers: bool = False) -> None:
+def _reset_infinicore_counts(llm: Any | None = None, *, use_ray: bool = False) -> None:
     try:
         from vllm_infinicore.ops import (
             infinicore_backend,
@@ -996,16 +990,16 @@ def _reset_infinicore_counts(llm: Any | None = None, *, use_workers: bool = Fals
         vllm_attention_backend.reset_attention_backend_route_counts()
     except Exception:
         pass
-    if use_workers and llm is not None:
-        _worker_collective_rpc(llm, _worker_reset_infinicore_counts)
+    if use_ray and llm is not None:
+        _ray_collective_rpc(llm, _worker_reset_infinicore_counts)
 
 
 def _infinicore_backend_counts(
-    llm: Any | None = None, *, use_workers: bool = False
+    llm: Any | None = None, *, use_ray: bool = False
 ) -> dict[str, int]:
-    if use_workers and llm is not None:
+    if use_ray and llm is not None:
         return _aggregate_worker_count_dicts(
-            _worker_collective_rpc(llm, _worker_infinicore_backend_counts)
+            _ray_collective_rpc(llm, _worker_infinicore_backend_counts)
         )
     try:
         from vllm_infinicore.ops import infinicore_backend
@@ -1016,11 +1010,11 @@ def _infinicore_backend_counts(
 
 
 def _infinicore_attention_counts(
-    llm: Any | None = None, *, use_workers: bool = False
+    llm: Any | None = None, *, use_ray: bool = False
 ) -> dict[str, int]:
-    if use_workers and llm is not None:
+    if use_ray and llm is not None:
         return _aggregate_worker_count_dicts(
-            _worker_collective_rpc(llm, _worker_infinicore_attention_counts)
+            _ray_collective_rpc(llm, _worker_infinicore_attention_counts)
         )
     try:
         from vllm_infinicore.ops import vllm_attention
@@ -1031,11 +1025,11 @@ def _infinicore_attention_counts(
 
 
 def _infinicore_attention_backend_counts(
-    llm: Any | None = None, *, use_workers: bool = False
+    llm: Any | None = None, *, use_ray: bool = False
 ) -> dict[str, int]:
-    if use_workers and llm is not None:
+    if use_ray and llm is not None:
         return _aggregate_worker_count_dicts(
-            _worker_collective_rpc(llm, _worker_infinicore_attention_backend_counts)
+            _ray_collective_rpc(llm, _worker_infinicore_attention_backend_counts)
         )
     try:
         from vllm_infinicore.ops import vllm_attention_backend
@@ -1046,11 +1040,11 @@ def _infinicore_attention_backend_counts(
 
 
 def _infinicore_cpp_bridge_counts(
-    llm: Any | None = None, *, use_workers: bool = False
+    llm: Any | None = None, *, use_ray: bool = False
 ) -> dict[str, int]:
-    if use_workers and llm is not None:
+    if use_ray and llm is not None:
         return _aggregate_worker_count_dicts(
-            _worker_collective_rpc(llm, _worker_infinicore_cpp_bridge_counts)
+            _ray_collective_rpc(llm, _worker_infinicore_cpp_bridge_counts)
         )
     try:
         from vllm_infinicore.ops import cpp_bridge
@@ -1061,10 +1055,10 @@ def _infinicore_cpp_bridge_counts(
 
 
 def _infinicore_cpp_bridge_selected_routes(
-    llm: Any | None = None, *, use_workers: bool = False
+    llm: Any | None = None, *, use_ray: bool = False
 ) -> tuple[str, ...]:
-    if use_workers and llm is not None:
-        worker_routes = _worker_collective_rpc(llm, _worker_infinicore_cpp_bridge_routes)
+    if use_ray and llm is not None:
+        worker_routes = _ray_collective_rpc(llm, _worker_infinicore_cpp_bridge_routes)
         routes = sorted(
             {
                 route
@@ -1083,7 +1077,7 @@ def _infinicore_cpp_bridge_selected_routes(
         return ()
 
 
-def _worker_collective_rpc(llm: Any, method: Any) -> list[Any]:
+def _ray_collective_rpc(llm: Any, method: Any) -> list[Any]:
     try:
         return list(llm.collective_rpc(method))
     except Exception:
@@ -1163,12 +1157,12 @@ def _vllm_attention_backend_path() -> str:
 
 
 def _vllm_metax_loaded(
-    llm: Any | None = None, *, use_workers: bool = False
+    llm: Any | None = None, *, use_ray: bool = False
 ) -> bool:
     local_loaded = _local_vllm_metax_loaded()
-    if use_workers and llm is not None:
+    if use_ray and llm is not None:
         worker_loaded = any(
-            bool(item) for item in _worker_collective_rpc(llm, _worker_vllm_metax_loaded)
+            bool(item) for item in _ray_collective_rpc(llm, _worker_vllm_metax_loaded)
         )
         return local_loaded or worker_loaded
     return local_loaded

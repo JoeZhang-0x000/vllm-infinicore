@@ -316,15 +316,6 @@ def _route_or_fallback(
     if not _should_use_infinicore(reference_tensor):
         return call_torch()
 
-    # InfiniCore resets the accelerator's current device to 0 while it
-    # dispatches. On a tensor-parallel rank above 0 that leaves every later
-    # launch pointed at the wrong device, and MACA reports it as "Pointer
-    # argument (at 0) cannot be accessed from Triton" out of vLLM's Triton
-    # sampler. A rank already on device 0 has nothing to restore, and
-    # ``index`` is None only for a device that carries no index at all, so
-    # both cases correctly skip the guard.
-    device_index = reference_tensor.device.index
-    device_api = _torch_device_api(reference_tensor) if device_index else None
     try:
         result = call_infinicore()
         _record_call(op_name)
@@ -340,9 +331,6 @@ def _route_or_fallback(
             exc,
         )
         return call_torch()
-    finally:
-        if device_api is not None and device_api.current_device() != device_index:
-            device_api.set_device(device_index)
 
 
 def _record_call(op_name: str) -> None:
