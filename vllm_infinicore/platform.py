@@ -92,8 +92,26 @@ def _build_platform_class() -> type:
         @classmethod
         def set_device(cls, device: torch.device) -> None:
             torch.cuda.set_device(device)
-            if is_musa_runtime:
-                _ = torch.zeros(1, device=device)
+            # Force the device context to be created eagerly. Without it a
+            # TP>1 worker on a non-zero rank keeps a lazy context and MACA's
+            # mcPointerGetAttribute rejects its own tensors, which surfaces as
+            # "Pointer argument (at 0) cannot be accessed from Triton".
+            # See https://github.com/pytorch/pytorch/issues/155668
+            _ = torch.zeros(1, device=device)
+
+            # Tell InfiniCore which card to build its default runtime on before
+            # anything touches it. InfiniCore otherwise always picks index 0, so
+            # every tensor-parallel worker opens a context on card 0 on top of
+            # its own card. Past about four of those the MACA driver stops
+            # issuing queue blocks and the next stream creation hangs forever in
+            # "mxkwCreateQueueBlock ioctl create queue block timeout". This is
+            # the earliest per-worker hook that still runs before the first
+            # InfiniCore call; InfiniCore ignores the variable if it is unset.
+            # Normalise first: callers may pass either a torch.device or a
+            # string like "cuda:0", and str has an .index attribute of its own.
+            index = torch.device(device).index
+            if index is not None:
+                os.environ["INFINICORE_DEFAULT_DEVICE_INDEX"] = str(index)
 
         @classmethod
         def manual_seed_all(cls, seed: int) -> None:
