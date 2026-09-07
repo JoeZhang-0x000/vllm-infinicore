@@ -1,5 +1,129 @@
 # Development Log
 
+## 2026-09-07 Tensor Parallel Support And The TP>=4 Driver Wedge
+
+Moved to an 8-card host, `ssh.v5000-prod-gw.nhss.zhejianglab.com:31266` (8x MetaX
+C550, MACA `3.8.0.23`, Python `3.10.10`, PyTorch `2.10.0+metax3.8.0.7`, vLLM
+`0.22.0` and matching `vllm-metax`). Models under `/root/models`. This is the
+first multi-card work on this plugin; TP>1 did not run at all before it.
+
+### Three Plugin Fixes To Make TP>1 Run
+
+1. `platform.py` `set_device` only did the eager `torch.zeros(1, device=device)`
+   under MUSA. On MACA a rank above 0 then kept a lazy context and died in vLLM's
+   Triton sampler with `Pointer argument (at 0) cannot be accessed from Triton`.
+   `vllm_metax` does this unconditionally; now so does this plugin.
+2. InfiniCore resets the accelerator's current device to 0 while it dispatches.
+   Confirmed in isolation: after one `rms_norm` on a `cuda:1` tensor,
+   `torch.cuda.current_device()` reads 0. `_route_or_fallback` now restores the
+   reference tensor's device in a `finally`; rank 0 skips the guard.
+3. The benchmark aggregated worker counters over collective RPC only under ray,
+   so every multiproc TP>1 case failed validation with `graph_capture_count=0`.
+   It now aggregates whenever `tensor_parallel_size > 1`.
+
+Fixes 1 and 2 are what unlock TP=1 and TP=2. They are not enough for TP>=4.
+
+### The Stray Card-0 Runtime
+
+`ContextImpl::ContextImpl()` in InfiniCore builds its default `Runtime` on device
+index **0**, hardcoded, whatever card the process actually uses. `Runtime`'s
+constructor allocates a primary context, a stream (`infinirtStreamCreate`), an
+infiniop handle and two allocators -- so every tensor-parallel worker holds a
+whole extra runtime on a card it never computes on. PyTorch does not do this: it
+only creates a context on the device you use.
+
+One process, no framework, reproduces it. Pin to card 3, make one InfiniCore
+allocation there, then look at `mx-smi`:
+
+| Scenario (process pinned to card 3) | Cards held |
+|---|---|
+| torch only, InfiniCore untouched | 3 |
+| one InfiniCore allocation | **0 and 3** |
+| same, with no torch loaded at all | **0 and 3** |
+| `infinicore.set_device(3)` first | **0 and 3** (no effect) |
+| `CUDA_VISIBLE_DEVICES=3` | 3 (card 0 *is* card 3 there) |
+
+`setDevice()` calls `getCurrentRuntime()` before switching, and that lazily builds
+the default card-0 runtime just to answer a comparison -- which is why calling
+`infinicore.set_device()` early does not avoid the stray context. That was tried
+and measured to have no effect.
+
+On MACA this makes TP>=4 hang on the first forward pass, after a completely
+successful engine init, in an unbounded
+`[MXKW][E] queues.c:844 mxkwCreateQueueBlock ioctl create queue block timeout ... Retrying`.
+Every one of those lines is unprefixed, i.e. emitted by the driver process rather
+than a worker. Counting processes per card with `mx-smi` during a run:
+
+| Engine | TP | processes on card 0 | total | Result |
+|---|---:|---:|---:|---|
+| vllm-metax | 4 | 2 | 5 | runs |
+| vllm-infinicore (before) | 4 | 4 | 7 | wedges |
+| vllm-infinicore (after) | 4 | 2 | 5 | runs |
+
+**Why the driver wedges is not established, and should not be asserted.** Three
+mechanisms were proposed and each was falsified by its own experiment: a cap on
+contexts per card (eight processes hold one on card 0 fine), a cap on streams per
+card (4096 streams in a single process is fine), and contention between processes
+creating queues concurrently (it does reproduce the same error for four processes
+making 32 streams each on one card, but a faithful synthetic model -- one heavy
+process on card 0 plus three stray runtimes -- does not fail). It is also not
+memory: the stray runtime shows 0 MiB and `--gpu-memory-utilization 0.5` does not
+help. The driver-side accounting is MACA's, and we did not explain it.
+
+What is established is causal rather than mechanistic: **removing the stray
+runtime turns TP>=4 from a guaranteed hang into 16/16 passing cases.** That is
+what the fix rests on.
+
+The plugin side is `set_device` exporting `INFINICORE_DEFAULT_DEVICE_INDEX` for
+the worker's own card -- the earliest per-worker hook that still precedes the
+first InfiniCore call. It does something only against an InfiniCore that reads
+that variable; that change belongs in the InfiniCore tree, not here, and is being
+proposed upstream. With the variable unset InfiniCore behaves exactly as before,
+so this is inert against a stock build.
+
+Route-subset bisection is impossible on the strict platform, for the record: any
+partial route set fails independently with `NameError: reshape_and_cache_flash`,
+because there is no `vllm_metax` to supply that fallback. Routes are
+all-or-nothing. Ray is not a workaround either -- 2.58.0 was installed and tried,
+and TP=4 still wedged.
+
+### TP Matrix
+
+`bs=8`, `input_len=1024`, `output_len=256`, BF16, PIECEWISE cudagraph, chunked
+prefill disabled with `max_num_batched_tokens=16384`, one warmup and three
+measured iterations, output-only TPS. Baseline `VLLM_PLUGINS=metax`; subject
+`VLLM_PLUGINS=infinicore,vllm_infinicore` with `vllm_metax_loaded=false` verified
+on every InfiniCore case. All 16 cases valid with `validation_errors=[]` and
+matching graph-capture counts (`artifacts/tp-matrix-20260907b`).
+
+| Model | TP | vLLM-MetaX | InfiniCore | Ratio |
+|---|---:|---:|---:|---:|
+| DeepSeek-R1-Distill-Qwen-7B | 1 | 478.19 | 410.46 | 85.8% |
+| DeepSeek-R1-Distill-Qwen-7B | 2 | 615.71 | 447.85 | 72.7% |
+| DeepSeek-R1-Distill-Qwen-7B | 4 | 784.34 | 540.75 | 68.9% |
+| Qwen3-32B | 2 | 196.71 | 157.04 | 79.8% |
+| Qwen3-32B | 4 | 270.84 | 207.71 | 76.7% |
+| Qwen3-32B | 8 | 333.37 | 246.68 | 74.0% |
+| Qwen2.5-72B | 4 | 150.48 | 124.28 | 82.6% |
+| Qwen2.5-72B | 8 | 200.03 | 160.17 | 80.1% |
+
+Note the metax baseline is healthy at every TP including 8 -- the wedge is
+specific to the InfiniCore path, not to the platform. InfiniCore holds 69-86% of
+vLLM-MetaX, and the ratio falls monotonically with TP on every model, so the gap
+is in multi-card scaling and not only in single-card operator speed. It narrows
+as the model grows, which is what fixed per-step overhead being amortised looks
+like.
+
+### Operational Note
+
+A wedged TP run leaks its workers: `VLLM::Worker` processes survive their parent's
+SIGKILL and keep about 58 GiB pinned per card indefinitely. On 2026-09-04 four of
+them held cards 0-3 for two days and starved every later case, which cost a whole
+matrix run and produced a spurious "TP=2 also fails" reading. Any harness that
+runs TP cases unattended must reap with `pkill -9 -f "VLLM::[W]orker"` (bracket the
+pattern, or pkill matches its own ssh command line) and poll `mx-smi` until the
+cards fall back to roughly 858 MiB before starting the next case.
+
 ## 2026-09-04 Decode Gap Localization And Two Fixes
 
 Moved to a dedicated single-card host,
