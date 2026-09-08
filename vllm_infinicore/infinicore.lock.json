@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/InfiniTensor/InfiniCore.git",
+  "ref": "main",
+  "revision": "d3551f37538896056e164abf91b120e38c27007b",
+  "resolved_at": "2026-09-07",
+  "ascend_bridge_abi": 1
+}

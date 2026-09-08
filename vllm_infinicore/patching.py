@@ -230,10 +230,12 @@ class PatchRegistry:
         *,
         installers: Mapping[str, PatchInstaller] | None = None,
         uninstallers: Mapping[str, PatchUninstaller] | None = None,
+        native_fallback_reasons: Mapping[str, str] | None = None,
     ) -> None:
         self._routes = {route.name: route for route in routes}
         self._installers = dict(installers or _DEFAULT_INSTALLERS)
         self._uninstallers = dict(uninstallers or _DEFAULT_UNINSTALLERS)
+        self._native_fallback_reasons = dict(native_fallback_reasons or {})
 
     @property
     def routes(self) -> Mapping[str, OperatorRoute]:
@@ -363,6 +365,23 @@ class PatchRegistry:
                             f"{FORCE_NATIVE_FALLBACK_ENV} is true; using "
                             f"{route.native_fallback}"
                         ),
+                    )
+                )
+                continue
+
+            unsupported_reason = self._native_fallback_reasons.get(route_name)
+            if unsupported_reason is not None:
+                # A missing adapter is a supported native-fallback state, not
+                # an installation failure. In particular, never register a
+                # competing OOT class before Ascend registers its own classes.
+                skipped_routes.append(route_name)
+                route_states.append(
+                    self._route_state(
+                        route,
+                        requested=True,
+                        disabled_by_env=False,
+                        status=ROUTE_STATE_NATIVE_FALLBACK,
+                        reason=unsupported_reason,
                     )
                 )
                 continue
@@ -547,8 +566,59 @@ class PatchRegistry:
 
 
 def get_default_registry() -> PatchRegistry:
-    return PatchRegistry(QWEN3_OPERATOR_ROUTES)
+    from dataclasses import replace
 
+    from .platform_support import (
+        ascend_native_fallback_reasons,
+        ascend_platform_selected,
+    )
+
+    if ascend_platform_selected():
+        fallback_reasons = ascend_native_fallback_reasons()
+
+        def installer(name):
+            def install():
+                from .ops.ascend_routes import install
+
+                return install(name)
+
+            return install
+
+        def uninstaller(name):
+            def uninstall():
+                from .ops.ascend_routes import uninstall
+
+                return uninstall(name)
+
+            return uninstall
+
+        return PatchRegistry(
+            tuple(
+                replace(
+                    route,
+                    native_fallback=f"vLLM-Ascend native {route.name}",
+                    implementation="ascend_class_adapter"
+                    if route.name not in fallback_reasons
+                    else route.implementation,
+                    graph_policy="eager_only"
+                    if route.name not in fallback_reasons
+                    else "native_platform",
+                )
+                for route in QWEN3_OPERATOR_ROUTES
+            ),
+            installers={
+                r.name: installer(r.name)
+                for r in QWEN3_OPERATOR_ROUTES
+                if r.name not in fallback_reasons
+            },
+            uninstallers={
+                r.name: uninstaller(r.name)
+                for r in QWEN3_OPERATOR_ROUTES
+                if r.name not in fallback_reasons
+            },
+            native_fallback_reasons=fallback_reasons,
+        )
+    return PatchRegistry(QWEN3_OPERATOR_ROUTES)
 
 def _install_rms_norm_route() -> PatchInstallResult:
     from .ops.vllm_rms_norm import install_vllm_rms_norm_oot

@@ -1,5 +1,105 @@
 # Development Log
 
+## 2026-09-07 27B Graph Throughput, TP=2 and TP=4
+
+Measured BF16 1,024-input/1,024-output requests at submitted batches 1,4,16,32,
+with one warmup and three timed repeats per batch. Both engines use Ascend
+FULL_DECODE_ONLY graph and VLLM_COMPILE. Every rank records six captures and
+actual replays. TP=1 exceeds single-card weight capacity; TP=8 is unavailable
+because the container only maps four cards.
+
+The current graph integration is a native compiled backbone plus InfiniCore
+LMHead outside the graph. Ratios to native are 99.76%, 99.81%, 101.75%, 100.81%
+at TP=2 and 99.86%, 99.81%, 100.20%, 99.95% at TP=4. These measurements do not
+demonstrate InfiniCore kernels executing inside graph capture.
+
+Fixed an actual fullgraph compile failure in the plugin's unsupported-case
+fallback: compiler tracing now returns native directly without exception
+stringification or Python counter mutations. Fourteen adapter tests, including
+a real torch.compile(fullgraph=True) regression, pass against both the source
+and the staged container plugin directory. The pinned C API library is unchanged.
+
+TP=2 matches native on all 159 measured outputs. TP=4 has token variation even
+between native repeats, so strict deterministic correctness is not established.
+One native output's binary literal triggers a repetition false positive; raw
+flags and the scoped manual review are retained. Both engines report identical
+cache capacities within each TP setting; TP=2 large batches are capacity-limited.
+See [the complete report](ASCEND_27B_GRAPH_THROUGHPUT.md) and
+`artifacts/ascend-27b-graph-20260907`. All benchmark workers have exited.
+
+## 2026-09-07 27B Ascend TP=2 Validation
+
+Validated `/models/Qwen3.8-27B` (config architecture
+`Qwen3_5ForConditionalGeneration`) on NPU 0 and 1 in `zx-vllm-ascend-023`.
+BF16 eager TP=2 with 512 context and batch up to 4 passes 12 output checks
+using `Embedding,MatMul,LMHead`; all outputs match native token-for-token.
+Each worker records 224 embedding, 68,096 linear and 224 LMHead real InfiniCore
+calls. Weight memory is approximately 25.17 GiB per worker.
+
+The exploratory `all` case also generates correctly but fails adapter coverage:
+Gemma-style normalization and multimodal/partial RoPE bypass existing wrappers,
+and SwiGLU width 8,704 requires native fallback. No kernel coverage checks were
+weakened. Added TP/device/memory/text-only options and a worker-count check to
+the existing smoke harness. See [the full report](ASCEND_27B_TP2_AVAILABILITY.md)
+and `artifacts/ascend-27b-tp2-20260907` for results and reproduction.
+
+## 2026-09-07 InfiniCore Installed in Default Ascend Python
+
+Installed the full InfiniCore Python package in `npu-worker-08` container
+`zx-vllm-ascend-023`, using the same clean pinned source at
+`d3551f37538896056e164abf91b120e38c27007b`.
+
+- Default interpreter: `/usr/local/python3.12.13/bin/python`.
+- Package: `/usr/local/python3.12.13/lib/python3.12/site-packages/infinicore`.
+- Native libraries: `/usr/local/lib/libinfiniop.so`, `libinfinirt.so`,
+  `libinfiniccl.so`, and `libinfinicore_cpp_api.so`.
+- Source/build logs: `/workspace/work/infinicore-python-20260907`.
+- Distribution version is upstream `0.1.0`; the lock SHA identifies the source.
+
+Built CPU and Ascend910B4 support, with optional CCL, ATen and OpenMP disabled.
+The build shell limits open files to 65536 for xmake, uses the installed
+pybind11 3.1.0, and suppresses fatal CANN deprecation preprocessor warnings
+with `-Wno-error=cpp`. A CMake toolchain selects 910B4 without source edits.
+
+From `/tmp`, with `PYTHONPATH`, `INFINI_ROOT` and the plugin bridge variable
+unset, the default interpreter imports the installed extension and passes
+FP32 RMSNorm against NumPy on CPU and NPU (maximum absolute errors
+`1.43e-6` and `4.77e-7`, respectively). Logs and the validation script/results
+are in `artifacts/ascend-python-default-20260907`.
+The existing plugin bridge is unchanged; installation does not add missing
+upstream Ascend operators or remove the plugin's native fallbacks.
+
+## 2026-09-07 Pinned InfiniCore Ascend Operator Adapters
+
+Added eager Ascend C API adapters for RMSNorm, SwiGLU, RoPE, Embedding,
+MatMul and LMHead directly in the worktree. `vllm_ascend` continues to own the
+platform, devices, worker, communication, attention and KV cache. Existing
+Ascend class methods are wrapped without duplicate OOT registrations, retaining
+their original native implementations for capability fallback.
+
+Pinned official InfiniCore `main` at
+`d3551f37538896056e164abf91b120e38c27007b` in a packaged lock file. The build
+script fetches/verifies that exact clean source; a small C API bridge embeds the
+revision and ABI for runtime verification. The build uses only the required
+upstream operator sources and CANN, without InfiniRT or Python InfiniCore.
+Fresh build trees avoid a CANN incremental preprocessing failure. A plugin-side
+Embedding destructor shim handles the missing upstream Ascend destroy branch.
+
+Supported operations submit on torch's current NPU stream and record tensor
+storage with its allocator. Blocked weights are converted to ND. Descriptor
+caches are bounded and synchronized before destruction. Fused Add+RMSNorm,
+FP32 GEMM, unsupported layouts/shapes and attention/KV paths retain native
+implementations. Unexpected device launch failures propagate.
+
+59 targeted unit/regression tests pass in the container.
+54 numeric checks pass on the 910B4, including three explicitly native FP32
+GEMM checks. Qwen3-0.6B eager `all` and automatic-discovery `autoall` each pass 12 output
+checks, match native token-for-token, and have nonzero counts for all six
+installed InfiniCore routes plus 10,752 fused norm native fallbacks.
+See [the integration report](ASCEND_QWEN3_06B_AVAILABILITY.md) for counters,
+reproduction and final regression results. No NPU graph/performance claim.
+
+
 ## 2026-09-04 Decode Gap Localization And Two Fixes
 
 Moved to a dedicated single-card host,

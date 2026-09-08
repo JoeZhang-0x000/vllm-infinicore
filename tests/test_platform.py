@@ -16,10 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class PlatformPluginTests(unittest.TestCase):
     def test_register_platform_returns_infinicore_platform_class_path(self) -> None:
-        self.assertEqual(
-            platform.register_platform(),
-            "vllm_infinicore.platform.InfiniCorePlatform",
-        )
+        with mock.patch("vllm_infinicore.platform_support.ascend_platform_selected", return_value=False):
+            self.assertEqual(
+                platform.register_platform(),
+                "vllm_infinicore.platform.InfiniCorePlatform",
+            )
 
     def test_platform_entry_point_does_not_import_vllm_or_torch(self) -> None:
         code = """
@@ -35,6 +36,7 @@ print("vllm" in sys.modules)
             check=True,
             capture_output=True,
             text=True,
+            env={**os.environ, "VLLM_PLUGINS": "infinicore,vllm_infinicore"},
         )
 
         self.assertEqual(

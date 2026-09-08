@@ -7,6 +7,32 @@ experiments on single-node Qwen3 inference. It remains default-off, but when
 explicitly enabled it now installs InfiniCore-backed eager routes for the full
 Qwen3-8B scoped inference operator set.
 
+Ascend uses a separate eager C API adapter (`ops/ascend_backend.py`) compiled
+from the exact upstream revision in `infinicore.lock.json`. The minimal bridge
+creates an operator handle for the caller's already selected device; it never
+initializes or owns a device runtime. Calls use torch's current NPU stream,
+convert blocked weights to ND before exposing pointers, and record tensor
+storage on that stream. Operator descriptors are cached per thread/device/stream;
+eviction synchronizes their owning stream before destroying ACL workspaces.
+
+`ops/ascend_routes.py` wraps methods on the existing Ascend classes instead of
+registering duplicate OOT names. Native methods and their orchestration remain
+available for capability fallback; uninstall restores the original method.
+Attention/KV-cache routes stay native. Missing operator-library configuration
+keeps all routes native without importing heavy frameworks. A configured but
+mismatched revision/ABI is an installation failure, not a supported backend.
+Known unsupported cases fall back before launch; runtime launch errors propagate.
+
+The platform entry defers to Ascend during automatic discovery, and MetaX
+compatibility mutations are skipped. Device management, workers, communication,
+attention and KV cache continue to use `vllm_ascend`. Real InfiniCore operator
+capture remains disabled; use eager execution to exercise those adapters.
+During torch.compile tracing, wrappers return the original native program
+without Python exception/counter side effects. The 27B TP=2/4 graph benchmark
+therefore uses a native compiled backbone and real InfiniCore LMHead outside
+the graph. See [the graph report](ASCEND_27B_GRAPH_THROUGHPUT.md) for throughput,
+graph evidence and the observed TP=4 token-repeatability limitation.
+
 ## Layers
 
 ### 1. vLLM Plugin Entry

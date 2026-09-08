@@ -107,6 +107,47 @@ class InfiniCoreBackendTests(unittest.TestCase):
             self.assertTrue(infinicore_backend.real_backend_enabled(tensor))
             self.assertTrue(infinicore_backend.store_kv_cache_backend_enabled(tensor))
 
+    def test_npu_is_accelerator_but_unsupported_adapter_uses_explicit_fallback(self) -> None:
+        tensor = SimpleNamespace(device=SimpleNamespace(type="npu", index=0))
+        npu_api = object()
+        native = mock.Mock(return_value="native output")
+        launch = mock.Mock(side_effect=AssertionError("NPU InfiniCore launch must not occur"))
+        with (
+            mock.patch.dict(os.environ, {"VLLM_INFINICORE_STRICT_BACKEND": "1"}, clear=True),
+            mock.patch.object(torch, "npu", npu_api, create=True),
+        ):
+            self.assertTrue(infinicore_backend._is_accelerator_tensor(tensor))
+            self.assertIs(infinicore_backend._torch_device_api(tensor), npu_api)
+            self.assertFalse(infinicore_backend.real_backend_enabled(tensor))
+            result = infinicore_backend._route_or_fallback("rms_norm", tensor, launch, native)
+        self.assertEqual(result, "native output")
+        native.assert_called_once()
+        launch.assert_not_called()
+        self.assertEqual(infinicore_backend.backend_call_counts(), {})
+        self.assertEqual(infinicore_backend.backend_fallback_counts(), {"rms_norm": 1})
+        self.assertIn("not supported", infinicore_backend.backend_fallback_reasons()["rms_norm"])
+        infinicore_backend.reset_backend_call_counts()
+        self.assertEqual(infinicore_backend.backend_fallback_counts(), {})
+
+    def test_npu_fused_norm_does_not_probe_cuda_cpp_bridge(self) -> None:
+        tensor = SimpleNamespace(device=SimpleNamespace(type="npu", index=0))
+        with (
+            mock.patch.object(infinicore_backend, "fused_add_rms_norm_supported") as probe,
+            mock.patch.object(infinicore_backend, "_fused_add_rms_norm_torch", return_value=("out", "residual")),
+        ):
+            self.assertEqual(infinicore_backend.fused_add_rms_norm(tensor, tensor, tensor, 1e-6), ("out", "residual"))
+        probe.assert_not_called()
+        self.assertEqual(infinicore_backend.backend_fallback_counts(), {"fused_add_rms_norm": 1})
+
+    def test_npu_fallback_policy_does_not_hide_cuda_strict_failures(self) -> None:
+        tensor = SimpleNamespace(device=SimpleNamespace(type="cuda", index=0))
+        native = mock.Mock()
+        launch = mock.Mock(side_effect=RuntimeError("kernel execution failed"))
+        with mock.patch.dict(os.environ, {"VLLM_INFINICORE_STRICT_BACKEND": "1"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "InfiniCore rms_norm failed"):
+                infinicore_backend._route_or_fallback("rms_norm", tensor, launch, native)
+        native.assert_not_called()
+
     def test_privateuseone_tensor_maps_to_musa_device_type(self) -> None:
         tensor = mock.Mock()
         tensor.is_cuda = False

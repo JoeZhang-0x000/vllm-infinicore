@@ -24,4 +24,6 @@ include = [
     "configs/*.yaml",
     "docs/*.md",
     "vllm_infinicore/csrc/*.cpp",
+    "vllm_infinicore/csrc/ascend/*",
+    "vllm_infinicore/infinicore.lock.json",
 ]

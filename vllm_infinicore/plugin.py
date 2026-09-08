@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 
 from .patching import PatchUninstallSummary, RegistrationResult, get_default_registry
+from .platform_support import ascend_platform_selected
 from .ray import register_vllm_environment
-from .runtime_patches import apply_vllm_020_compat_patches
+from .runtime_patches import apply_vllm_020_compat_patches, vllm_020_compat_status
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +19,8 @@ def register() -> RegistrationResult:
     """Register the plugin with vLLM.
 
     vLLM calls this function with no arguments from the
-    ``vllm.general_plugins`` entry point. The current skeleton deliberately
-    records the Qwen3 routing scope without installing monkey patches.
+    ``vllm.general_plugins`` entry point. Unsupported platform adapters leave
+    native operators intact and are reported explicitly as native fallback.
     """
 
     global _REGISTERED, _REGISTRATION_RESULT
@@ -28,7 +29,11 @@ def register() -> RegistrationResult:
         return _REGISTRATION_RESULT
 
     register_vllm_environment()
-    compat_status = apply_vllm_020_compat_patches()
+    compat_status = (
+        vllm_020_compat_status()
+        if ascend_platform_selected()
+        else apply_vllm_020_compat_patches()
+    )
 
     registry = get_default_registry()
     result = registry.register_from_environment()
@@ -44,6 +49,9 @@ def register() -> RegistrationResult:
     )
     if compat_status.applied:
         logger.info("vllm-infinicore vLLM 0.20 compatibility patches: %s", compat_status)
+    for state in result.route_states:
+        if state.fallback_active:
+            logger.info("vllm-infinicore %s: native_fallback (%s)", state.name, state.reason)
     return result
 
 
