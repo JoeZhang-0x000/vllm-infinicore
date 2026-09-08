@@ -26,8 +26,13 @@ ATTENTION_BACKEND_CLASS_PATH = (
 )
 
 
-def register_platform() -> str:
-    """Return the vLLM platform class path for the InfiniCore platform."""
+def register_platform() -> str | None:
+    """Defer to Ascend when selected; otherwise offer the InfiniCore platform."""
+
+    from .platform_support import ascend_platform_selected
+
+    if ascend_platform_selected():
+        return None
 
     return PLATFORM_CLASS_PATH
 

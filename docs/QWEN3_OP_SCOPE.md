@@ -29,6 +29,16 @@ Current routing policy:
   plumbing while keeping native vLLM execution.
 - Preserve vLLM native cudagraph correctness as the baseline.
 
+On Ascend, the plugin adapts existing `vllm_ascend` operator methods through a
+pinned InfiniCore C API library. With no library configured, all routes remain
+native. With the library configured, capability-supported routes are installed;
+attention and KV-cache routes remain native. Per-call unsupported cases use the
+original Ascend implementation and report separate fallback counters/reasons.
+The adapter never registers competing OOT classes, and does not implement its
+own Ascend device/worker/communication runtime. Ascend routes are eager-only.
+See [`ASCEND_QWEN3_06B_AVAILABILITY.md`](ASCEND_QWEN3_06B_AVAILABILITY.md) for
+exact tested coverage and remaining capability exclusions.
+
 ## Current Route-State Smoke
 
 Artifact: `artifacts/qwen3_128_32_smoke.json`
