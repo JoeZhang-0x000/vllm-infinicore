@@ -2096,3 +2096,86 @@ underlying InfiniCore decode/logits kernel/API behavior, vLLM scheduling around
 attention/logits, or stream synchronization granularity. Further work should
 profile kernel time versus stream-wait time and compare the exact InfiniLM C++
 execution context before adding more bridge code.
+
+
+## 2026-09-09 — InfiniCore operators now run inside the compiled Ascend graph
+
+`ascend_backend.execute()` returned the native operator whenever
+`torch.compiler.is_compiling()` was true, and refused any call made during stream
+capture, so every graph measurement this project had published was native against
+native — as `ASCEND_27B_GRAPH_THROUGHPUT.md` says about its own numbers. The
+compiled path now calls InfiniCore. Full method, limits and evidence in
+`docs/ASCEND_27B_GRAPH_INFINICORE.md`.
+
+Changes:
+
+- `ops/ascend_graph_ops.py` registers the operators as `torch.library.custom_op`
+  in the `vllm_infinicore_ascend::` namespace with fake implementations, so
+  Dynamo can place the ctypes launch in the graph as an opaque node. The
+  `vllm_infinicore::` namespace is already owned by the default-off
+  `ops/custom_ops.py` layer and cannot be reused.
+- Capability predicates (`supports_linear`, `supports_silu_and_mul`,
+  `supports_rotary_embedding`, `supports_tensor`) are shared by the eager path
+  and the trace-time gate. A compiled graph cannot switch implementations per
+  call, so an unsupported case selects native before the node is emitted.
+- `launch()` is capture-safe: the descriptor key drops the stream so warmed
+  descriptors are reused during capture, eviction is skipped while capturing, and
+  a descriptor recorded into a graph is pinned so eviction cannot destroy state a
+  replay still points at.
+- Workspaces are shared per device at the high-water mark. A buffer per
+  descriptor is a memory regression — sizes are skewed (88 MiB against a 0.16 MiB
+  median), so the sum exhausts the headroom `gpu_memory_utilization` leaves and
+  the engine fails to start.
+- **`record_stream` is gone from the launch path**, which was the single largest
+  effect. It is only meaningful for a tensor used on a stream other than its
+  own, and this adapter always launches on the tensors' current stream, so it
+  protected nothing while making the allocator defer block reuse until it
+  observed a stream event. With a fresh 71 MiB output per call, each allocation
+  waited on device progress instead of pipelining. A 4-sequence TP=2 prefill went
+  from 12.15 s to 2.01 s against native's 1.80 s, and per-call allocation cost
+  from 166/595 µs (the ranks differed by 3.6x) to a symmetric 36.9/37.7 µs.
+
+Graph results, median of three repeats, 1,024 in / 256 out:
+
+| TP | bs=1 | bs=4 | bs=16 | bs=32 |
+| --- | --- | --- | --- | --- |
+| 2 | 99.3% | 96.8% | excluded | excluded |
+| 4 | 98.8% | 95.3% | 90.9% | 89.9% |
+
+Every cell stable within ~1% across repeats. Against the same workload measured
+in eager mode before the `record_stream` fix (62.2% at TP=2 bs=1), every cell
+improves; those eager numbers described the defect, not the adapter, and are not
+carried forward.
+
+`record_stream` also explained a cluster of separately-chased symptoms: an
+unexplained 54.2% cell at TP=2 `bs=4`, intermittent stalls at TP=4 `bs=1`, a rank
+asymmetry that flipped between runs, and the puzzle that it looked like allocator
+pressure yet `expandable_segments:True` changed nothing. Isolated microbenchmarks
+never showed it because an idle device has free memory, so deferred reuse never
+blocks. Impact scales with memory pressure: TP=2 (~15,040 cache tokens) was hit
+hard, TP=4 (~200,320) barely.
+
+TP=2 `bs=16`/`bs=32` are excluded because they measure InfiniCore *faster* than
+native (130.6 against 53.2 tok/s), reproducibly across three fresh launches each.
+Instrumentation shows both engines run the same forward passes (783 against 781)
+but very different ACL graph replays (745 against 501): native leaves 280 steps
+to run eagerly. The cell measures vLLM-Ascend batching under cache pressure, not
+the plugin, and why the scheduler diverges is open. Ruled out by measurement:
+kernel differences (`torch.ops.vllm.unquantized_gemm` is
+`torch.nn.functional.linear`, at parity with InfiniCore from M=1 to M=2048),
+extra recompute, an unstable native baseline, descriptor-cache eviction, and
+`FRACTAL_NZ` weight conversion.
+
+Method notes worth keeping:
+
+- Measure kernel time by capturing launches into a graph and timing replay. A
+  wall-clock loop at small M is enqueue-bound on both sides and hides the kernel.
+- Use three measured repeats, not two: the median of two values is their mean, so
+  one stalled repeat moves the figure by tens of percent.
+- `bench_ascend_throughput.py` purges every `VLLM_INFINICORE_*` variable before
+  starting the engine, so an override passed from outside is silently erased.
+  This invalidated two experiments before it was noticed; overrides must be CLI
+  flags.
+- A failed `LLM()` orphans its TP workers, which keep ~29.5 GiB per card and make
+  every later run fail on free memory rather than on its own merits. The harness
+  now reaps children when construction fails.

@@ -66,11 +66,23 @@ InfiniRT and communication components are not required. A manifest records the
 revision, SoC, CANN path and library SHA256. The adapter checks the embedded
 revision and ABI before installing routes, including in spawned workers.
 
-Use **eager execution** (`enforce_eager=True`) to exercise the real Ascend adapters.
-Graph compilation retains native backbone operations; the tested 27B TP=2/4
-graph path invokes InfiniCore only for LMHead outside the graph. See the
-[graph throughput report](docs/ASCEND_27B_GRAPH_THROUGHPUT.md) for measurements
-and correctness limits. Supported eager calls use the current
+The adapters run in **both eager and compiled execution**. Operators are
+registered as `torch.library` custom ops in the `vllm_infinicore_ascend::`
+namespace, so Dynamo traces them into the compiled program and an ACL graph can
+capture them; capability is resolved at trace time, and an unsupported call
+selects the native operator there rather than raising inside the graph. The
+[graph report](docs/ASCEND_27B_GRAPH_INFINICORE.md) is the current
+InfiniCore-vs-native result: 99.3% of native at TP=2 batch 1, and 98.8% down to
+89.9% across batch 1 to 32 at TP=4.
+The older [native-backbone graph report](docs/ASCEND_27B_GRAPH_THROUGHPUT.md)
+predates the traceable operators and measured native against native. Set
+`VLLM_INFINICORE_ASCEND_GRAPH=0` to restore eager-only behaviour.
+
+Route coverage depends on the architecture: on Qwen3.5-27B only Embedding,
+MatMul and LMHead execute, because SwiGLU rejects `intermediate_size` above
+8192, Ascend pins RMSNorm to native, and the linear-attention layers bypass
+RoPE. TP=1 is not available for that checkpoint: 51.75 GiB of BF16 weights
+exceed the 29.49 GiB usable per 910B4. Supported calls use the current
 torch NPU stream and torch-owned tensor storage. Unsupported cases retain the
 original Ascend method, with fallback counts/reasons separate from InfiniCore
 call counts. Runtime launch errors propagate rather than being silently retried.

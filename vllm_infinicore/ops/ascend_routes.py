@@ -1,12 +1,21 @@
-"""Adapt Ascend-owned classes without registering competing OOT classes."""
+"""Adapt Ascend-owned classes without registering competing OOT classes.
+
+Each route wraps one Ascend or vLLM method and picks between three
+implementations per call: the traceable operator from `ascend_graph_ops`, an
+eager InfiniCore launch, or the original native method. `_dispatch` holds that
+choice in one place so every route makes it the same way.
+"""
 
 from __future__ import annotations
 
 from functools import wraps
 import importlib
 
+import torch
+
 from ..patching import PatchInstallResult, PatchUninstallResult
 from . import ascend_backend as backend
+from . import ascend_graph_ops as graph_ops
 
 _TARGETS = {
     "RMSNorm": ("vllm_ascend.ops.layernorm", "AscendRMSNorm", "forward_oot"),
@@ -31,112 +40,198 @@ _TARGETS = {
 _PATCHES = {}
 
 
-def _wrapper(route, original):
-    if route == "RMSNorm":
+def _prefetch():
+    from vllm_ascend.utils import get_weight_prefetch_method
 
-        @wraps(original)
-        def rms(self, x, residual=None):
-            native = lambda: original(self, x, residual)
-            if residual is not None:
-                return backend.fallback(
-                    "fused_add_rms_norm",
-                    "InfiniCore has no Ascend fused Add+RMSNorm kernel",
-                    native,
-                )
+    return get_weight_prefetch_method()
 
-            def run():
-                if getattr(self, "variance_size_override", None) not in (
-                    None,
-                    x.shape[-1],
-                ):
-                    raise backend.Unsupported("partial RMSNorm variance")
-                y = backend.rms_norm(x, self.weight, self.variance_epsilon)
-                if self.bias_loaded:
-                    y.add_(self.bias)
-                from vllm_ascend.utils import get_weight_prefetch_method
 
-                get_weight_prefetch_method().maybe_prefetch_mlp_weight_postprocess(y)
-                return y
+def _dispatch(name, tensor, checks, traced, eager, native):
+    """Route one call to the traced operator, the eager launch, or native.
 
-            return backend.execute("rms_norm", x, run, native)
+    `checks` are `(supported, reason)` pairs. They are all evaluated before the
+    call is known to be eligible, so every predicate must answer for any tensor
+    rather than raise. They mean
+    different things on each path. While tracing, an unsupported call must
+    select the native operator here: a compiled graph fixes its operators and
+    cannot choose per call, so raising inside it is not an option. In eager
+    execution the same failure becomes an `Unsupported`, which `execute`
+    records as a fallback with its reason.
+    """
+    unsupported = next((reason for supported, reason in checks if not supported), None)
+    if torch.compiler.is_compiling():
+        return native() if unsupported else traced()
 
-        return rms
-    if route == "SiluAndMul":
+    def run():
+        if unsupported:
+            raise backend.Unsupported(unsupported)
+        return eager()
 
-        @wraps(original)
-        def silu(self, x):
-            def run():
-                from vllm_ascend.utils import get_weight_prefetch_method
+    return backend.execute(name, tensor, run, native)
 
-                prefetch = get_weight_prefetch_method()
-                prefetch.maybe_prefetch_mlp_weight_preprocess(prefetch.MLP_DOWN, x)
-                y = backend.silu_and_mul(x)
-                prefetch.maybe_prefetch_mlp_weight_postprocess(y)
-                return y
 
-            return backend.execute("silu_and_mul", x, run, lambda: original(self, x))
+def _rms_norm(original):
+    @wraps(original)
+    def rms(self, x, residual=None):
+        native = lambda: original(self, x, residual)
+        if residual is not None:
+            return backend.fallback(
+                "fused_add_rms_norm",
+                "InfiniCore has no Ascend fused Add+RMSNorm kernel",
+                native,
+            )
 
-        return silu
-    if route == "RoPE":
+        def finish(y):
+            if self.bias_loaded:
+                y = y + self.bias
+            _prefetch().maybe_prefetch_mlp_weight_postprocess(y)
+            return y
 
-        @wraps(original)
-        def rope(
-            self, positions, query, key, offsets=None, is_neox_style_override=None
-        ):
-            def run():
-                if offsets is not None or getattr(self, "use_mtp", False):
-                    raise backend.Unsupported(
-                        "offset/MTP RoPE retains Ascend orchestration"
-                    )
-                neox = (
-                    self.is_neox_style
-                    if is_neox_style_override is None
-                    else is_neox_style_override
-                )
-                return backend.rotary_embedding(
-                    positions,
-                    query,
-                    key,
-                    self.head_size,
-                    self.rotary_dim,
-                    self.cos_sin_cache,
-                    neox,
-                )
-
-            return backend.execute(
-                "rotary_embedding",
-                query,
-                run,
-                lambda: original(
-                    self, positions, query, key, offsets, is_neox_style_override
+        return _dispatch(
+            "rms_norm",
+            x,
+            [
+                (
+                    getattr(self, "variance_size_override", None)
+                    in (None, x.shape[-1]),
+                    "partial RMSNorm variance",
                 ),
-            )
+                backend.supports_tensor(x),
+                backend.supports_tensor(self.weight),
+            ],
+            traced=lambda: finish(
+                graph_ops.rms_norm(x, self.weight, self.variance_epsilon)
+            ),
+            eager=lambda: finish(
+                backend.rms_norm(x, self.weight, self.variance_epsilon)
+            ),
+            native=native,
+        )
 
-        return rope
-    if route == "Embedding":
+    return rms
 
-        @wraps(original)
-        def embedding(self, layer, input_):
-            return backend.execute(
-                "embedding",
-                input_,
-                lambda: backend.embedding(input_, layer.weight),
-                lambda: original(self, layer, input_),
-            )
 
-        return embedding
+def _silu_and_mul(original):
+    @wraps(original)
+    def silu(self, x):
+        native = lambda: original(self, x)
 
+        def prefetched(launch):
+            prefetch = _prefetch()
+            prefetch.maybe_prefetch_mlp_weight_preprocess(prefetch.MLP_DOWN, x)
+            y = launch()
+            prefetch.maybe_prefetch_mlp_weight_postprocess(y)
+            return y
+
+        return _dispatch(
+            "silu_and_mul",
+            x,
+            [backend.supports_tensor(x), backend.supports_silu_and_mul(x)],
+            traced=lambda: prefetched(lambda: graph_ops.silu_and_mul(x)),
+            eager=lambda: prefetched(lambda: backend.silu_and_mul(x)),
+            native=native,
+        )
+
+    return silu
+
+
+def _rotary_embedding(original):
+    @wraps(original)
+    def rope(self, positions, query, key, offsets=None, is_neox_style_override=None):
+        native = lambda: original(
+            self, positions, query, key, offsets, is_neox_style_override
+        )
+        if torch.compiler.is_compiling() and key is None:
+            # The operator returns two tensors, so a missing key cannot be
+            # expressed in its schema and stays on the native path.
+            return native()
+        neox = (
+            self.is_neox_style
+            if is_neox_style_override is None
+            else is_neox_style_override
+        )
+        args = (
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.rotary_dim,
+            self.cos_sin_cache,
+            neox,
+        )
+        checks = [
+            (
+                offsets is None and not getattr(self, "use_mtp", False),
+                "offset/MTP RoPE retains Ascend orchestration",
+            ),
+            backend.supports_tensor(positions),
+            backend.supports_tensor(query),
+            backend.supports_rotary_embedding(
+                positions, self.head_size, self.rotary_dim
+            ),
+        ]
+        if key is not None:
+            checks.append(backend.supports_tensor(key))
+        return _dispatch(
+            "rotary_embedding",
+            query,
+            checks,
+            traced=lambda: graph_ops.rotary_embedding(*args),
+            eager=lambda: backend.rotary_embedding(*args),
+            native=native,
+        )
+
+    return rope
+
+
+def _embedding(original):
+    @wraps(original)
+    def embedding(self, layer, input_):
+        native = lambda: original(self, layer, input_)
+        return _dispatch(
+            "embedding",
+            input_,
+            [backend.supports_tensor(input_), backend.supports_tensor(layer.weight)],
+            traced=lambda: graph_ops.embedding(input_, layer.weight),
+            eager=lambda: backend.embedding(input_, layer.weight),
+            native=native,
+        )
+
+    return embedding
+
+
+def _linear(original, name):
     @wraps(original)
     def linear(self, layer, x, bias=None):
-        name = "linear" if route == "MatMul" else "lm_head"
-        return backend.execute(
+        native = lambda: original(self, layer, x, bias)
+        return _dispatch(
             name,
             x,
-            lambda: backend.linear(x, layer.weight, bias),
-            lambda: original(self, layer, x, bias),
+            [
+                backend.supports_tensor(x),
+                backend.supports_tensor(layer.weight),
+                backend.supports_linear(x),
+            ],
+            traced=lambda: graph_ops.linear(x, layer.weight, bias, name),
+            eager=lambda: backend.linear(x, layer.weight, bias),
+            native=native,
         )
 
     return linear
+
+
+_WRAPPERS = {
+    "RMSNorm": _rms_norm,
+    "SiluAndMul": _silu_and_mul,
+    "RoPE": _rotary_embedding,
+    "Embedding": _embedding,
+    "MatMul": lambda original: _linear(original, "linear"),
+    "LMHead": lambda original: _linear(original, "lm_head"),
+}
+
+
+def _wrapper(route, original):
+    return _WRAPPERS[route](original)
 
 
 def install(route):

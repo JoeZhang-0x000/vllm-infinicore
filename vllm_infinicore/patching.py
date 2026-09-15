@@ -600,7 +600,7 @@ def get_default_registry() -> PatchRegistry:
                     implementation="ascend_class_adapter"
                     if route.name not in fallback_reasons
                     else route.implementation,
-                    graph_policy="eager_only"
+                    graph_policy="ascend_graph_capturable"
                     if route.name not in fallback_reasons
                     else "native_platform",
                 )
