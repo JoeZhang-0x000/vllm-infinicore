@@ -1,271 +1,106 @@
-# Qwen3 Operator Scope
+# Qwen3 算子范围
 
-This document defines the first operator scope for single-node Qwen3 inference. All routes are disabled by default, and requested routes without a proven installer use native vLLM fallback.
+本文定义单节点 Qwen3 推理的算子范围。**所有路由默认关闭**；被请求但没有可用安装器的路由使用
+vLLM 原生回退。术语与命名约定见 [README](../README.md#术语与命名约定)。
 
-| Operator | Category | Planned route | Default | Current installer | Native fallback |
-|---|---|---|---|---|---|
-| `RMSNorm` | Normalization | PyTorch custom op wrapper | Disabled | vLLM OOT class -> `vllm_infinicore::rms_norm` | vLLM RMSNorm `forward_native` |
-| `SiluAndMul` | MLP activation | PyTorch custom op wrapper | Disabled | vLLM OOT class -> `vllm_infinicore::silu_and_mul` | vLLM native activation |
-| `RoPE` | Attention position encoding | PyTorch custom op wrapper | Disabled | vLLM OOT class -> `vllm_infinicore::rotary_embedding` | vLLM native rotary embedding |
-| `Embedding` | Token embedding | PyTorch custom op wrapper | Disabled | `UnquantizedEmbeddingMethod.embedding` -> `vllm_infinicore::embedding` | vLLM native token embedding |
-| `MatMul` | Linear projections | PyTorch custom op wrapper | Disabled | `UnquantizedLinearMethod.apply` -> `vllm_infinicore::linear` | vLLM native linear layers |
-| `LMHead` | Final projection | PyTorch custom op wrapper | Disabled | `UnquantizedEmbeddingMethod.apply` for `ParallelLMHead` -> `vllm_infinicore::lm_head` | vLLM native logits projection |
-| `StoreKVCache` | KV cache update | InfiniCore PA/KV wrapper | Disabled | attention backend `do_kv_cache_update` -> `infinicore.paged_caching` | vLLM native KV cache store path |
-| `PagedAttentionPrefill` | Paged attention | InfiniCore PA/KV wrapper | Disabled | attention backend `forward` -> `infinicore.paged_attention_prefill` | vLLM native paged attention prefill backend |
-| `PagedAttentionDecode` | Paged attention | InfiniCore PA/KV wrapper | Disabled | attention backend `forward` -> C++ bridge `PagedAttentionDecodeFlash` | vLLM native paged attention decode backend |
+## 九条 scoped 路由
 
-## Routing And Defaults
+| 算子 | 类别 | 默认 | 安装器 | 原生回退 |
+|---|---|---|---|---|
+| `RMSNorm` | 归一化 | 关闭 | vLLM OOT 类 → `vllm_infinicore::rms_norm` / `::fused_add_rms_norm` | vLLM RMSNorm `forward_native` |
+| `SiluAndMul` | MLP 激活 | 关闭 | vLLM OOT 类 → `vllm_infinicore::silu_and_mul` | vLLM 原生激活 |
+| `RoPE` | 位置编码 | 关闭 | vLLM OOT 类 → `vllm_infinicore::rotary_embedding` | vLLM 原生 rotary embedding |
+| `Embedding` | token embedding | 关闭 | `UnquantizedEmbeddingMethod.embedding` → `vllm_infinicore::embedding` | vLLM 原生 token embedding |
+| `MatMul` | 线性投影 | 关闭 | `UnquantizedLinearMethod.apply` → `vllm_infinicore::linear` | vLLM 原生 linear |
+| `LMHead` | 最终投影 | 关闭 | `ParallelLMHead` 的 `UnquantizedEmbeddingMethod.apply` → `vllm_infinicore::lm_head` | vLLM 原生 logits 投影 |
+| `StoreKVCache` | KV cache 更新 | 关闭 | attention 后端 `do_kv_cache_update` → `infinicore.paged_caching` / bridge `StoreKVCache` | vLLM 原生 KV cache 写入 |
+| `PagedAttentionPrefill` | paged attention | 关闭 | attention 后端 `forward` → `infinicore.mha_varlen` | vLLM 原生 paged attention prefill |
+| `PagedAttentionDecode` | paged attention | 关闭 | attention 后端 `forward` → C++ bridge `PagedAttentionDecodeFlash` | vLLM 原生 paged attention decode |
 
-Current routing policy:
+前六条为非 attention 路由，后三条为 attention/KV 路由。`RMSNorm` 路由同时覆盖普通 RMSNorm 和
+fused residual-add RMSNorm 两个 op，它们有各自独立的计数器，但消融与
+`VLLM_INFINICORE_DISABLED_ROUTES` 的语义按单条路由处理。
 
-- Keep patching opt-in and disabled by default.
-- Install routes only when `VLLM_INFINICORE_ENABLE_PATCHES=1` and
-  `VLLM_INFINICORE_ROUTES=...` request them.
-- Allow `VLLM_INFINICORE_ROUTES=all` for the full nine-route Qwen3 scope or a
-  comma-separated subset for isolation.
-- Allow `VLLM_INFINICORE_DISABLED_ROUTES=...` to remove selected routes from an
-  otherwise larger request.
-- Allow `VLLM_INFINICORE_FORCE_NATIVE_FALLBACK=1` to exercise route-state
-  plumbing while keeping native vLLM execution.
-- Preserve vLLM native cudagraph correctness as the baseline.
+## 路由策略
 
-On Ascend, the plugin adapts existing `vllm_ascend` operator methods through a
-pinned InfiniCore C API library. With no library configured, all routes remain
-native. With the library configured, capability-supported routes are installed;
-attention and KV-cache routes remain native. Per-call unsupported cases use the
-original Ascend implementation and report separate fallback counters/reasons.
-The adapter never registers competing OOT classes, and does not implement its
-own Ascend device/worker/communication runtime. Ascend routes are eager-only.
-See [`ASCEND_QWEN3_06B_AVAILABILITY.md`](ASCEND_QWEN3_06B_AVAILABILITY.md) for
-exact tested coverage and remaining capability exclusions.
+- 保持 opt-in，默认关闭。
+- 只有在 `VLLM_INFINICORE_ENABLE_PATCHES=1` 且 `VLLM_INFINICORE_ROUTES=...` 请求时才安装路由。
+- `VLLM_INFINICORE_ROUTES=all` 展开为完整九条；也接受逗号分隔子集用于隔离实验。
+- `VLLM_INFINICORE_DISABLED_ROUTES=...` 从更大的请求集合中移除若干条。
+- `VLLM_INFINICORE_FORCE_NATIVE_FALLBACK=1` 请求路由但保持 vLLM 原生执行，用于验证路由状态管线。
+- 以 vLLM 原生 cudagraph 的正确性为基线。
 
-## Current Route-State Smoke
+### 平台差异
 
-Artifact: `artifacts/qwen3_128_32_smoke.json`
+**MetaX。** 与 `vllm_metax` 共存，或用本插件的平台入口在不加载 `vllm_metax` 的情况下运行。
+后一种模式下**路由是全有或全无**：底层后端缺 `reshape_and_cache_flash` / `flash_attn_varlen_func`，
+任何部分路由集都会独立地以 `NameError` 失败，因此无法在严格平台上做路由子集二分。
+attention/KV 路由的消融必须另用 `VLLM_PLUGINS=metax,vllm_infinicore` 的诊断矩阵，
+而**加载 MetaX 上下文本身就会改变全路由基线**（2026-09-01 实测 `+10.80%`），这个效应必须与路由归因分开。
 
-Settings:
+**Ascend。** 通过固定版本的 InfiniCore C API 库适配 `vllm_ascend` 既有的算子方法。
+未配置库时全部路由保持原生；配置后安装能力支持的路由，attention/KV 路由保持原生。
+每次调用中不支持的情形使用原始 Ascend 实现，并单独上报回退计数与原因。
+适配器不注册竞争的 OOT 类，也不实现自己的 Ascend 设备/worker/通信运行时。
+支持的路由可通过 `ops/ascend_graph_ops.py` 在编译后的 ACL graph 内执行，不支持的形状在 trace 时选原生；
+capture 会固定算子 descriptor，replay 不再增加 Python launch 计数。详见 [`ASCEND.md`](ASCEND.md)。
 
-- Model: `/mnt/geogpt-doc-new/default/xb/qwen3-8B`
-- Prompt IDs: generated once and reused across cases
-- Input/output: exact `128 / 32` tokens
-- Sampling: `temperature=0.0`, `top_p=1.0`, `top_k=1`, EOS ignored,
-  `min_tokens=max_tokens=32`
-- CUDA Graph: PIECEWISE, capture sizes `[1, 2, 4, 8]`,
-  `backend="eager"`, `enforce_eager=False`
-- Warmup/repeats: `1 / 2`
+**MUSA。** 当前流 C++ bridge 在 MUSA 上默认覆盖全部九条路由，与 MetaX 上只默认三条不同。
 
-Result:
+## 覆盖率不等于安装数
 
-| Case | Route state | Graph evidence | Validation |
-|---|---|---|---|
-| `native-graph` | no plugin routes requested | `num_cudagraph_captured=148` | `validation_errors=[]` |
-| `plugin-fallback-graph` | all nine routes requested, all native fallback | `num_cudagraph_captured=148` | `validation_errors=[]` |
+**"安装了 N 条路由"不等于"N 条路由都被调用"**，也不等于"它们在热路径上"。实际覆盖取决于模型架构
+和每 rank 的分片形状。已踩过的三个坑：
 
-Output health for both cases: exact input count `128`, exact generated count
-`32`, readable decoded preview, replacement/control chars `0`, and no
-degenerate repetition flagged. Output-only TPS in this quick smoke was
-`53.11` native graph and `53.27` plugin fallback graph; this is a sanity
-comparison, not a formal throughput conclusion.
+1. **计数非零不代表在热路径上。** torch.compile 在 trace 时解析 Python 分支。2026-09-04 的 RMSNorm
+   路由已安装、后端计数非零，却因为要求 `residual is None` 而缺席了自己 98% 的调用
+   （一个 decoder layer 的 57 个调用点里有 56 个带 residual）。需要运行时分支计数才能确认。
+2. **能力限制作用于分片后的形状。** InfiniCore Ascend SwiGLU kernel 的宽度限制是 8192，
+   作用于**每 rank 分片后**的 intermediate width。`/models/Qwen3.8-27B` 的未分片 `intermediate_size`
+   是 17,408，但 TP=2 分片后为 8,704（超限，回退），TP=4 分片后为 4,352（支持，正常执行）。
+   按未分片宽度做的一刀切排除是错的。
+3. **上游可能把某个 op 钉在原生。** `vllm_ascend` 把 IR op 优先级设为
+   `IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])`，所包装的 RMSNorm 入口
+   因此拿不到任何调用；这不是能力不足。同样地，`/models/Qwen3.8-27B` 的 64 层中有 48 层是
+   `linear_attention`，走 gated-delta-rule 路径而不调用标准 rotary op。
 
-## Current All-Routes InfiniCore Smokes
+各模型的实测覆盖见 [`ASCEND.md`](ASCEND.md) 第 7 节。
 
-Eager artifact:
-`artifacts/qwen3_128_32_all_routes_streamed_strict_eager.json`
+## 启用一条路由之前的验收
 
-Graph artifact:
-`artifacts/qwen3_128_32_all_routes_streamed_strict_graph.json`
+在一条路由可以默认启用之前，需要：
 
-No-MetaX single-card artifact:
-`artifacts/qwen3_128_32_no_metax_stage3.json`
+- 对照 vLLM 原生路径的单元级数值比较；
+- 带精确 token 计数的 128 输入 / 32 输出正确性 smoke；
+- 输出预览验证且 `validation_errors=[]`；
+- 2048 输入 / 512 输出的预热与重复测量；
+- 图模式下使用时的 graph capture 证据；
+- 结论不依赖历史 TPS 表。
 
-Settings:
+## 吞吐路由策略
 
-- Model: `/mnt/geogpt-doc-new/default/xb/qwen3-8B`
-- Routes: `VLLM_INFINICORE_ROUTES=all`
-- Strict backend: `VLLM_INFINICORE_STRICT_BACKEND=1`
-- Native fallback forcing: `VLLM_INFINICORE_FORCE_NATIVE_FALLBACK=0`
-- vLLM eager mode: `enforce_eager=True`
-- vLLM graph mode: PIECEWISE cudagraph with `backend="eager"` and
-  `enforce_eager=False`
-- Input/output: exact `128 / 32` tokens
-- Sampling: `temperature=0.0`, `top_p=1.0`, `top_k=1`, EOS ignored,
-  `min_tokens=max_tokens=32`
-
-Result:
-
-| Case | Installed routes | Graph captures | Validation |
-|---|---|---:|---|
-| `custom-eager` | all nine scoped routes | 0 | `validation_errors=[]` |
-| `custom-graph` | all nine scoped routes | 148 | `validation_errors=[]` |
-| `no-metax-eager` | all nine scoped routes, `vllm_metax_loaded=False` | 0 | `validation_errors=[]` |
-| `no-metax-graph` | all nine scoped routes, `vllm_metax_loaded=False` | 148 | `validation_errors=[]` |
-
-The no-MetaX cases run with `VLLM_PLUGINS=infinicore,vllm_infinicore`,
-`VLLM_INFINICORE_ROUTES=all`, and
-`VLLM_INFINICORE_FORCE_NATIVE_FALLBACK=0`. The smoke harness treats
-`vllm_metax_loaded=True` as a validation error for these cases.
-
-Backend call counts in the all-routes eager measured iteration:
-
-| Backend wrapper | Calls |
-|---|---:|
-| `embedding` | 32 |
-| `linear` | 4608 |
-| `lm_head` | 32 |
-| `paged_attention_prefill` | 36 |
-| `paged_attention_decode` | 1116 |
-| `rms_norm` | 2336 |
-| `rotary_embedding` | 1152 |
-| `silu_and_mul` | 1152 |
-| `store_kv_cache` | 1152 |
-
-Backend call counts in the all-routes graph measured iteration:
-
-| Backend wrapper | Calls |
-|---|---:|
-| `embedding` | 1 |
-| `linear` | 144 |
-| `lm_head` | 32 |
-| `paged_attention_prefill` | 36 |
-| `paged_attention_decode` | 1116 |
-| `rms_norm` | 73 |
-| `rotary_embedding` | 36 |
-| `silu_and_mul` | 36 |
-| `store_kv_cache` | 36 |
-
-Graph note:
-
-- The previous graph replay failure was caused by launching `_infinicore`
-  kernels on InfiniCore's runtime stream without joining that stream to
-  PyTorch's captured stream.
-- The backend now wraps the InfiniCore stream with `torch.cuda.ExternalStream`
-  and adds `wait_stream` dependencies around each launch.
-- Python backend call counters in graph mode count graph capture and
-  non-captured paths; replay of captured non-attention ops does not re-enter
-  Python, so `graph_capture_count` and decoded-output validation remain part of
-  the evidence.
-
-## Acceptance Before Enabling A Route
-
-Before any route can be enabled by default, it needs:
-
-- Unit-level numeric comparison against the native vLLM path.
-- 128 input / 32 output correctness smoke with exact token accounting.
-- Output preview validation and `validation_errors=[]`.
-- 2048 input / 512 output warmup and repeated measurement.
-- CUDA Graph capture evidence when used in graph mode.
-- No reliance on historical TPS tables for the conclusion.
-
-## Throughput Route Policy
-
-For current graph-mode all-operator throughput runs, use the full
-vLLM-InfiniCore route profile:
+图模式下的全算子吞吐运行必须使用完整路由剖面：
 
 ```text
 VLLM_INFINICORE_ROUTES=all
 ```
 
-This expands to all nine scoped Qwen3 routes:
-`RMSNorm,SiluAndMul,RoPE,Embedding,MatMul,LMHead,StoreKVCache,`
-`PagedAttentionPrefill,PagedAttentionDecode`.
+即 `RMSNorm,SiluAndMul,RoPE,Embedding,MatMul,LMHead,StoreKVCache,PagedAttentionPrefill,PagedAttentionDecode`。
 
-Isolation data remains useful for diagnosis only. It must not be used as the
-delivery configuration when the requirement is that every scoped called
-operator routes through InfiniCore. Older isolation at `bs=8`,
-`input_len=4096`, `output_len=128`, graph mode pointed to the paged-attention
-kernel pair:
+隔离数据只用于诊断。当要求是"每一个纳入范围且被调用的算子都走 InfiniCore"时，
+它不能作为交付配置。
 
-| Routes | Output TPS | Artifact |
-|---|---:|---|
-| `StoreKVCache,PagedAttentionPrefill,PagedAttentionDecode` | 17.90 | `artifacts/attention-wrapper-cache-bs8-in4096-out128-graph-20260505-142100` |
-| `StoreKVCache,PagedAttentionPrefill` | 60.84 | `artifacts/attention-no-decode-bs8-in4096-out128-graph-20260505-142722` |
-| `PagedAttentionPrefill` | 61.65 | `artifacts/attention-prefill-only-bs8-in4096-out128-graph-20260505-143036` |
-| `StoreKVCache` | 168.66 | `artifacts/attention-storekv-only-bs8-in4096-out128-graph-20260505-142918` |
+当前的 attention 路由使用 InfiniCore 可用的 PA/FA 算子：prefill 分派到 `infinicore.mha_varlen`，
+decode 分派到插件 C++ bridge 路由 `PagedAttentionDecodeFlash`（使用 InfiniCore 自带的 FlashAttention
+适配器，在 vLLM 当前流上执行）。较慢的 Python `infinicore.paged_attention` decode 包装器仅保留用于
+A/B（关闭 bridge 即可），旧的外部 stream `mha_kvcache_` bridge 可用
+`VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode` 显式选择。
+`LMHead` 走 bridge 仍是 opt-in：`VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecodeFlash,LMHead`。
 
-Current DeepSeek-R1-Distill-Qwen-7B one-at-a-time ablation at `bs=8`,
-`input_len=2048`, `output_len=512`, strict no-MetaX PIECEWISE graph mode shows
-that the primary bottleneck has moved to the default StoreKVCache execution
-boundary. A MetaX-fallback diagnostic recovered `43.59` output tok/s
-(`+12.40%`) by disabling only StoreKVCache. More directly, retaining the
-InfiniCore StoreKV route and switching it from the Python/external-stream path
-to the existing current-stream C++ `infiniopPagedCaching` bridge raised strict
-no-MetaX all-route throughput from `317.33` to `366.14` output tok/s
-(`+15.38%`) with 116 graph captures and no fallback. MatMul was the largest
-non-attention secondary route (`+3.65%` when disabled); PagedAttentionDecode
-was a net benefit relative to its MetaX fallback (`-2.24%` when disabled).
-
-The latest full-route benchmark at `bs=8`, `input_len=4096`,
-`output_len=512`, graph mode was:
-
-| Engine/routes | Output TPS | Graph captures | Artifact |
-|---|---:|---:|---|
-| vLLM native | 283.29 | 148 | `artifacts/all-routes-gap-ablation-bs8-in4096-out512-graph-20260505-165647` |
-| vLLM-InfiniCore `all` | 262.41 | 148 | `artifacts/all-routes-after-rope-opt-bs8-in4096-out512-graph-20260505-172113` |
-
-The `all` run installed all nine scoped routes and recorded nonzero InfiniCore
-calls for Embedding, RMSNorm, MatMul/Linear, RoPE, StoreKVCache,
-PagedAttentionPrefill, SiluAndMul, LMHead, and PagedAttentionDecode.
-`PagedAttentionPrefill` now dispatches to InfiniCore's FlashAttention-wrapped
-`mha_varlen`, and `PagedAttentionDecode` dispatches to the plugin C++ bridge
-route `PagedAttentionDecodeFlash`. This keeps the all-scoped-operators
-requirement while avoiding the slower Python `infinicore.paged_attention`
-decode wrapper and the older external-stream `mha_kvcache_` bridge.
-
-Older `bs=8`, `input_len=4096`, `output_len=512` runs reduced the full-route
-result from `43.17` to `211.73`, then to `262.41` output tok/s after the RoPE
-wrapper optimization. A later 95% follow-up retained per-device InfiniCore
-stream pointer caching and measured `262.97` output tok/s for
-`VLLM_INFINICORE_ROUTES=all` against `280.93` same-run vLLM native (`93.61%`).
-
-`PagedAttentionDecode`, bias-free `MatMul`, and `StoreKVCache` now route through
-the plugin C++ bridge by default. The default bridge routes are
-`PagedAttentionDecodeFlash,MatMul,StoreKVCache`; Flash decode uses the
-InfiniCore-vendored FlashAttention adaptor from the current vLLM stream and records bridge
-counters. The older external-stream `mha_kvcache_` bridge can be selected for
-A/B tests with
-`VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecode`.
-
-`LMHead` remains opt-in through:
-
-```text
-VLLM_INFINICORE_CPP_BRIDGE_ROUTES=PagedAttentionDecodeFlash,LMHead
-```
-
-For Qwen2.5-0.5B-Instruct TP=1 at `input_len=2048`, `output_len=1024`, the
-current strict no-MetaX default measured `102.14` output tok/s versus the
-same-shape vLLM MetaX baseline `145.65` output tok/s (`70.1%`). The run
-reported `vllm_metax_loaded=false`, backend
-`vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend`,
-and bridge counters `PagedAttentionDecodeFlash=24552`, `MatMul=72`. Artifact:
-`artifacts/xzh-53-qwen25-clean-default-20260605-011125`.
-
-On the current Qwen3-4B single-GPU decision shape (`bs=8`, `input_len=1024`,
-`output_len=512`), default bridged decode measured `412.44` output tok/s
-against `417.31` vLLM native (`98.8%`) with 148 graph captures and no native
-fallback. Artifact:
-`artifacts/single-gpu-cpp-decode-qwen3-4b-20260603-200530`.
-
-## Attention Backend Status
-
-The attention/KV route group is now installed through a vLLM attention backend
-override rather than through per-method monkey patches. When these routes are
-requested, `FLASH_ATTN` is re-registered to:
-
-```text
-vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend
-```
-
-The implementation reuses the MetaX/vLLM FlashAttention metadata builder and
-KV-cache layout, then dispatches supported KV update, prefill, and decode paths
-to `_infinicore`. Current validation artifacts:
-
-- Eager `128/32` custom attention-backend smoke:
-  `artifacts/attention_backend_custom_eager_128_32_v3.json`
-- Graph `bs=2`, `128/32` attention-backend smoke:
-  `artifacts/attention-backend-smoke-bs2-in128-out32-v3`
-
-Eager validation shows backend-level nonzero calls for StoreKVCache,
-PagedAttentionPrefill, and PagedAttentionDecode. Graph validation shows
-backend-level nonzero calls for StoreKVCache and PagedAttentionDecode with
-`graph_capture_count=148`; the prefill forward in that graph smoke currently
-falls back to the platform backend and remains a follow-up item.
+**已知的路由级瓶颈排序**（DeepSeek-R1-Distill-Qwen-7B，`bs=8`、`input_len=2048`、`output_len=512`、
+严格无 MetaX PIECEWISE 图模式，2026-09-01 实测）：主瓶颈是 StoreKVCache 的 Python/外部 stream 边界，
+不是 paged-caching 数学本身——保留 InfiniCore StoreKV 路由而把它从 Python/外部 stream 路径切到当前流
+C++ `infiniopPagedCaching` bridge，把全路由吞吐从 `317.33` 抬到 `366.14` 输出 TPS（`+15.38%`）。
+`MatMul` 是最大的非 attention 次要路由（禁用时 `+3.65%`）；`PagedAttentionDecode` 相对其 MetaX 回退
+是净收益（禁用时 `-2.24%`）。低于 2% 的差值接近运行波动，不应过度解读。
+完整消融表与后续的 decode gap profile 见 [`DEV_LOG.md`](DEV_LOG.md)。

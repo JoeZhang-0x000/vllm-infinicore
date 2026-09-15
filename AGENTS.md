@@ -1,54 +1,41 @@
-# vLLM-InfiniCore Agent Guide
+# vllm-infinicore 智能体指南
 
-**Updated:** 2026-05-04
-**Target machine:** MetaX C550 with MACA 3.5.3. Work locally; no SSH is needed.
+**更新：** 2026-09-15
 
-## Source Of Truth
+## 先读这些
 
-Read these first when changing this project:
+改动本项目前请先读：
 
-- `docs/DEV_LOG.md`
-- `docs/ARCHITECTURE.md`
-- `docs/QWEN3_OP_SCOPE.md`
+- [`README.md`](README.md) — 项目概览、**术语与命名约定**、环境变量清单
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 分层设计、图策略、基准公平性规则
+- [`docs/QWEN3_OP_SCOPE.md`](docs/QWEN3_OP_SCOPE.md) — 九条 scoped 路由与覆盖率陷阱
+- [`docs/ASCEND.md`](docs/ASCEND.md) — Ascend 集成、最新性能矩阵与限制
+- [`docs/DEV_LOG.md`](docs/DEV_LOG.md) — 2026-09-01 起的开发日志与对应 commit
 
-This project is a clean vLLM plugin scaffold. Older `vLLM-NT` and `InfiniLM` benchmark tables are historical unless a new fair benchmark proves the claim. Do not claim InfiniLM or this plugin is faster than vLLM native cudagraph from old TPS tables.
+**所有文档使用中文**，代码与代码注释保持英文。新文档必须遵守 README 中的术语表，不要引入别名。
 
-## Environment
+**不要用旧的 TPS 表下结论。** 更早的 `vLLM-NT` / `InfiniLM` 基准表已作废，其 artifacts 已随
+`9f8ba43 chore: remove generated artifacts` 清理。除非有按当前公平性规则重新测出的结果，
+否则不要声称 InfiniLM 或本插件快于 vLLM 原生 cudagraph。
 
-```bash
-source /opt/conda/etc/profile.d/conda.sh
-conda activate base
+## 平台与环境
 
-export MACA_PATH=/opt/maca-3.5.3
-export MACA_HOME=/opt/maca-3.5.3
-export MACA_ROOT=/opt/maca-3.5.3
-export INFINI_ROOT=$HOME/.infini
-export PYTHON_SITE_PACKAGES=/opt/conda/lib/python3.12/site-packages
-export TORCH_LIB=$PYTHON_SITE_PACKAGES/torch/lib
-export FLASH_ATTN_2_CUDA_SO=$PYTHON_SITE_PACKAGES/flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so
+三条平台线。具体环境变量见 [README](README.md)，此处只列每条线的要害：
 
-export PATH=/mnt/geogpt-doc-new/default/xmake_env/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$MACA_PATH/bin:$PATH
-export LD_LIBRARY_PATH=/opt/conda/lib:$TORCH_LIB:$INFINI_ROOT/lib:$MACA_PATH/lib:$MACA_PATH/lib64
-export XMAKE_ROOT=y
+| 平台 | 工作方式 | 要害 |
+|---|---|---|
+| Ascend NPU 910B4 | 远端容器（`npu-worker-08` / `zx-vllm-ascend-023`），模型在 `/models` | 需要 `VLLM_INFINICORE_ASCEND_LIBRARY`；未设置时九条路由全部保持原生 |
+| MetaX C550 | 远端主机，MACA `3.8.0.23`，模型在 `/root/models` | vLLM 0.22 必须设 `VLLM_USE_V2_MODEL_RUNNER=0`；用 `run-infinicore.sh` / `run-metax.sh` wrapper 固定后端 |
+| MUSA | 仅打通启动/图路由/TP 通信 | 无正式性能结果，不要引用 MUSA 吞吐数字 |
 
-# Include both the MetaX platform plugin and this general plugin when testing after installation.
-export VLLM_PLUGINS=metax,vllm_infinicore
-export VLLM_ENABLE_V1_MULTIPROCESSING=0
-```
+最初的 MACA 3.5.3 本地开发目标已不再是当前目标。
 
-Default behavior is conservative. `vllm_infinicore.register()` installs no monkey patches unless a future implementation explicitly enables a safe path. Keep `VLLM_INFINICORE_ENABLE_PATCHES=0` or unset for dry import and baseline runs.
+默认行为是保守的：`vllm_infinicore.register()` 不安装任何 monkey patch。
+做 dry import 和基线运行时保持 `VLLM_INFINICORE_ENABLE_PATCHES=0` 或不设置。
 
-## Current Model
+## 图规则
 
-```text
-/mnt/geogpt-doc-new/default/xb/qwen3-8B
-```
-
-This is Qwen3-8B.
-
-## CUDA Graph Rules
-
-vLLM native cudagraph works on this machine with:
+**MetaX** 上 vLLM 原生 cudagraph 可用：
 
 ```python
 from vllm.config import CUDAGraphMode
@@ -62,53 +49,54 @@ comp_config = {
 llm = LLM(..., enforce_eager=False, compilation_config=comp_config)
 ```
 
-Rules:
+- 测 cudagraph 时不要用 `enforce_eager=True`。
+- **MetaX 上不要用 `CompilationMode.VLLM_COMPILE`**，除非就是在测编译失败模式。
+- 用 `backend="eager"` 跳过 torch.compile 同时保留 cudagraph。
+- 在每条打过 patch 的路径被证明图安全之前，保持本插件图保守。
 
-- Do not use `enforce_eager=True` when measuring cudagraph.
-- Do not use `CompilationMode.VLLM_COMPILE` on MetaX unless explicitly testing compile failure modes.
-- Use `backend="eager"` to skip torch.compile while keeping cudagraph.
-- Keep this plugin graph-conservative until every patched path is proven graph-safe.
+**Ascend** 上相反：使用 `CompilationMode.VLLM_COMPILE` 配 `CUDAGraphMode.FULL_DECODE_ONLY`，
+prefill 不在 decode graph 内。该栈上默认 KV block size 16 会让 graph 初始化失败，需显式请求 128。
 
-## Benchmark Rules
+## 基准规则
 
-Future benchmark scripts must:
+基准脚本必须：
 
-1. Generate prompt token IDs once with the model tokenizer.
-2. Use exact same prompt IDs for every engine.
-3. Record actual input and generated output token counts.
-4. Use output-only TPS as the primary metric.
-5. Align sampling: `temperature=0.0`, `top_p=1.0`, `top_k=1`, EOS disabled.
-6. For vLLM, use `min_tokens=max_tokens=output_len`.
-7. Print decoded output preview and text-health counters before trusting TPS.
-8. Warm up before measurement and run enough repeats to avoid single-request overhead.
+1. 用模型 tokenizer 一次性生成 prompt token ID，并在各引擎间复用同一份。
+2. 记录实际的输入与生成输出 token 数。
+3. 以**输出 TPS**（定义见 README）为主指标。
+4. 对齐采样：`temperature=0.0`、`top_p=1.0`、`top_k=1`、禁用 EOS，vLLM 侧
+   `min_tokens=max_tokens=output_len`。
+5. 先预热，**再做三次测量重复**——两次不够，两个值的中位数就是均值。
+6. 在信任 TPS 之前先打印解码输出预览和文本健康计数。
+7. 记录 graph capture 数、路由状态与后端计数器。
 
-## Validation
+几个反复踩到的坑：
 
-Skeleton validation:
+- **后端计数非零不能证明一条路由活在热路径上**，torch.compile 在 trace 时就解析掉 Python 分支。
+- 图模式下的 Python 计数只反映预热、capture 和未捕获路径，不是全部 replay 算子数。
+- **不要用 cProfile 的 cumtime 去估高频路径上的优化收益**，要做 A/B。
+- 判断 host 侧优化需要完整基准 harness；短 profiler 窗口只对结构性证据（设备算子时间、
+  GPU busy、设备事件计数）可靠。
+- 卡死或失败的运行会遗留 worker 并占住显存，使后续用例因显存不足而失败，必须回收后再继续。
+
+## 验证
 
 ```bash
 python -m compileall vllm_infinicore
 python -c "import vllm_infinicore; vllm_infinicore.register()"
-python - <<'PY'
-import tomllib
-from pathlib import Path
-data = tomllib.loads(Path("pyproject.toml").read_text())
-print(data["project"]["entry-points"]["vllm.general_plugins"])
-PY
+python -m unittest discover -s tests
 ```
 
-## Notifications
+跑测试套件需要设置 `VLLM_PLUGINS`；不设时只跑 80 个测试且 4 个平台/注册用例报错。
+在 MetaX 主机上通过后端 wrapper 运行以拿到完整套件。
 
-Use the configured Feishu task update webhook from the parent benchmark project
-only for important conclusions or data.
+## 通知
 
-Send a notification for:
+只对重要结论或数据使用上级基准项目配置的飞书任务更新 webhook：
 
-- Formal benchmark completion with result data or artifact paths.
-- Important correctness, graph-safety, or performance conclusions.
-- Blocking failures that need human attention.
-- Resolution of a previously reported blocking failure.
+- 带结果数据或 artifact 路径的正式基准完成；
+- 重要的正确性、图安全性或性能结论；
+- 需要人介入的阻塞性失败，以及此类失败的解除。
 
-Do not send Feishu notifications for routine file edits, ordinary task
-completion, small refactors, dry imports, compile checks, intermediate progress,
-or non-blocking findings. Prefer a concise final chat update for those cases.
+不要为常规文件编辑、普通任务完成、小重构、dry import、编译检查、中间进度或非阻塞发现发通知，
+这些用一条简洁的最终聊天更新即可。
