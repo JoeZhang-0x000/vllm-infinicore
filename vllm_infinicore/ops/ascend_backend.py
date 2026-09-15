@@ -1,8 +1,12 @@
-"""Pinned InfiniCore C API on torch's current NPU stream (eager only).
+"""Pinned InfiniCore C API on torch's current NPU stream.
 
-Descriptors are cached per device/stream. Tensor storage is owned by torch;
-record_stream protects every raw pointer until the external launch completes.
-No device, worker, communication or KV-cache runtime is implemented here.
+Descriptors are cached per device and shape, deliberately not per stream, so a
+descriptor warmed on the default stream is reused during graph capture. Tensor
+storage is owned by torch; record_stream protects every raw pointer until the
+external launch completes, and is skipped during capture where the graph's own
+memory pool keeps the addresses alive. Launches are traceable through the
+operators in `ascend_graph_ops`. No device, worker,
+communication or KV-cache runtime is implemented here.
 """
 
 from __future__ import annotations
@@ -110,9 +114,18 @@ def fallback(name, reason, native):
     return native()
 
 
+def graph_enabled():
+    """Whether InfiniCore may run inside a captured Ascend graph.
+
+    Set `VLLM_INFINICORE_ASCEND_GRAPH=0` to restore the eager-only behaviour and
+    let capture fall back to the native operator.
+    """
+    return os.environ.get("VLLM_INFINICORE_ASCEND_GRAPH", "1") != "0"
+
+
 def execute(name, tensor, operation, native):
-    # Raising/converting Unsupported inside Dynamo fullgraph tracing breaks
-    # compilation. Keep the eager-only adapter out of the compiled program.
+    # Routes emit a registered custom op while tracing, so reaching here under
+    # Dynamo means no traceable operator exists for this call.
     if torch.compiler.is_compiling():
         return native()
     if tensor.device.type != "npu":
@@ -121,8 +134,8 @@ def execute(name, tensor, operation, native):
         return fallback(name, "real backend explicitly disabled", native)
     try:
         with torch.npu.device(tensor.device):
-            if torch.npu.is_current_stream_capturing():
-                raise Unsupported("Ascend graph capture has not been validated")
+            if torch.npu.is_current_stream_capturing() and not graph_enabled():
+                raise Unsupported("Ascend graph capture disabled by environment")
             result = operation()
     except Unsupported as exc:
         return fallback(name, str(exc), native)
@@ -133,13 +146,26 @@ def execute(name, tensor, operation, native):
     return result
 
 
+def supports_tensor(tensor):
+    """The device and dtype half of `nd`, answerable from a traced tensor.
+
+    Format casting stays inside `nd`: it inspects real device memory, so it can
+    only run in the operator body, never at trace time.
+    """
+    if tensor.device.type != "npu" or tensor.dtype not in _DTYPES:
+        return (
+            False,
+            f"unsupported tensor device/dtype: {tensor.device}/{tensor.dtype}",
+        )
+    return True, ""
+
+
 def nd(tensor):
     import torch_npu
 
-    if tensor.device.type != "npu" or tensor.dtype not in _DTYPES:
-        raise Unsupported(
-            f"unsupported tensor device/dtype: {tensor.device}/{tensor.dtype}"
-        )
+    supported, reason = supports_tensor(tensor)
+    if not supported:
+        raise Unsupported(reason)
     if not tensor.numel():
         raise Unsupported("empty tensor")
     if torch_npu.get_npu_format(tensor) != 2:
@@ -150,9 +176,13 @@ def nd(tensor):
 class _Descriptor:
     def __init__(self, lib, op, tensors, scalar, stream):
         self.lib, self.op, self.stream = lib, op, stream
+        # A descriptor created during capture records the capture stream, which
+        # is not the stream to synchronize against when it is later destroyed.
+        self.device = tensors[0].device
         self.ptr = C.c_void_p()
         self.handle = C.c_void_p()
         self.workspace_size = C.c_size_t()
+        self._workspace = None
         _check(
             lib.vllmInfinicoreCreateAscendHandle(
                 C.byref(self.handle), tensors[0].device.index
@@ -194,11 +224,41 @@ class _Descriptor:
             for ptr in descs:
                 lib.infiniopDestroyTensorDescriptor(ptr)
 
+    def workspace(self, capturing):
+        """Scratch for one launch, shared by every descriptor on the device.
+
+        Allocating per launch churns the caching allocator tens of thousands of
+        times per batch and puts an allocation inside every capture, but a
+        buffer per descriptor is worse: sizes are skewed (88 MiB for a large
+        prefill GEMM against a 0.16 MiB median), so summing them exhausts the
+        headroom left by `gpu_memory_utilization` and the engine fails to start.
+        One buffer at the high-water mark costs the maximum instead of the sum.
+
+        Launches on a device are serialized on its stream, so sharing scratch is
+        safe. Growth is not: a captured graph records the pointer, so once a
+        capture has used the shared buffer it must never be reallocated, and any
+        later launch needing more takes a private buffer instead.
+        """
+        need = max(self.workspace_size.value, 1)
+        if self._workspace is not None and self._workspace.numel() >= need:
+            return self._workspace
+        shared = getattr(_LOCAL, "workspace", None)
+        if shared is not None and shared.numel() >= need:
+            if capturing:
+                _LOCAL.workspace_locked = True
+            return shared
+        if capturing or getattr(_LOCAL, "workspace_locked", False):
+            self._workspace = torch.empty(need, dtype=torch.uint8, device=self.device)
+            return self._workspace
+        shared = torch.empty(need, dtype=torch.uint8, device=self.device)
+        _LOCAL.workspace = shared
+        return shared
+
     def close(self):
         # Embedding owns an ACL workspace; executors also must outlive launches.
-        with torch.npu.device(self.stream.device):
+        with torch.npu.device(self.device):
             if self.ptr.value:
-                self.stream.synchronize()
+                torch.npu.current_stream(self.device).synchronize()
                 _check(
                     (
                         self.lib.vllmInfinicoreDestroyEmbeddingDescriptor
@@ -213,7 +273,24 @@ class _Descriptor:
                 self.handle = C.c_void_p()
 
 
+
+# The descriptor key includes the token count, so chunked prefill and every
+# decode batch width add entries. Evicting one costs a stream synchronize, so
+# the limit sits well above the working set a run actually reaches (~90).
+_DESCRIPTOR_CACHE_LIMIT = 4096
+
+
+def _evict(cache):
+    """Drop the oldest descriptor that no captured graph depends on."""
+    for key, desc in cache.items():
+        if not getattr(desc, "pinned", False):
+            cache.pop(key).close()
+            return
+
+
 def clear_cache():
+    _LOCAL.workspace = None
+    _LOCAL.workspace_locked = False
     cache = getattr(_LOCAL, "descriptors", {})
     for desc in cache.values():
         desc.close()
@@ -225,31 +302,43 @@ def launch(op, tensors, scalar=()):
     if any(t.device != tensors[0].device for t in tensors):
         raise Unsupported("mixed-device tensors")
     stream = torch.npu.current_stream(tensors[0].device)
+    # The stream is a launch argument, not part of the descriptor, so it stays
+    # out of the key. Keying on it would force a fresh descriptor during graph
+    # capture, whose creation and eviction both touch the host mid-capture.
     key = (
         op,
         tensors[0].device,
-        stream.npu_stream,
         tuple((tuple(t.shape), t.stride(), t.dtype) for t in tensors),
         scalar,
     )
     if not hasattr(_LOCAL, "descriptors"):
         _LOCAL.descriptors = OrderedDict()
     cache = _LOCAL.descriptors
+    capturing = torch.npu.is_current_stream_capturing()
     if key not in cache:
-        if len(cache) >= 128:
-            cache.popitem(last=False)[1].close()
+        # close() synchronizes, which is illegal mid-capture. A capture adds at
+        # most the shapes it records, so letting the cache grow is bounded.
+        if len(cache) >= _DESCRIPTOR_CACHE_LIMIT and not capturing:
+            _evict(cache)
         cache[key] = _Descriptor(lib, op, tensors, scalar, stream)
+        # A captured graph replays the recorded launch without consulting this
+        # cache, so destroying its descriptor would leave the graph pointing at
+        # freed state. Descriptors recorded into a graph are never evicted.
+        cache[key].pinned = capturing
     cache.move_to_end(key)
     desc = cache[key]
+    if capturing:
+        desc.pinned = True
     args = [desc.ptr]
     if op != "Embedding":
-        workspace = torch.empty(
-            desc.workspace_size.value, dtype=torch.uint8, device=tensors[0].device
-        )
-        workspace.record_stream(stream)
-        args += [workspace.data_ptr(), desc.workspace_size.value]
-    for tensor in tensors:
-        tensor.record_stream(stream)
+        # The descriptor owns this buffer for its whole lifetime, so it needs no
+        # record_stream and its address is stable across a graph replay.
+        args += [desc.workspace(capturing).data_ptr(), desc.workspace_size.value]
+    # record_stream is a no-op against a captured graph and is rejected by the
+    # allocator during capture; the graph's own pool keeps the addresses alive.
+    if not capturing:
+        for tensor in tensors:
+            tensor.record_stream(stream)
     args += [t.data_ptr() for t in tensors]
     if op == "Gemm":
         args += [1.0, 0.0]
@@ -263,26 +352,48 @@ def rms_norm(x, weight, eps):
     return launch("RMSNorm", [torch.empty_like(x), x, weight], (float(eps),))
 
 
-def silu_and_mul(x):
-    x = nd(x).contiguous()
-    if x.shape[-1] % 2:
-        raise Unsupported("SwiGLU requires an even hidden size")
+def supports_silu_and_mul(x):
+    """Report SwiGLU capability from shape and dtype alone.
+
+    A compiled graph fixes its operators at trace time, so the same predicate
+    has to answer before the node is emitted and before an eager launch. Like
+    every `supports_*`, it must answer for any tensor rather than raise: callers
+    evaluate it before knowing whether the call is eligible at all.
+    """
+    if x.ndim == 0 or x.shape[-1] % 2:
+        return False, "SwiGLU requires an even hidden size"
     hidden = x.shape[-1] // 2
     # Upstream uses eight blocks with aligned, unmasked input loads. Reject
     # uneven/tail tiles rather than exposing storage beyond the logical tensor.
     if hidden % (8 * 32 // x.element_size()) or hidden > 8192:
-        raise Unsupported("SwiGLU requires eight aligned tiles and hidden size <= 8192")
+        return False, "SwiGLU requires eight aligned tiles and hidden size <= 8192"
+    return True, ""
+
+
+def silu_and_mul(x):
+    x = nd(x).contiguous()
+    supported, reason = supports_silu_and_mul(x)
+    if not supported:
+        raise Unsupported(reason)
     original = x.shape[:-1] + (x.shape[-1] // 2,)
     gate, up = x.reshape(-1, x.shape[-1]).chunk(2, dim=-1)
     out = torch.empty(gate.shape, device=x.device, dtype=x.dtype)
     return launch("SwiGLU", [out, up, gate]).reshape(original)
 
 
-def linear(x, weight, bias=None):
+def supports_linear(x):
     if x.dtype == torch.float32:
-        raise Unsupported(
-            "pinned Ascend GEMM uses reduced-precision FP32 math; retain native FP32 linear"
+        return (
+            False,
+            "pinned Ascend GEMM uses reduced-precision FP32 math; retain native FP32 linear",
         )
+    return True, ""
+
+
+def linear(x, weight, bias=None):
+    supported, reason = supports_linear(x)
+    if not supported:
+        raise Unsupported(reason)
     x, weight = nd(x).contiguous(), nd(weight).contiguous()
     shape = x.shape[:-1] + (weight.shape[0],)
     out = torch.empty(
@@ -301,11 +412,19 @@ def embedding(ids, weight):
     return launch("Embedding", [out, ids, weight])
 
 
-def rotary_embedding(positions, query, key, head_size, rotary_dim, cache, neox):
+def supports_rotary_embedding(positions, head_size, rotary_dim):
     if rotary_dim != head_size or head_size != 128 or positions.ndim != 1:
-        raise Unsupported(
-            "only 128-dimensional full-head RoPE with 1D positions is supported"
+        return (
+            False,
+            "only 128-dimensional full-head RoPE with 1D positions is supported",
         )
+    return True, ""
+
+
+def rotary_embedding(positions, query, key, head_size, rotary_dim, cache, neox):
+    supported, reason = supports_rotary_embedding(positions, head_size, rotary_dim)
+    if not supported:
+        raise Unsupported(reason)
     positions = nd(positions).contiguous()
     cache = nd(cache.to(device=query.device, dtype=query.dtype))
     cos, sin = (t.contiguous() for t in cache.chunk(2, dim=-1))
