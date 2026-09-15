@@ -372,3 +372,42 @@ class AscendGraphOperatorTests(unittest.TestCase):
         self.assertEqual(desc.workspace(False).numel(), 1)
         backend.clear_cache()
 
+    def test_launch_does_not_record_stream_on_the_current_stream(self):
+        # record_stream defers allocator block reuse until a stream event is
+        # observed, which serializes the per-call output allocation against
+        # device progress. It protects nothing for a same-stream launch.
+        tensors = [
+            SimpleNamespace(
+                device=torch.device("npu:0"),
+                shape=(2, 2),
+                stride=lambda: (2, 1),
+                dtype=torch.bfloat16,
+                ndim=2,
+                data_ptr=lambda: 1,
+                record_stream=mock.Mock(side_effect=AssertionError("record_stream")),
+            )
+        ]
+        stream = SimpleNamespace(npu_stream=7)
+        api = SimpleNamespace(
+            current_stream=lambda _: stream,
+            is_current_stream_capturing=lambda: False,
+        )
+        descriptor = SimpleNamespace(
+            ptr=1,
+            workspace_size=SimpleNamespace(value=0),
+            workspace=lambda capturing: SimpleNamespace(data_ptr=lambda: 2),
+            pinned=False,
+            close=lambda: None,
+        )
+        lib = SimpleNamespace(infiniopGemm=mock.Mock(return_value=0))
+        with (
+            mock.patch.object(torch, "npu", api, create=True),
+            mock.patch.object(backend, "library", return_value=lib),
+            mock.patch.object(backend, "_Descriptor", return_value=descriptor),
+        ):
+            backend._LOCAL.descriptors = __import__("collections").OrderedDict()
+            try:
+                backend.launch("Gemm", tensors)
+            finally:
+                backend._LOCAL.descriptors.clear()
+        tensors[0].record_stream.assert_not_called()

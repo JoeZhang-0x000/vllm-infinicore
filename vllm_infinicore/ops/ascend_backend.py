@@ -2,10 +2,10 @@
 
 Descriptors are cached per device and shape, deliberately not per stream, so a
 descriptor warmed on the default stream is reused during graph capture. Tensor
-storage is owned by torch; record_stream protects every raw pointer until the
-external launch completes, and is skipped during capture where the graph's own
-memory pool keeps the addresses alive. Launches are traceable through the
-operators in `ascend_graph_ops`. No device, worker,
+storage is owned by torch, and every launch is issued on the tensors' own
+current stream, which is what keeps the raw pointers valid for the duration of
+the launch; see `launch` for why record_stream must not be added back. Launches
+are traceable through the operators in `ascend_graph_ops`. No device, worker,
 communication or KV-cache runtime is implemented here.
 """
 
@@ -334,11 +334,15 @@ def launch(op, tensors, scalar=()):
         # The descriptor owns this buffer for its whole lifetime, so it needs no
         # record_stream and its address is stable across a graph replay.
         args += [desc.workspace(capturing).data_ptr(), desc.workspace_size.value]
-    # record_stream is a no-op against a captured graph and is rejected by the
-    # allocator during capture; the graph's own pool keeps the addresses alive.
-    if not capturing:
-        for tensor in tensors:
-            tensor.record_stream(stream)
+    # No record_stream here. Every launch goes on the tensors' own current
+    # stream, which the caching allocator already orders allocations against, so
+    # it would protect nothing. It is far from free: it defers block reuse until
+    # the allocator observes a stream event, so with a fresh output allocated per
+    # call and little spare memory each allocation blocks on device progress
+    # instead of pipelining. Removing it cut a 4-sequence prefill from 12.1 s to
+    # 2.0 s against native's 1.8 s, and removed a 16x spread in allocation cost
+    # between ranks. Reintroduce it only alongside a launch on some other stream,
+    # and never during capture, where the graph pool owns the addresses.
     args += [t.data_ptr() for t in tensors]
     if op == "Gemm":
         args += [1.0, 0.0]
