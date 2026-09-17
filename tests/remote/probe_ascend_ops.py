@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 import torch_npu
-from vllm_infinicore.ops import ascend_backend as backend
+from vllm_infinicore.operators.ascend import backend
 
 
 def main():
@@ -110,7 +110,7 @@ def main():
                     )
                 )
     backend.clear_cache()
-    from vllm_infinicore.ops import infinicore_backend as counters
+    from vllm_infinicore.operators import backend as counters
 
     Path(args.output).write_text(
         json.dumps(

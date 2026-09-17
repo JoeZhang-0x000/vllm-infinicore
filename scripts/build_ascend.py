@@ -72,7 +72,7 @@ def main() -> None:
         [
             "cmake",
             "-S",
-            str(ROOT / "vllm_infinicore/csrc/ascend"),
+            str(ROOT / "vllm_infinicore/operators/ascend/csrc"),
             "-B",
             str(cmake_dir),
             f"-DINFINICORE_SOURCE={source}",

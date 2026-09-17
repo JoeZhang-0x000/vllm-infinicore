@@ -1,0 +1,1 @@
+"""Torch-free shared utilities."""

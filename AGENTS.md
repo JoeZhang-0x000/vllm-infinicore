@@ -1,13 +1,13 @@
 # vllm-infinicore 智能体指南
 
-**更新：** 2026-09-15
+**更新：** 2026-09-17
 
 ## 先读这些
 
 改动本项目前请先读：
 
-- [`README.md`](README.md) — 项目概览、**术语与命名约定**、环境变量清单
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 分层设计、图策略、基准公平性规则
+- [`README.md`](README.md) — 项目定位与六个优化方向、**术语与命名约定**、环境变量清单
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 六个优化方向（含**对外表述红线**）、分层设计、图策略、基准公平性规则
 - [`docs/QWEN3_OP_SCOPE.md`](docs/QWEN3_OP_SCOPE.md) — 九条 scoped 路由与覆盖率陷阱
 - [`docs/ASCEND.md`](docs/ASCEND.md) — Ascend 集成、最新性能矩阵与限制
 - [`docs/DEV_LOG.md`](docs/DEV_LOG.md) — 2026-09-01 起的开发日志与对应 commit

@@ -12,7 +12,7 @@ else:
     TORCH_IMPORT_ERROR = None
 
 try:
-    from vllm_infinicore.ops import vllm_embedding
+    from vllm_infinicore.operators.routes import embedding as vllm_embedding
 except Exception as exc:  # pragma: no cover - depends on vLLM install
     vllm_embedding = None
     IMPORT_ERROR = exc

@@ -211,8 +211,7 @@ def _compile_bridge() -> Any:
 
 
 def _bridge_build_config() -> dict[str, Any]:
-    root = Path(__file__).resolve().parents[1]
-    source = root / "csrc" / "infinicore_bridge.cpp"
+    source = Path(__file__).resolve().parent / "csrc" / "infinicore_bridge.cpp"
     infini_root = Path(os.environ.get("INFINI_ROOT", str(Path.home() / ".infini")))
     maca_path = Path(os.environ.get("MACA_PATH", "/opt/maca-3.5.3"))
     target = _bridge_target()

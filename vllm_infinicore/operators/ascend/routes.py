@@ -13,9 +13,9 @@ import importlib
 
 import torch
 
-from ..patching import PatchInstallResult, PatchUninstallResult
-from . import ascend_backend as backend
-from . import ascend_graph_ops as graph_ops
+from ...routing.patching import PatchInstallResult, PatchUninstallResult
+from . import backend
+from . import graph_ops
 
 _TARGETS = {
     "RMSNorm": ("vllm_ascend.ops.layernorm", "AscendRMSNorm", "forward_oot"),

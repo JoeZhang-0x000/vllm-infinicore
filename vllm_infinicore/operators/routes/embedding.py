@@ -11,7 +11,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from .custom_ops import EMBEDDING_OP, load_custom_ops
+from ..custom_ops import EMBEDDING_OP, load_custom_ops
 
 VLLM_EMBEDDING_ROUTE_NAME = "Embedding"
 

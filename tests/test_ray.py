@@ -6,7 +6,7 @@ import types
 import unittest
 from unittest import mock
 
-from vllm_infinicore.ray import (
+from vllm_infinicore.device.distributed import (
     RAY_BACKEND_ENV,
     RAY_NOSET_CUDA_VISIBLE_DEVICES_ENV,
     configure_ray_environment,

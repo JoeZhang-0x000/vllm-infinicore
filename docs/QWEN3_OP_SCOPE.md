@@ -30,6 +30,9 @@ fused residual-add RMSNorm 两个 op，它们有各自独立的计数器，但�
 - `VLLM_INFINICORE_FORCE_NATIVE_FALLBACK=1` 请求路由但保持 vLLM 原生执行，用于验证路由状态管线。
 - 以 vLLM 原生 cudagraph 的正确性为基线。
 
+一条路由在运行时选 InfiniCore 还是原生，由能力表与性能策略两层决定，
+机制与表述红线见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 的"能力与性能分派"一节。
+
 ### 平台差异
 
 **MetaX。** 与 `vllm_metax` 共存，或用本插件的平台入口在不加载 `vllm_metax` 的情况下运行。
@@ -42,7 +45,7 @@ attention/KV 路由的消融必须另用 `VLLM_PLUGINS=metax,vllm_infinicore` �
 未配置库时全部路由保持原生；配置后安装能力支持的路由，attention/KV 路由保持原生。
 每次调用中不支持的情形使用原始 Ascend 实现，并单独上报回退计数与原因。
 适配器不注册竞争的 OOT 类，也不实现自己的 Ascend 设备/worker/通信运行时。
-支持的路由可通过 `ops/ascend_graph_ops.py` 在编译后的 ACL graph 内执行，不支持的形状在 trace 时选原生；
+支持的路由可通过 `operators/ascend/graph_ops.py` 在编译后的 ACL graph 内执行，不支持的形状在 trace 时选原生；
 capture 会固定算子 descriptor，replay 不再增加 Python launch 计数。详见 [`ASCEND.md`](ASCEND.md)。
 
 **MUSA。** 当前流 C++ bridge 在 MUSA 上默认覆盖全部九条路由，与 MetaX 上只默认三条不同。

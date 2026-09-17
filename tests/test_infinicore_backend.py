@@ -14,7 +14,8 @@ except ModuleNotFoundError:  # pragma: no cover - local macOS dev env may not sh
     torch = None
 
 if torch is not None:
-    from vllm_infinicore.ops import cpp_bridge, infinicore_backend
+    from vllm_infinicore.operators import backend as infinicore_backend
+    from vllm_infinicore.operators import cpp_bridge
 else:
     cpp_bridge = None
     infinicore_backend = None
@@ -403,7 +404,7 @@ class InfiniCoreBackendTests(unittest.TestCase):
         self.assertTrue(torch.allclose(out_key, key + 1))
 
     def test_lm_head_route_patches_logits_processor_for_tied_embeddings(self) -> None:
-        module_name = "vllm_infinicore.ops.vllm_linear"
+        module_name = "vllm_infinicore.operators.routes.linear"
 
         class FakeUnquantizedLinearMethod:
             def apply(self, layer, x, bias=None):

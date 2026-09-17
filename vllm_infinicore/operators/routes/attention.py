@@ -19,7 +19,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from . import infinicore_backend
+from .. import backend as infinicore_backend
 
 INFINICORE_ATTENTION_BACKEND_ROUTES = (
     "StoreKVCache",
@@ -448,7 +448,7 @@ def _register_infinicore_backend_path() -> None:
 
     register_backend(
         AttentionBackendEnum.FLASH_ATTN,
-        "vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend",
+        "vllm_infinicore.operators.routes.attention.InfiniCoreFlashAttentionBackend",
     )
 
 
@@ -911,7 +911,7 @@ def _on_query_device(
 
 def _flash_decode_num_splits() -> int:
     try:
-        from . import cpp_bridge
+        from .. import cpp_bridge
 
         return cpp_bridge.flash_decode_num_splits()
     except Exception:

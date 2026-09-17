@@ -20,16 +20,16 @@ if TYPE_CHECKING:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
-PLATFORM_CLASS_PATH = "vllm_infinicore.platform.InfiniCorePlatform"
+PLATFORM_CLASS_PATH = "vllm_infinicore.device.platform.InfiniCorePlatform"
 ATTENTION_BACKEND_CLASS_PATH = (
-    "vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend"
+    "vllm_infinicore.operators.routes.attention.InfiniCoreFlashAttentionBackend"
 )
 
 
 def register_platform() -> str | None:
     """Defer to Ascend when selected; otherwise offer the InfiniCore platform."""
 
-    from .platform_support import ascend_platform_selected
+    from .detection import ascend_platform_selected
 
     if ascend_platform_selected():
         return None
@@ -40,7 +40,7 @@ def register_platform() -> str | None:
 def register_attention_backends() -> None:
     """Register InfiniCore attention backends with vLLM."""
 
-    from vllm_infinicore.ops.vllm_attention_backend import (
+    from vllm_infinicore.operators.routes.attention import (
         install_platform_attention_backend,
     )
 
@@ -271,7 +271,7 @@ def _build_platform_class() -> type:
         @classmethod
         def get_device_communicator_cls(cls) -> str:
             if is_musa_runtime:
-                return "vllm_infinicore.communicator.InfiniCoreMusaCommunicator"
+                return "vllm_infinicore.device.musa.communicator.InfiniCoreMusaCommunicator"
             return "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"
 
         @classmethod
@@ -306,7 +306,7 @@ def _build_platform_class() -> type:
 
         @classmethod
         def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-            from vllm_infinicore.runtime_patches import (
+            from vllm_infinicore.routing.runtime_patches import (
                 apply_vllm_020_compat_patches,
                 patch_gpu_model_runner_dummy_run_real_reqs,
             )

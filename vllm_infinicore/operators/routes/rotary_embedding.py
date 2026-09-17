@@ -11,7 +11,7 @@ from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbedding as VllmRotaryEmbedding,
 )
 
-from .custom_ops import ROTARY_EMBEDDING_OP, load_custom_ops
+from ..custom_ops import ROTARY_EMBEDDING_OP, load_custom_ops
 
 VLLM_ROTARY_EMBEDDING_CLASS = "RotaryEmbedding"
 

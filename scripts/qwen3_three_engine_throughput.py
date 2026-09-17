@@ -548,7 +548,7 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
         or int(manifest.get("tensor_parallel_size", 1)) > 1
     )
     if distributed_executor_backend == "ray":
-        from vllm_infinicore.ray import (
+        from vllm_infinicore.device.distributed import (
             PLUGIN_ENV_VARS,
             RUNTIME_ENV_VARS,
             configure_ray_environment,
@@ -706,9 +706,6 @@ def run_vllm(case: dict[str, Any], manifest: dict[str, Any], prompt_payload: dic
             ),
             "vllm_platform": _vllm_platform_name(),
             "infinicore_backend_call_counts": _infinicore_backend_counts(
-                llm, use_workers=use_worker_rpc
-            ),
-            "infinicore_attention_route_counts": _infinicore_attention_counts(
                 llm, use_workers=use_worker_rpc
             ),
             "infinicore_attention_backend_route_counts": _infinicore_attention_backend_counts(
@@ -983,16 +980,12 @@ def _local_vllm_graph_count() -> int:
 
 def _reset_infinicore_counts(llm: Any | None = None, *, use_workers: bool = False) -> None:
     try:
-        from vllm_infinicore.ops import (
-            infinicore_backend,
-            cpp_bridge,
-            vllm_attention,
-            vllm_attention_backend,
-        )
+        from vllm_infinicore.operators import backend as infinicore_backend
+        from vllm_infinicore.operators import cpp_bridge
+        from vllm_infinicore.operators.routes import attention as vllm_attention_backend
 
         infinicore_backend.reset_backend_call_counts()
         cpp_bridge.reset_bridge_call_counts()
-        vllm_attention.reset_attention_route_counts()
         vllm_attention_backend.reset_attention_backend_route_counts()
     except Exception:
         pass
@@ -1008,24 +1001,9 @@ def _infinicore_backend_counts(
             _worker_collective_rpc(llm, _worker_infinicore_backend_counts)
         )
     try:
-        from vllm_infinicore.ops import infinicore_backend
+        from vllm_infinicore.operators import backend as infinicore_backend
 
         return infinicore_backend.backend_call_counts()
-    except Exception:
-        return {}
-
-
-def _infinicore_attention_counts(
-    llm: Any | None = None, *, use_workers: bool = False
-) -> dict[str, int]:
-    if use_workers and llm is not None:
-        return _aggregate_worker_count_dicts(
-            _worker_collective_rpc(llm, _worker_infinicore_attention_counts)
-        )
-    try:
-        from vllm_infinicore.ops import vllm_attention
-
-        return vllm_attention.attention_route_counts()
     except Exception:
         return {}
 
@@ -1038,7 +1016,7 @@ def _infinicore_attention_backend_counts(
             _worker_collective_rpc(llm, _worker_infinicore_attention_backend_counts)
         )
     try:
-        from vllm_infinicore.ops import vllm_attention_backend
+        from vllm_infinicore.operators.routes import attention as vllm_attention_backend
 
         return vllm_attention_backend.attention_backend_route_counts()
     except Exception:
@@ -1053,7 +1031,7 @@ def _infinicore_cpp_bridge_counts(
             _worker_collective_rpc(llm, _worker_infinicore_cpp_bridge_counts)
         )
     try:
-        from vllm_infinicore.ops import cpp_bridge
+        from vllm_infinicore.operators import cpp_bridge
 
         return cpp_bridge.bridge_call_counts()
     except Exception:
@@ -1076,7 +1054,7 @@ def _infinicore_cpp_bridge_selected_routes(
         )
         return tuple(routes)
     try:
-        from vllm_infinicore.ops import cpp_bridge
+        from vllm_infinicore.operators import cpp_bridge
 
         return cpp_bridge.selected_routes()
     except Exception:
@@ -1102,45 +1080,35 @@ def _aggregate_worker_count_dicts(worker_counts: list[Any]) -> dict[str, int]:
 
 
 def _worker_reset_infinicore_counts(_worker: Any) -> None:
-    from vllm_infinicore.ops import (
-        cpp_bridge,
-        infinicore_backend,
-        vllm_attention,
-        vllm_attention_backend,
-    )
+    from vllm_infinicore.operators import backend as infinicore_backend
+    from vllm_infinicore.operators import cpp_bridge
+    from vllm_infinicore.operators.routes import attention as vllm_attention_backend
 
     infinicore_backend.reset_backend_call_counts()
     cpp_bridge.reset_bridge_call_counts()
-    vllm_attention.reset_attention_route_counts()
     vllm_attention_backend.reset_attention_backend_route_counts()
 
 
 def _worker_infinicore_backend_counts(_worker: Any) -> dict[str, int]:
-    from vllm_infinicore.ops import infinicore_backend
+    from vllm_infinicore.operators import backend as infinicore_backend
 
     return infinicore_backend.backend_call_counts()
 
 
-def _worker_infinicore_attention_counts(_worker: Any) -> dict[str, int]:
-    from vllm_infinicore.ops import vllm_attention
-
-    return vllm_attention.attention_route_counts()
-
-
 def _worker_infinicore_attention_backend_counts(_worker: Any) -> dict[str, int]:
-    from vllm_infinicore.ops import vllm_attention_backend
+    from vllm_infinicore.operators.routes import attention as vllm_attention_backend
 
     return vllm_attention_backend.attention_backend_route_counts()
 
 
 def _worker_infinicore_cpp_bridge_counts(_worker: Any) -> dict[str, int]:
-    from vllm_infinicore.ops import cpp_bridge
+    from vllm_infinicore.operators import cpp_bridge
 
     return cpp_bridge.bridge_call_counts()
 
 
 def _worker_infinicore_cpp_bridge_routes(_worker: Any) -> tuple[str, ...]:
-    from vllm_infinicore.ops import cpp_bridge
+    from vllm_infinicore.operators import cpp_bridge
 
     return cpp_bridge.selected_routes()
 

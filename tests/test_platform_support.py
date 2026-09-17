@@ -7,8 +7,10 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
 
-from vllm_infinicore import platform, platform_support, plugin
-from vllm_infinicore.patching import (
+from vllm_infinicore.device import detection as platform_support
+from vllm_infinicore.device import platform
+from vllm_infinicore import plugin
+from vllm_infinicore.routing.patching import (
     PatchInstallResult,
     PatchRegistry,
     QWEN3_OPERATOR_ROUTES,
@@ -135,7 +137,7 @@ class AscendPlatformSupportTests(unittest.TestCase):
                 """
 import sys
 from vllm_infinicore import register
-from vllm_infinicore.platform import register_platform
+from vllm_infinicore.device.platform import register_platform
 assert register_platform() is None
 assert len(register().native_fallback_routes) == 9
 assert not any(name in sys.modules for name in ('torch', 'torch_npu', 'vllm', 'vllm_ascend', 'infinicore'))
