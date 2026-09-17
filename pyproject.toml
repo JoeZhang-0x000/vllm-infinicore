@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "vllm-infinicore"
 version = "0.1.0"
-description = "Conservative InfiniCore operator plugin skeleton for vLLM Qwen3 inference"
+description = "InfiniCore operator integration for vLLM, optimizing adaptation, scheduling, and resource-management overhead on high-frequency calls"
 requires-python = ">=3.10"
 dependencies = [
     "PyYAML>=6.0",
@@ -15,7 +15,7 @@ dependencies = [
 vllm_infinicore = "vllm_infinicore:register"
 
 [project.entry-points."vllm.platform_plugins"]
-infinicore = "vllm_infinicore.platform:register_platform"
+infinicore = "vllm_infinicore.device.platform:register_platform"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vllm_infinicore"]
@@ -23,7 +23,7 @@ include = [
     "AGENTS.md",
     "configs/*.yaml",
     "docs/*.md",
-    "vllm_infinicore/csrc/*.cpp",
-    "vllm_infinicore/csrc/ascend/*",
+    "vllm_infinicore/operators/csrc/*.cpp",
+    "vllm_infinicore/operators/ascend/csrc/*",
     "vllm_infinicore/infinicore.lock.json",
 ]

@@ -5,7 +5,7 @@ from pathlib import Path
 import tomllib
 import unittest
 
-from vllm_infinicore.config import (
+from vllm_infinicore.routing.config import (
     ConfigValidationError,
     load_config,
     parse_config,
@@ -75,7 +75,7 @@ class ConfigTests(unittest.TestCase):
         platform_plugins = data["project"]["entry-points"]["vllm.platform_plugins"]
         self.assertEqual(
             platform_plugins["infinicore"],
-            "vllm_infinicore.platform:register_platform",
+            "vllm_infinicore.device.platform:register_platform",
         )
 
 

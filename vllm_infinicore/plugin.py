@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import logging
 
-from .patching import PatchUninstallSummary, RegistrationResult, get_default_registry
-from .platform_support import ascend_platform_selected
-from .ray import register_vllm_environment
-from .runtime_patches import apply_vllm_020_compat_patches, vllm_020_compat_status
+from .routing.patching import PatchUninstallSummary, RegistrationResult, get_default_registry
+from .device.detection import ascend_platform_selected
+from .device.distributed import register_vllm_environment
+from .routing.runtime_patches import apply_vllm_020_compat_patches, vllm_020_compat_status
 
 logger = logging.getLogger(__name__)
 

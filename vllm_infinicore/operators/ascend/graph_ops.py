@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import torch
 
-from . import ascend_backend as backend
+from . import backend
 
 
 def _count(name: str) -> None:
@@ -27,7 +27,7 @@ def _count(name: str) -> None:
     the recorded kernels without re-entering Python, so replay-only steps do not
     add counts; capture and every eager or prefill step still do.
     """
-    from . import infinicore_backend as counters
+    from .. import backend as counters
 
     counters._CALL_COUNTS[name] = counters._CALL_COUNTS.get(name, 0) + 1
 

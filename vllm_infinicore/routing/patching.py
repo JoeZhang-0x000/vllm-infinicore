@@ -568,7 +568,7 @@ class PatchRegistry:
 def get_default_registry() -> PatchRegistry:
     from dataclasses import replace
 
-    from .platform_support import (
+    from ..device.detection import (
         ascend_native_fallback_reasons,
         ascend_platform_selected,
     )
@@ -578,7 +578,7 @@ def get_default_registry() -> PatchRegistry:
 
         def installer(name):
             def install():
-                from .ops.ascend_routes import install
+                from ..operators.ascend.routes import install
 
                 return install(name)
 
@@ -586,7 +586,7 @@ def get_default_registry() -> PatchRegistry:
 
         def uninstaller(name):
             def uninstall():
-                from .ops.ascend_routes import uninstall
+                from ..operators.ascend.routes import uninstall
 
                 return uninstall(name)
 
@@ -621,56 +621,56 @@ def get_default_registry() -> PatchRegistry:
     return PatchRegistry(QWEN3_OPERATOR_ROUTES)
 
 def _install_rms_norm_route() -> PatchInstallResult:
-    from .ops.vllm_rms_norm import install_vllm_rms_norm_oot
+    from ..operators.routes.rms_norm import install_vllm_rms_norm_oot
 
     status = install_vllm_rms_norm_oot()
     return PatchInstallResult(installed=status.installed, reason=status.reason)
 
 
 def _uninstall_rms_norm_route() -> PatchUninstallResult:
-    from .ops.vllm_rms_norm import uninstall_vllm_rms_norm_oot
+    from ..operators.routes.rms_norm import uninstall_vllm_rms_norm_oot
 
     status = uninstall_vllm_rms_norm_oot()
     return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
 
 
 def _install_silu_and_mul_route() -> PatchInstallResult:
-    from .ops.vllm_silu_and_mul import install_vllm_silu_and_mul_oot
+    from ..operators.routes.silu_and_mul import install_vllm_silu_and_mul_oot
 
     status = install_vllm_silu_and_mul_oot()
     return PatchInstallResult(installed=status.installed, reason=status.reason)
 
 
 def _uninstall_silu_and_mul_route() -> PatchUninstallResult:
-    from .ops.vllm_silu_and_mul import uninstall_vllm_silu_and_mul_oot
+    from ..operators.routes.silu_and_mul import uninstall_vllm_silu_and_mul_oot
 
     status = uninstall_vllm_silu_and_mul_oot()
     return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
 
 
 def _install_rotary_embedding_route() -> PatchInstallResult:
-    from .ops.vllm_rotary_embedding import install_vllm_rotary_embedding_oot
+    from ..operators.routes.rotary_embedding import install_vllm_rotary_embedding_oot
 
     status = install_vllm_rotary_embedding_oot()
     return PatchInstallResult(installed=status.installed, reason=status.reason)
 
 
 def _uninstall_rotary_embedding_route() -> PatchUninstallResult:
-    from .ops.vllm_rotary_embedding import uninstall_vllm_rotary_embedding_oot
+    from ..operators.routes.rotary_embedding import uninstall_vllm_rotary_embedding_oot
 
     status = uninstall_vllm_rotary_embedding_oot()
     return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
 
 
 def _install_embedding_route() -> PatchInstallResult:
-    from .ops.vllm_embedding import install_vllm_unquantized_embedding_route
+    from ..operators.routes.embedding import install_vllm_unquantized_embedding_route
 
     status = install_vllm_unquantized_embedding_route()
     return PatchInstallResult(installed=status.installed, reason=status.reason)
 
 
 def _uninstall_embedding_route() -> PatchUninstallResult:
-    from .ops.vllm_embedding import uninstall_vllm_unquantized_embedding_route
+    from ..operators.routes.embedding import uninstall_vllm_unquantized_embedding_route
 
     status = uninstall_vllm_unquantized_embedding_route()
     return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
@@ -678,7 +678,7 @@ def _uninstall_embedding_route() -> PatchUninstallResult:
 
 def _make_linear_installer(route_name: str) -> PatchInstaller:
     def installer() -> PatchInstallResult:
-        from .ops.vllm_linear import install_vllm_unquantized_linear_route
+        from ..operators.routes.linear import install_vllm_unquantized_linear_route
 
         status = install_vllm_unquantized_linear_route(route_name)
         return PatchInstallResult(installed=status.installed, reason=status.reason)
@@ -688,7 +688,7 @@ def _make_linear_installer(route_name: str) -> PatchInstaller:
 
 def _make_linear_uninstaller(route_name: str) -> PatchUninstaller:
     def uninstaller() -> PatchUninstallResult:
-        from .ops.vllm_linear import uninstall_vllm_unquantized_linear_route
+        from ..operators.routes.linear import uninstall_vllm_unquantized_linear_route
 
         status = uninstall_vllm_unquantized_linear_route(route_name)
         return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
@@ -698,7 +698,7 @@ def _make_linear_uninstaller(route_name: str) -> PatchUninstaller:
 
 def _make_attention_installer(route_name: str) -> PatchInstaller:
     def installer() -> PatchInstallResult:
-        from .ops.vllm_attention_backend import install_infinicore_attention_backend
+        from ..operators.routes.attention import install_infinicore_attention_backend
 
         status = install_infinicore_attention_backend(route_name)
         return PatchInstallResult(installed=status.installed, reason=status.reason)
@@ -708,7 +708,7 @@ def _make_attention_installer(route_name: str) -> PatchInstaller:
 
 def _make_attention_uninstaller(route_name: str) -> PatchUninstaller:
     def uninstaller() -> PatchUninstallResult:
-        from .ops.vllm_attention_backend import uninstall_infinicore_attention_backend
+        from ..operators.routes.attention import uninstall_infinicore_attention_backend
 
         status = uninstall_infinicore_attention_backend(route_name)
         return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)

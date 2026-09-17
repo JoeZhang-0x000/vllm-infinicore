@@ -5,7 +5,7 @@ import subprocess
 import sys
 import unittest
 
-from vllm_infinicore.validation import (
+from vllm_infinicore.common.validation import (
     BenchmarkResult,
     GraphEvidence,
     check_graph_evidence,
@@ -21,7 +21,7 @@ class ValidationTests(unittest.TestCase):
     def test_module_import_does_not_import_torch_or_vllm(self) -> None:
         code = """
 import sys
-from vllm_infinicore.validation import BenchmarkResult, GraphEvidence
+from vllm_infinicore.common.validation import BenchmarkResult, GraphEvidence
 print(BenchmarkResult.__name__)
 print(GraphEvidence.__name__)
 print("torch" in sys.modules)

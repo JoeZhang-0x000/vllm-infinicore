@@ -1,13 +1,30 @@
 # vllm-infinicore
 
-把 Qwen3 解码路径上已纳入范围的算子路由到 InfiniCore 的 out-of-tree vLLM 插件。
-插件默认全部关闭，只有显式开启时才安装路由。目前支持两条线：
+**在完成 InfiniCore 算子接入的基础上，针对 vLLM 高频调用中的适配、调度和资源管理开销进行优化**
+的 out-of-tree vLLM 插件。算子接入已按九条 scoped 路由落地（清单见
+[`docs/QWEN3_OP_SCOPE.md`](docs/QWEN3_OP_SCOPE.md)）；此后的工作重心是让接入后的算子
+在高频路径、编译路径与多卡路径上的 host 开销趋近原生。插件默认全部关闭，
+只有显式开启时才安装路由。目前支持三条平台线：
 
 | 平台 | 上游平台插件 | 最新结果 | 文档 |
 |---|---|---|---|
 | Ascend NPU（910B4） | `vllm_ascend` | 2026-09-15 性能矩阵：0.6B 为原生的 24.5%–98.2%，27B 为 95.6%–99.5% | [`docs/ASCEND.md`](docs/ASCEND.md) |
 | MetaX GPU（C550） | `vllm_metax`，或本插件自带的 InfiniCore 平台入口 | 2026-09-07 TP 矩阵：为 vllm-metax 的 69%–86% | [`docs/DEV_LOG.md`](docs/DEV_LOG.md) |
 | MUSA（Moore Threads） | 本插件的 InfiniCore 平台入口 | 仅打通启动、图路由与 TP 通信，无正式性能结果 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+
+## 优化方向
+
+全部方向的完整描述（问题、已落地内容、约束与对外表述）见
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 的"优化方向"一章：
+
+| 方向 | 对外表述 |
+|---|---|
+| Tensor Bridge | 构建面向 vLLM 的 Tensor Bridge，以尽可能零拷贝的方式连接 PyTorch Tensor 与 InfiniCore 算子接口，减少高频调用中的类型包装和元数据转换开销 |
+| 缓存与资源复用 | 将平台识别和稳定能力检测前移到初始化阶段，并按执行签名复用描述符与临时资源，降低逐层、逐 token 重复执行的 host 管理成本 |
+| Stream 对齐 | 将 InfiniCore 算子提交到 vLLM 当前执行流，减少跨运行时的流交接和依赖维护开销，同时保持正确的执行顺序 |
+| 编译与设备图适配 | 为 InfiniCore 算子提供编译器可识别的算子契约，并管理设备图捕获与回放所需的资源生命周期，使外部算子能够保留在编译及图执行路径中 |
+| 能力与性能分派 | 按平台能力和实际调用签名选择算子实现，接通已有融合路径，并结合验证与性能反馈制定分派策略，避免无效替换和不必要的算子拆分 |
+| 张量并行（TP） | 已完成多平台张量并行运行时适配。部分配置的吞吐已接近原生，但多卡扩展效率仍有差距，后续将重点分析计算、调度与通信之间的额外开销 |
 
 ## 术语与命名约定
 
@@ -21,10 +38,12 @@
 | 27B checkpoint | 按目录名 `/models/Qwen3.8-27B`；其 config 声明 `Qwen3_5ForConditionalGeneration` / `qwen3_5`。**不要写成 “Qwen3.5-27B”。** |
 | 吞吐指标 | **输出 TPS** = 实际生成 token 总数 / `LLM.generate()` 墙钟耗时（含 prefill、decode 与生成 API 开销，不含加载、编译、预热） |
 | 路由总数 | **九条 scoped 路由** = 六条非 attention 路由 + 三条 attention/KV 路由 |
+| 优化方向 | 六个方向名固定为：**Tensor Bridge、缓存与资源复用、Stream 对齐、编译与设备图适配、能力与性能分派、张量并行（TP）**，不要引入别名 |
+| Tensor Bridge 与代码的对应 | 文档中的 Tensor Bridge 泛指桥接层，代码里是当前流 C++ bridge（`operators/cpp_bridge.py` + `operators/csrc/infinicore_bridge.cpp`）与 Ascend C API bridge（`operators/ascend/backend.py` + `operators/ascend/csrc/`） |
 | 日期 | ISO 格式 `2026-09-15` |
 | Ascend 图 | 称 ACL graph（vLLM 的配置项名仍是 `CUDAGraphMode`） |
 
-本表约束的是**文档正文**。代码内的运行时字符串沿用既有拼写（例如 `patching.py` 的
+本表约束的是**文档正文**。代码内的运行时字符串沿用既有拼写（例如 `routing/patching.py` 的
 `native_fallback="vLLM-Ascend native ..."`，该字符串被 `tests/test_platform_support.py` 断言），
 改动它需要同步改测试，不要顺手统一。
 
@@ -150,7 +169,7 @@ Ray 不能为 vLLM worker 改写 `CUDA_VISIBLE_DEVICES`，否则 rank 1 只看�
 
 平台入口在检测到 `torch.musa` 时把设备名/类型切到 `musa`、dispatch key 切到 `MUSA`、
 分布式后端切到 `mccl`，并在使用 cudagraph 时设置一组 MUSA 图环境默认值。
-`communicator.py` 提供 MUSA communicator 适配，使 torch.distributed 集合通信满足 vLLM 的图检查。
+`device/musa/communicator.py` 提供 MUSA communicator 适配，使 torch.distributed 集合通信满足 vLLM 的图检查。
 当前流 C++ bridge 在 MUSA 上默认覆盖全部九条路由（`MUSA_DEFAULT_ROUTES`），
 与 MetaX 上只默认三条不同。
 
@@ -170,7 +189,7 @@ Ray 不能为 vLLM worker 改写 `CUDA_VISIBLE_DEVICES`，否则 rank 1 只看�
 | `VLLM_INFINICORE_ASCEND_GRAPH` | 设为 `0` 退回 eager-only 行为 |
 
 路由清单、安装器与原生回退对照见 [`docs/QWEN3_OP_SCOPE.md`](docs/QWEN3_OP_SCOPE.md)，
-分层设计见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+优化方向与分层设计见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 ## 测试
 

@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vllm_infinicore.validation import BenchmarkResult, GraphEvidence
+from vllm_infinicore.common.validation import BenchmarkResult, GraphEvidence
 
 
 DEFAULT_MODEL = "/mnt/geogpt-doc-new/default/xb/qwen3-8B"
@@ -498,7 +498,6 @@ def run_single_case(args: argparse.Namespace) -> int:
         "forbid_metax_load": forbid_metax_load,
         "vllm_platform": _vllm_platform_name(),
         "infinicore_backend_call_counts": _infinicore_backend_call_counts(),
-        "infinicore_attention_route_counts": _infinicore_attention_route_counts(),
         "infinicore_attention_backend_route_counts": _infinicore_attention_backend_route_counts(),
         "infinicore_cpp_bridge_call_counts": _infinicore_cpp_bridge_call_counts(),
         "cpp_bridge_enabled": bool(_infinicore_cpp_bridge_selected_routes()),
@@ -610,37 +609,27 @@ def _read_vllm_graph_capture_count() -> int:
 
 def _reset_infinicore_backend_counts() -> None:
     try:
-        from vllm_infinicore.ops import infinicore_backend
-        from vllm_infinicore.ops import cpp_bridge
-        from vllm_infinicore.ops import vllm_attention
-        from vllm_infinicore.ops import vllm_attention_backend
+        from vllm_infinicore.operators import backend as infinicore_backend
+        from vllm_infinicore.operators import cpp_bridge
+        from vllm_infinicore.operators.routes import attention as vllm_attention_backend
     except Exception:
         return
     infinicore_backend.reset_backend_call_counts()
     cpp_bridge.reset_bridge_call_counts()
-    vllm_attention.reset_attention_route_counts()
     vllm_attention_backend.reset_attention_backend_route_counts()
 
 
 def _infinicore_backend_call_counts() -> dict[str, int]:
     try:
-        from vllm_infinicore.ops import infinicore_backend
+        from vllm_infinicore.operators import backend as infinicore_backend
     except Exception:
         return {}
     return infinicore_backend.backend_call_counts()
 
 
-def _infinicore_attention_route_counts() -> dict[str, int]:
-    try:
-        from vllm_infinicore.ops import vllm_attention
-    except Exception:
-        return {}
-    return vllm_attention.attention_route_counts()
-
-
 def _infinicore_attention_backend_route_counts() -> dict[str, int]:
     try:
-        from vllm_infinicore.ops import vllm_attention_backend
+        from vllm_infinicore.operators.routes import attention as vllm_attention_backend
     except Exception:
         return {}
     return vllm_attention_backend.attention_backend_route_counts()
@@ -648,7 +637,7 @@ def _infinicore_attention_backend_route_counts() -> dict[str, int]:
 
 def _infinicore_cpp_bridge_call_counts() -> dict[str, int]:
     try:
-        from vllm_infinicore.ops import cpp_bridge
+        from vllm_infinicore.operators import cpp_bridge
     except Exception:
         return {}
     return cpp_bridge.bridge_call_counts()
@@ -656,7 +645,7 @@ def _infinicore_cpp_bridge_call_counts() -> dict[str, int]:
 
 def _infinicore_cpp_bridge_selected_routes() -> tuple[str, ...]:
     try:
-        from vllm_infinicore.ops import cpp_bridge
+        from vllm_infinicore.operators import cpp_bridge
     except Exception:
         return ()
     return cpp_bridge.selected_routes()

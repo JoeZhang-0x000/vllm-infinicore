@@ -200,7 +200,8 @@ def profile_python_frames(
 
 def infinicore_counters() -> dict[str, Any]:
     try:
-        from vllm_infinicore.ops import cpp_bridge, infinicore_backend
+        from vllm_infinicore.operators import backend as infinicore_backend
+        from vllm_infinicore.operators import cpp_bridge
 
         return {
             "infinicore_backend_call_counts": dict(infinicore_backend.backend_call_counts()),

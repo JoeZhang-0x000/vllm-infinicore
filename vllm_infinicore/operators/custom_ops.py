@@ -195,7 +195,7 @@ def _register_rms_norm(torch: Any) -> None:
     library.define("rms_norm(Tensor input, Tensor weight, float eps) -> Tensor")
 
     def _rms_norm_impl(input_tensor: Any, weight: Any, eps: float) -> Any:
-        from . import infinicore_backend
+        from . import backend as infinicore_backend
 
         return infinicore_backend.rms_norm(input_tensor, weight, float(eps))
 
@@ -222,7 +222,7 @@ def _register_fused_add_rms_norm(torch: Any) -> None:
         weight: Any,
         eps: float,
     ) -> Any:
-        from . import infinicore_backend
+        from . import backend as infinicore_backend
 
         return infinicore_backend.fused_add_rms_norm(
             input_tensor, residual, weight, float(eps)
@@ -245,7 +245,7 @@ def _register_silu_and_mul(torch: Any) -> None:
     library.define("silu_and_mul(Tensor input) -> Tensor")
 
     def _silu_and_mul_impl(input_tensor: Any) -> Any:
-        from . import infinicore_backend
+        from . import backend as infinicore_backend
 
         return infinicore_backend.silu_and_mul(input_tensor)
 
@@ -263,7 +263,7 @@ def _register_linear(torch: Any) -> None:
     library.define("linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor")
 
     def _linear_impl(input_tensor: Any, weight: Any, bias: Any | None = None) -> Any:
-        from . import infinicore_backend
+        from . import backend as infinicore_backend
 
         return infinicore_backend.linear(input_tensor, weight, bias)
 
@@ -281,7 +281,7 @@ def _register_lm_head(torch: Any) -> None:
     library.define("lm_head(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor")
 
     def _lm_head_impl(input_tensor: Any, weight: Any, bias: Any | None = None) -> Any:
-        from . import infinicore_backend
+        from . import backend as infinicore_backend
 
         return infinicore_backend.lm_head(input_tensor, weight, bias)
 
@@ -299,7 +299,7 @@ def _register_embedding(torch: Any) -> None:
     library.define("embedding(Tensor input, Tensor weight) -> Tensor")
 
     def _embedding_impl(input_tensor: Any, weight: Any) -> Any:
-        from . import infinicore_backend
+        from . import backend as infinicore_backend
 
         return infinicore_backend.embedding(input_tensor, weight)
 
@@ -329,7 +329,7 @@ def _register_rotary_embedding(torch: Any) -> None:
         cos_sin_cache: Any,
         is_neox_style: bool,
     ) -> tuple[Any, Any | None]:
-        from . import infinicore_backend
+        from . import backend as infinicore_backend
 
         return infinicore_backend.rotary_embedding(
             positions,

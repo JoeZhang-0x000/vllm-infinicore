@@ -14,7 +14,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from .custom_ops import LINEAR_OP, LM_HEAD_OP, load_custom_ops
+from ..custom_ops import LINEAR_OP, LM_HEAD_OP, load_custom_ops
 
 VLLM_LINEAR_ROUTE_NAMES = ("MatMul", "LMHead")
 
@@ -173,16 +173,6 @@ def _patched_logits_processor_get_logits(
             lm_head,
             embedding_bias,
         )
-    try:
-        return torch.ops.vllm_infinicore.lm_head(x, layer.weight, bias)
-    except Exception:
-        from .infinicore_backend import strict_backend_enabled
-
-        if strict_backend_enabled():
-            raise
-        if _ORIGINAL_LM_HEAD_APPLY is None:
-            raise
-        return _ORIGINAL_LM_HEAD_APPLY(self, layer, x, bias)
 
 
 __all__ = [

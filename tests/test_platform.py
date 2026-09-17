@@ -9,23 +9,23 @@ import types
 import unittest
 from unittest import mock
 
-from vllm_infinicore import platform
+from vllm_infinicore.device import platform
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class PlatformPluginTests(unittest.TestCase):
     def test_register_platform_returns_infinicore_platform_class_path(self) -> None:
-        with mock.patch("vllm_infinicore.platform_support.ascend_platform_selected", return_value=False):
+        with mock.patch("vllm_infinicore.device.detection.ascend_platform_selected", return_value=False):
             self.assertEqual(
                 platform.register_platform(),
-                "vllm_infinicore.platform.InfiniCorePlatform",
+                "vllm_infinicore.device.platform.InfiniCorePlatform",
             )
 
     def test_platform_entry_point_does_not_import_vllm_or_torch(self) -> None:
         code = """
 import sys
-from vllm_infinicore.platform import register_platform
+from vllm_infinicore.device.platform import register_platform
 print(register_platform())
 print("torch" in sys.modules)
 print("vllm" in sys.modules)
@@ -42,7 +42,7 @@ print("vllm" in sys.modules)
         self.assertEqual(
             result.stdout.strip().splitlines(),
             [
-                "vllm_infinicore.platform.InfiniCorePlatform",
+                "vllm_infinicore.device.platform.InfiniCorePlatform",
                 "False",
                 "False",
             ],
@@ -233,7 +233,7 @@ print("vllm" in sys.modules)
             self.assertEqual(platform_cls.dispatch_key, expected_dispatch_key)
             self.assertEqual(platform_cls.dist_backend, expected_dist_backend)
             expected_communicator = (
-                "vllm_infinicore.communicator.InfiniCoreMusaCommunicator"
+                "vllm_infinicore.device.musa.communicator.InfiniCoreMusaCommunicator"
                 if hasattr(torch, "musa")
                 else "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"
             )
@@ -275,10 +275,10 @@ print("vllm" in sys.modules)
                     clear=True,
                 ),
                 mock.patch(
-                    "vllm_infinicore.runtime_patches.apply_vllm_020_compat_patches"
+                    "vllm_infinicore.routing.runtime_patches.apply_vllm_020_compat_patches"
                 ),
                 mock.patch(
-                    "vllm_infinicore.runtime_patches."
+                    "vllm_infinicore.routing.runtime_patches."
                     "patch_gpu_model_runner_dummy_run_real_reqs"
                 ),
             ):
@@ -288,7 +288,7 @@ print("vllm" in sys.modules)
                 musa_platform_cls = platform._build_platform_class()
                 self.assertEqual(
                     musa_platform_cls.get_device_communicator_cls(),
-                    "vllm_infinicore.communicator.InfiniCoreMusaCommunicator",
+                    "vllm_infinicore.device.musa.communicator.InfiniCoreMusaCommunicator",
                 )
                 musa_platform_cls.check_and_update_config(fake_vllm_config)
                 self.assertEqual(os.environ.get("TORCH_COMPILE_DISABLE"), "1")
@@ -314,7 +314,7 @@ print("vllm" in sys.modules)
             from vllm.distributed.device_communicators.xpu_communicator import (
                 XpuCommunicator,
             )
-            from vllm_infinicore.communicator import InfiniCoreMusaCommunicator
+            from vllm_infinicore.device.musa.communicator import InfiniCoreMusaCommunicator
         except ModuleNotFoundError as exc:
             self.skipTest(f"vLLM communicator dependencies unavailable: {exc}")
 
@@ -323,7 +323,7 @@ print("vllm" in sys.modules)
 
     def test_platform_attention_registration_respects_explicit_routes(self) -> None:
         try:
-            from vllm_infinicore.ops import vllm_attention_backend
+            from vllm_infinicore.operators.routes import attention as vllm_attention_backend
         except ModuleNotFoundError as exc:
             self.skipTest(f"attention backend dependencies unavailable: {exc}")
 
@@ -344,7 +344,7 @@ print("vllm" in sys.modules)
 
     def test_platform_only_attention_registration_keeps_no_metax_default(self) -> None:
         try:
-            from vllm_infinicore.ops import vllm_attention_backend
+            from vllm_infinicore.operators.routes import attention as vllm_attention_backend
         except ModuleNotFoundError as exc:
             self.skipTest(f"attention backend dependencies unavailable: {exc}")
 

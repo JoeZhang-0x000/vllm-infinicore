@@ -16,7 +16,52 @@
 
 ---
 
-## 2026-09-15 — Ascend 性能矩阵（工作区，尚未提交）
+## 2026-09-17 — 项目定位与架构文档重组、死代码清理、目录分层重整（commit `eda3cbc`）
+
+### 目录分层重整
+
+按"通用放抽象目录、特化各建子目录"的原则重排包结构，全部用 `git mv` 保留历史：
+
+- **`operators/`（算子层）**：`infinicore_backend.py` → `backend.py`，`cpp_bridge.py`、
+  `custom_ops.py`、`csrc/` 保持原名移入；六条通用安装器 `vllm_*.py` 去前缀移入
+  `routes/`（`vllm_attention_backend.py` → `routes/attention.py`）；Ascend 三件套移入
+  `ascend/`（`backend.py` / `routes.py` / `graph_ops.py` + `csrc/`）。
+- **`device/`（设备层）**：`platform.py`、`platform_support.py` → `detection.py`、
+  `ray.py` → `distributed.py`；`communicator.py` → `musa/communicator.py`。
+- **`routing/`（耦合层）**：`patching.py`、`runtime_patches.py`、`config.py`。
+- **`common/`（通用层）**：`validation.py`。
+- `plugin.py`、`__init__.py`、`infinicore.lock.json` 留在包根；`platform_plugins` 入口点
+  改为 `vllm_infinicore.device.platform:register_platform`。
+
+同步修正：三处仓库相对路径定位的层级（`config.py` 的 configs、`ascend/backend.py` 的
+锁文件、`cpp_bridge.py` 的 csrc）、全部 import 与 mock.patch 字符串路径（包内、tests、
+scripts、tests/remote）、pyproject 入口与 wheel include、`scripts/build_ascend.py` 的
+csrc 路径。设备层的 Ascend 化（接管 `vllm_ascend` 的设备运行时）是明确的未完成项，
+当前 Ascend 仍由算子层适配、设备层让位。
+
+### 文档重组与定位
+
+- 项目对外定位调整为：**在完成 InfiniCore 算子接入的基础上，针对 vLLM 高频调用中的适配、
+  调度和资源管理开销进行优化。** [`ARCHITECTURE.md`](ARCHITECTURE.md) 按六个优化方向重构
+  （Tensor Bridge、缓存与资源复用、Stream 对齐、编译与设备图适配、能力与性能分派、张量并行），
+  每个方向写明问题、已落地内容、约束与对外表述；模块分层一节改为新目录结构的分层视图。
+  README 增加定位与六方向总览，术语表固定六个方向名及其与代码命名的对应；
+  `pyproject.toml` 描述同步。
+- 表述红线随方向写入文档：Tensor Bridge 的收益是减少 Python 对象构造、参数编组与跨语言
+  调用，且取决于调用频率，不是"C++ 调用没有开销"；两个运行时独立管理 stream，不能假定
+  自动同一条流；custom op + fake 接通编译器与图 replay 省去逐算子重复提交是两个层次；
+  分派是"选择经过验证的合适分支"而非"保证最好分支"；TP 多卡差距在测出每 rank 计算 /
+  host 提交 / 集合通信 / 等待的分解之前不归因通信，"单卡达原生 90% 以上"不泛化
+  （MetaX 已测 TP 矩阵仍为 69%–86%）。
+- 死代码清理：删除无人引用的旧版配置驱动 patch 机制 `vllm_infinicore/patches.py`（776 行）
+  及其 `configs/strict-infinicore.yaml`，以及无引用的 `configs/qwen-infinicore.yaml`；
+  删除被 attention 后端覆盖取代的 `ops/vllm_attention.py`（443 行），两个基准脚本里恒为
+  空字典的 impl-class 计数读取一并移除（真实计数由 `vllm_attention_backend` 提供）；
+  删除 `ops/vllm_linear.py` 的 `_patched_logits_processor_get_logits` 中一段不可达且引用
+  未定义名字的残留语句。
+- 同日丢弃 2026-09-15 矩阵 harness 的全部未提交草稿（见该条目的更新说明）。
+
+## 2026-09-15 — Ascend 性能矩阵（harness 未保留，结果并入 ASCEND.md）
 
 完整结果见 [`ASCEND.md`](ASCEND.md) 第 6–9 节。**未改动任何算子实现**，新增的只是记录真实
 graph/路由证据和可复核验证数据的 harness。
@@ -43,10 +88,12 @@ graph/路由证据和可复核验证数据的 harness。
   其他重复/健康错误仍会失败。对应 `--review-numeric-literals`。
 - 35 项容器回归测试通过，含原始 artifact 哈希未改动校验、以及拒绝为无关重复/健康错误开脱的用例。
 
-工作区新增/改动：`tests/remote/run_ascend_matrix.py`、`tests/remote/probe_ascend_graph.py`、
-`tests/remote/audit_ascend_repetition.py`、`tests/test_ascend_matrix_harness.py`、
-`tests/test_ascend_repetition_audit.py`、`tests/remote/bench_ascend_throughput.py`。
-原始记录：`artifacts/ascend-matrix-20260915/`（`artifacts/` 不纳入版本控制）。
+该轮 harness（`tests/remote/run_ascend_matrix.py`、`probe_ascend_graph.py`、
+`audit_ascend_repetition.py` 与 `tests/test_ascend_matrix_harness.py`、
+`tests/test_ascend_repetition_audit.py`）只存在于当时的工作区，2026-09-17 决定不随仓库保留，
+已删除；`tests/remote/bench_ascend_throughput.py` 保持已提交版本未改动。
+矩阵结果与结论以 [`ASCEND.md`](ASCEND.md) 与 `artifacts/ascend-matrix-20260915/` 为准
+（`artifacts/` 不纳入版本控制）。
 
 ## 2026-09-09 — InfiniCore 算子进入编译后的 Ascend 图
 

@@ -6,7 +6,7 @@ import types
 import unittest
 from unittest import mock
 
-from vllm_infinicore import runtime_patches
+from vllm_infinicore.routing import runtime_patches
 
 
 class RuntimePatchTests(unittest.TestCase):

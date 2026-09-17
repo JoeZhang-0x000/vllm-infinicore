@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 from unittest import mock
 
-from vllm_infinicore.ops import cpp_bridge
+from vllm_infinicore.operators import cpp_bridge
 
 
 class CppBridgeTests(unittest.TestCase):

@@ -40,7 +40,7 @@ def worker_state(worker):
     import dataclasses
     import os
     from vllm.compilation.counter import compilation_counter
-    from vllm_infinicore.ops import infinicore_backend
+    from vllm_infinicore.operators import backend as infinicore_backend
     from vllm_infinicore import plugin
 
     registration = plugin._REGISTRATION_RESULT
@@ -245,7 +245,7 @@ def main():
         import importlib.metadata
         from vllm import LLM, SamplingParams
         from vllm.config import CompilationMode, CUDAGraphMode
-        from vllm_infinicore.validation import compute_text_health, detect_degenerate_repetition
+        from vllm_infinicore.common.validation import compute_text_health, detect_degenerate_repetition
 
         result["versions"] = {
             n: importlib.metadata.version(n) for n in ["vllm", "vllm_ascend", "torch", "torch_npu"]

@@ -49,9 +49,9 @@ manifest 记录修订、SoC、CANN 路径与库 SHA256；运行时在安装任�
 
 移除这两个 guard 需要五项改动：
 
-1. **`ops/ascend_graph_ops.py`** 把每个算子注册为 `vllm_infinicore_ascend::` 命名空间下的
+1. **`operators/ascend/graph_ops.py`** 把每个算子注册为 `vllm_infinicore_ascend::` 命名空间下的
    `torch.library.custom_op` 并提供 fake 实现，使 tracer 能把 ctypes launch 作为不透明节点
-   放进图里。`vllm_infinicore::` 命名空间已被默认关闭的 `ops/custom_ops.py` 占用，不能复用。
+   放进图里。`vllm_infinicore::` 命名空间已被默认关闭的 `operators/custom_ops.py` 占用，不能复用。
 2. **能力判定前移到 trace time。** `supports_linear`、`supports_silu_and_mul`、
    `supports_rotary_embedding`、`supports_tensor` 仅依据 dtype 和 shape 作答，并与 eager 路径共用，
    两者不可能出现分歧。编译后的图一次性固定算子，所以不支持的调用必须在建节点前就选原生，
@@ -261,10 +261,14 @@ library SHA256: ab76cfadb6e16c5194d70abb78d22b248ce0cc0636ddae86e641bbd91e52d1a0
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export VLLM_INFINICORE_ASCEND_LIBRARY=/workspace/infinicore-build/libvllm_infinicore_ascend.so
 python tests/remote/probe_ascend_ops.py --output /tmp/ascend-operators.json
-python tests/remote/probe_ascend_graph.py --output /tmp/ascend-graph-operators.json
-python tests/remote/run_ascend_matrix.py smoke --root artifacts/ascend-matrix-rerun
-python tests/remote/run_ascend_matrix.py matrix --root artifacts/ascend-matrix-rerun --review-numeric-literals
 ```
+
+**第 6 节的 18 组矩阵由一套一次性 harness 采集（矩阵编排、graph 算子探针、重复输出审计），
+该 harness 只存在于当时的工作区，未随仓库保留**；矩阵数字、核对结论与全部原始 JSON 以
+`artifacts/ascend-matrix-20260915/` 为准（见第 11 节）。日常工具保留三个：
+算子数值探针 `probe_ascend_ops.py`、可用性 smoke `run_ascend_smoke.py`、
+吞吐对比 `bench_ascend_throughput.py`（graph 算子计时另见 `bench_ascend_graph.py`）。
+复现矩阵需要先按第 6.1 节的配置重建同等 harness。
 
 矩阵脚本把完整 token 序列、文本健康计数、每次 TPS、路由计数、graph capture/replay、异常和启动配置
 保存在各子目录 JSON 中；整模型跨引擎一致性另由 `summary.json` 给出，不会因为单引擎

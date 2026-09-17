@@ -19,7 +19,7 @@ from .patching import (
 )
 
 DEFAULT_CONFIG_PATH = (
-    Path(__file__).resolve().parent.parent / "configs" / "qwen3_infinicore_graph.yaml"
+    Path(__file__).resolve().parents[2] / "configs" / "qwen3_infinicore_graph.yaml"
 )
 
 _ROUTE_IMPLEMENTATIONS = {"torch_custom_op", "infinicore_attention_backend"}

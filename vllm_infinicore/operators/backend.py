@@ -17,7 +17,7 @@ from typing import Any, Callable
 import torch
 import torch.nn.functional as F
 
-from ..platform_support import ASCEND_TENSOR_BRIDGE_UNAVAILABLE
+from ..device.detection import ASCEND_TENSOR_BRIDGE_UNAVAILABLE
 
 REAL_BACKEND_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_REAL_BACKEND"
 STRICT_BACKEND_ENV = "VLLM_INFINICORE_STRICT_BACKEND"
@@ -38,7 +38,7 @@ _INFINI_TENSOR_CACHE: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
 
 def rms_norm(input_tensor: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     if input_tensor.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from . import ascend_backend
+        from .ascend import backend as ascend_backend
         return ascend_backend.execute("rms_norm", input_tensor,
             lambda: ascend_backend.rms_norm(input_tensor, weight, eps), lambda: _rms_norm_torch(input_tensor, weight, eps))
     return _route_or_fallback(
@@ -72,7 +72,7 @@ def fused_add_rms_norm(
 
 def silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
     if input_tensor.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from . import ascend_backend
+        from .ascend import backend as ascend_backend
         return ascend_backend.execute("silu_and_mul", input_tensor,
             lambda: ascend_backend.silu_and_mul(input_tensor), lambda: _silu_and_mul_torch(input_tensor))
     return _route_or_fallback(
@@ -89,7 +89,7 @@ def linear(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if input_tensor.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from . import ascend_backend
+        from .ascend import backend as ascend_backend
         return ascend_backend.execute("linear", input_tensor,
             lambda: ascend_backend.linear(input_tensor, weight, bias), lambda: F.linear(input_tensor, weight, bias))
     return _route_or_fallback(
@@ -106,7 +106,7 @@ def lm_head(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if input_tensor.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from . import ascend_backend
+        from .ascend import backend as ascend_backend
         return ascend_backend.execute("lm_head", input_tensor,
             lambda: ascend_backend.linear(input_tensor, weight, bias), lambda: F.linear(input_tensor, weight, bias))
     return _route_or_fallback(
@@ -119,7 +119,7 @@ def lm_head(
 
 def embedding(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if input_tensor.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from . import ascend_backend
+        from .ascend import backend as ascend_backend
         return ascend_backend.execute("embedding", input_tensor,
             lambda: ascend_backend.embedding(input_tensor, weight), lambda: F.embedding(input_tensor.long(), weight))
     return _route_or_fallback(
@@ -140,7 +140,7 @@ def rotary_embedding(
     is_neox_style: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if query.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from . import ascend_backend
+        from .ascend import backend as ascend_backend
         return ascend_backend.execute(
             "rotary_embedding", query,
             lambda: ascend_backend.rotary_embedding(

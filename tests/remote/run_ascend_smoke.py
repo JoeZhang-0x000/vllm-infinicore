@@ -57,7 +57,7 @@ def validate_worker_routes(states, *, allow_native_fallback):
 def worker_state(worker):
     import dataclasses
     import os
-    from vllm_infinicore.ops import infinicore_backend
+    from vllm_infinicore.operators import backend as infinicore_backend
     from vllm_infinicore import plugin
     from vllm.model_executor.custom_op import op_registry_oot
 
@@ -78,7 +78,7 @@ def worker_state(worker):
 
 
 def reset_worker_counts(worker):
-    from vllm_infinicore.ops import infinicore_backend
+    from vllm_infinicore.operators import backend as infinicore_backend
 
     infinicore_backend.reset_backend_call_counts()
 
@@ -218,11 +218,11 @@ def main():
                 min_tokens=32,
                 max_tokens=32,
             )
-            from vllm_infinicore.validation import (
+            from vllm_infinicore.common.validation import (
                 compute_text_health,
                 detect_degenerate_repetition,
             )
-            from vllm_infinicore.ops import infinicore_backend as backend
+            from vllm_infinicore.operators import backend
 
             llm.generate(
                 [{"prompt_token_ids": prompts["exact128"]}], params, use_tqdm=False

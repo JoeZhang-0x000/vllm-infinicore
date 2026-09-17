@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from vllm_infinicore import plugin
-from vllm_infinicore.patching import (
+from vllm_infinicore.routing.patching import (
     FORCE_NATIVE_FALLBACK_ENV,
     PatchInstallResult,
     PatchRegistry,
@@ -181,7 +181,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertTrue(AttentionBackendEnum.FLASH_ATTN.is_overridden())
         self.assertEqual(
             AttentionBackendEnum.FLASH_ATTN.get_path(),
-            "vllm_infinicore.ops.vllm_attention_backend.InfiniCoreFlashAttentionBackend",
+            "vllm_infinicore.operators.routes.attention.InfiniCoreFlashAttentionBackend",
         )
         AttentionBackendEnum.FLASH_ATTN.clear_override()
 

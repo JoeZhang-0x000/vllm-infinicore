@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 def graph_state(worker):
     from vllm.compilation.counter import compilation_counter
     from vllm_ascend.compilation import acl_graph
-    from vllm_infinicore.ops import infinicore_backend as backend
+    from vllm_infinicore.operators import backend
     cfg = worker.vllm_config
     return dict(
         pid=os.getpid(), rank=worker.rank,
@@ -111,7 +111,7 @@ def main():
         import importlib.metadata
         from vllm import LLM, SamplingParams
         from vllm.config import CompilationMode, CUDAGraphMode
-        from vllm_infinicore.validation import compute_text_health, detect_degenerate_repetition
+        from vllm_infinicore.common.validation import compute_text_health, detect_degenerate_repetition
         result['versions'] = {n: importlib.metadata.version(n) for n in ['vllm','vllm_ascend','torch','torch_npu']}
         prompt_data = json.loads((root/'prompts.json').read_text())
         ids = prompt_data['token_ids']

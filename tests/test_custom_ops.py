@@ -7,7 +7,7 @@ import sys
 import unittest
 from unittest import mock
 
-from vllm_infinicore.ops import custom_ops
+from vllm_infinicore.operators import custom_ops
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -18,7 +18,7 @@ class CustomOpsTests(unittest.TestCase):
 import os
 import sys
 os.environ.pop("VLLM_INFINICORE_ENABLE_CUSTOM_OPS", None)
-from vllm_infinicore.ops import load_custom_ops
+from vllm_infinicore.operators import load_custom_ops
 status = load_custom_ops()
 print(status.available)
 print(status.registered_ops)

@@ -9,7 +9,7 @@ import torch
 from vllm.model_executor.custom_op import CustomOp, op_registry_oot
 from vllm.model_executor.layers.activation import SiluAndMul as VllmSiluAndMul
 
-from .custom_ops import SILU_AND_MUL_OP, load_custom_ops
+from ..custom_ops import SILU_AND_MUL_OP, load_custom_ops
 
 VLLM_SILU_AND_MUL_CLASS = "SiluAndMul"
 

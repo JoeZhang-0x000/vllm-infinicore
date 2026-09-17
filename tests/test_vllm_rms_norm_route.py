@@ -34,8 +34,8 @@ class VllmRMSNormRouteTests(unittest.TestCase):
             from vllm.config.compilation import CompilationMode
             from vllm.config.vllm import set_current_vllm_config
             from vllm.model_executor.layers.layernorm import RMSNorm as NativeRMSNorm
-            from vllm_infinicore.ops import custom_ops
-            from vllm_infinicore.ops.vllm_rms_norm import (
+            from vllm_infinicore.operators import custom_ops
+            from vllm_infinicore.operators.routes.rms_norm import (
                 InfiniCoreRMSNorm,
                 install_vllm_rms_norm_oot,
                 uninstall_vllm_rms_norm_oot,
@@ -121,7 +121,8 @@ class VllmRMSNormRouteTests(unittest.TestCase):
         torch.testing.assert_close(actual[1], expected[1])
 
     def test_unsupported_device_falls_back_instead_of_failing(self) -> None:
-        from vllm_infinicore.ops import cpp_bridge, infinicore_backend
+        from vllm_infinicore.operators import backend as infinicore_backend
+        from vllm_infinicore.operators import cpp_bridge
 
         torch = self.torch
         hidden_size = 8
@@ -161,7 +162,8 @@ class VllmRMSNormRouteTests(unittest.TestCase):
         self.assertEqual(probes, [1], "capability must be probed once and cached")
 
     def test_supported_device_probes_once_and_routes(self) -> None:
-        from vllm_infinicore.ops import cpp_bridge, infinicore_backend
+        from vllm_infinicore.operators import backend as infinicore_backend
+        from vllm_infinicore.operators import cpp_bridge
 
         torch = self.torch
         hidden_size = 8

@@ -11,9 +11,9 @@ from unittest import mock
 
 import torch
 
-from vllm_infinicore.ops import ascend_backend as backend
-from vllm_infinicore import platform_support
-from vllm_infinicore.ops import infinicore_backend as counters
+from vllm_infinicore.operators.ascend import backend
+from vllm_infinicore.device import detection as platform_support
+from vllm_infinicore.operators import backend as counters
 
 
 class AscendAdapterTests(unittest.TestCase):
@@ -79,7 +79,7 @@ class AscendAdapterTests(unittest.TestCase):
             )
 
     def test_route_installation_preserves_class_and_restores_original(self):
-        from vllm_infinicore.ops import ascend_routes
+        from vllm_infinicore.operators.ascend import routes as ascend_routes
 
         class Native:
             def forward_oot(self, x):
@@ -101,7 +101,7 @@ class AscendAdapterTests(unittest.TestCase):
             self.assertIs(Native.forward_oot, original)
 
     def test_uninstall_does_not_overwrite_later_patch(self):
-        from vllm_infinicore.ops import ascend_routes
+        from vllm_infinicore.operators.ascend import routes as ascend_routes
 
         class Native:
             def forward_oot(self, x):
@@ -244,7 +244,7 @@ class AscendGraphOperatorTests(unittest.TestCase):
         counters.reset_backend_call_counts()
 
     def test_operators_registered_with_shape_propagation(self):
-        from vllm_infinicore.ops import ascend_graph_ops  # noqa: F401
+        from vllm_infinicore.operators.ascend import graph_ops as ascend_graph_ops  # noqa: F401
 
         ops = torch.ops.vllm_infinicore_ascend
         with torch._subclasses.FakeTensorMode():
@@ -289,7 +289,7 @@ class AscendGraphOperatorTests(unittest.TestCase):
                 self.assertIsInstance(reason, str)
 
     def test_unsupported_call_selects_native_at_trace_time(self):
-        from vllm_infinicore.ops import ascend_routes
+        from vllm_infinicore.operators.ascend import routes as ascend_routes
 
         wrapper = ascend_routes._wrapper(
             "MatMul", lambda self, layer, x, bias=None: "native"
