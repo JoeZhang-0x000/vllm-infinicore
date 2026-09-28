@@ -276,7 +276,7 @@ def _set_default_device_index(tensor: torch.Tensor) -> None:
 
 
 def _should_use_infinicore(tensor: torch.Tensor) -> bool:
-    # This predicate selects the existing Python CUDA/MUSA bridge. Supported
+    # This predicate selects the existing CUDA-compatible torch bridge. Supported
     # NPU entry points dispatch separately through ascend_backend's C API;
     # remaining direct NPU calls use their explicit native fallback.
     return (
@@ -509,8 +509,7 @@ def _is_accelerator_tensor(tensor: torch.Tensor) -> bool:
     device_type = getattr(device, "type", "")
     return (
         bool(getattr(tensor, "is_cuda", False))
-        or bool(getattr(tensor, "is_musa", False))
-        or device_type in {"cuda", "musa", "privateuseone", "npu"}
+        or device_type in {"cuda", "npu"}
     )
 
 
@@ -520,19 +519,11 @@ def _torch_device_api(tensor: torch.Tensor) -> Any | None:
         return getattr(torch, "npu", None)
     if bool(getattr(tensor, "is_cuda", False)) or device_type == "cuda":
         return getattr(torch, "cuda", None)
-    if bool(getattr(tensor, "is_musa", False)) or device_type in {
-        "musa",
-        "privateuseone",
-    }:
-        return getattr(torch, "musa", None)
     return None
 
 
 def _infinicore_device_type(tensor: torch.Tensor) -> str:
-    device_type = getattr(getattr(tensor, "device", None), "type", "")
-    if device_type == "privateuseone":
-        return "musa"
-    return device_type
+    return getattr(getattr(tensor, "device", None), "type", "")
 
 
 def _on_reference_device(tensor: torch.Tensor | None, reference: torch.Tensor) -> torch.Tensor | None:

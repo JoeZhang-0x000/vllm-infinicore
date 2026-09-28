@@ -566,6 +566,8 @@ def get_default_registry() -> PatchRegistry:
 
     from ..device.detection import selected_platform
 
+    # The vendor vLLM plugin owns the platform. This general plugin only
+    # chooses its operator adapter for that already-selected platform.
     platform = selected_platform().name
     vendor_names = {
         "ascend": "vLLM-Ascend",

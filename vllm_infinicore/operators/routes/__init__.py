@@ -1,1 +1,1 @@
-"""vLLM-facing route installers (generic, platform-independent implementations)."""
+"""Shared vLLM route installers for the MetaX and Kunlun backends."""

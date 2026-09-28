@@ -1,9 +1,7 @@
-"""On-demand C++ bridge for hot InfiniCore routes."""
+"""On-demand C++ bridge for MetaX and Kunlun operator routes."""
 
 from __future__ import annotations
 
-import glob
-import importlib.util
 import os
 from pathlib import Path
 from typing import Any
@@ -13,12 +11,10 @@ CPP_BRIDGE_ROUTES_ENV = "VLLM_INFINICORE_CPP_BRIDGE_ROUTES"
 CPP_BRIDGE_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_CPP_BRIDGE"
 CPP_BRIDGE_TARGET_ENV = "VLLM_INFINICORE_CPP_BRIDGE_TARGET"
 
-CUDA_TARGET = "cuda"
-MUSA_TARGET = "musa"
+METAX_TARGET = "metax"
 KUNLUN_TARGET = "kunlun"
 BRIDGE_TARGET_ALIASES = {
-    CUDA_TARGET: frozenset({"cuda", "metax", "muxi"}),
-    MUSA_TARGET: frozenset({"musa", "moore"}),
+    METAX_TARGET: frozenset({"cuda", "maca", "metax", "muxi"}),
     KUNLUN_TARGET: frozenset({"kunlun", "xpu"}),
 }
 
@@ -46,7 +42,6 @@ NATIVE_ATTENTION_ROUTES = frozenset(
     {DECODE_ROUTE, FLASH_DECODE_ROUTE, STORE_KV_CACHE_ROUTE, PREFILL_ROUTE}
 )
 DEFAULT_ROUTES = (MATMUL_ROUTE,)
-MUSA_DEFAULT_ROUTES: tuple[str, ...] = ()
 KUNLUN_VALIDATED_ROUTES = (
     EMBEDDING_ROUTE,
     LM_HEAD_ROUTE,
@@ -60,7 +55,6 @@ _MODULE: Any | None = None
 _LOAD_ERROR: str | None = None
 _CALL_COUNTS: dict[str, int] = {}
 _BRIDGE_TARGET_CACHE: dict[str, str] = {}
-_TORCH_MUSA_DIRS_CACHE: tuple[Path, ...] | None = None
 _ROUTES_CACHE_KEY: tuple[str | None, str | None, str | None, str | None] | None = None
 _ROUTES_CACHE: tuple[str, ...] | None = None
 _ROUTES_SET_CACHE: frozenset[str] | None = None
@@ -120,8 +114,6 @@ def _parse_selected_routes() -> tuple[str, ...]:
     if raw is None or not raw.strip():
         if _bridge_target() == KUNLUN_TARGET:
             return ()
-        if _bridge_target() == MUSA_TARGET:
-            return MUSA_DEFAULT_ROUTES
         if _env_truthy("VLLM_INFINICORE_RAY_BACKEND"):
             return RAY_DEFAULT_ROUTES
         return DEFAULT_ROUTES
@@ -130,8 +122,6 @@ def _parse_selected_routes() -> tuple[str, ...]:
     if routes == ("all",):
         if target == KUNLUN_TARGET:
             return tuple(sorted(KUNLUN_VALIDATED_ROUTES))
-        if target == MUSA_TARGET:
-            return tuple(sorted(MUSA_DEFAULT_ROUTES))
         return tuple(sorted(SUPPORTED_ROUTES))
     unknown = tuple(
         route for route in routes
@@ -220,15 +210,7 @@ def _bridge_build_config() -> dict[str, Any]:
         "-linfiniccl",
     ]
 
-    if target == MUSA_TARGET:
-        try:
-            import torch_musa  # noqa: F401
-        except Exception:
-            pass
-        cflags.extend(["-DENABLE_MUSA_API", "-DENABLE_MOORE_API"])
-        include_paths.extend(str(path) for path in _musa_include_paths())
-        ldflags.extend(str(flag) for flag in _musa_link_flags())
-    elif target == KUNLUN_TARGET:
+    if target == KUNLUN_TARGET:
         cflags.extend(["-DENABLE_CUDA_API", "-DENABLE_KUNLUN_API"])
         include_paths.append(
             str(Path(os.environ.get("XPU_HOME", "/usr/local/xpu")) / "include")
@@ -251,9 +233,8 @@ def _bridge_build_config() -> dict[str, Any]:
 
 
 def _bridge_target() -> str:
-    # Resolved once per distinct override value. The auto-detected target is a
-    # machine property, so repeated device probing in hot operator paths adds
-    # avoidable host overhead.
+    # Resolve once per override. With no override, follow the selected vLLM
+    # vendor platform instead of guessing from installed Python packages.
     raw = os.environ.get(CPP_BRIDGE_TARGET_ENV)
     key = raw.strip() if raw is not None else ""
     cached = _BRIDGE_TARGET_CACHE.get(key)
@@ -269,10 +250,15 @@ def _bridge_target() -> str:
                 f"{CPP_BRIDGE_TARGET_ENV} must be one of {', '.join(valid)}"
             )
         target = normalized
-    elif _torch_musa_package_dirs():
-        target = MUSA_TARGET
     else:
-        target = CUDA_TARGET
+        from ..device.detection import selected_platform
+
+        target = selected_platform().name
+        if target not in BRIDGE_TARGET_ALIASES:
+            raise CppBridgeError(
+                "C++ bridge requires a selected MetaX or Kunlun vLLM platform; "
+                f"set {CPP_BRIDGE_TARGET_ENV} to override"
+            )
     _BRIDGE_TARGET_CACHE[key] = target
     return target
 
@@ -283,59 +269,6 @@ def _normalize_bridge_target(value: str) -> str | None:
         if normalized in aliases:
             return target
     return None
-
-
-def _musa_include_paths() -> tuple[Path, ...]:
-    paths: list[Path] = []
-    for package_dir in _torch_musa_package_dirs():
-        paths.append(package_dir.parent)
-        paths.append(package_dir / "share" / "generated_cuda_compatible")
-    for root in _musa_roots():
-        paths.append(root / "include")
-    return tuple(paths)
-
-
-def _musa_link_flags() -> tuple[str, ...]:
-    flags: list[str] = []
-    for package_dir in _torch_musa_package_dirs():
-        lib_dir = package_dir / "lib"
-        flags.extend(
-            [
-                f"-L{lib_dir}",
-                f"-Wl,-rpath,{lib_dir}",
-                "-lmusa_python",
-                "-lmusa_kernels",
-            ]
-        )
-    for root in _musa_roots():
-        lib_dir = root / "lib"
-        flags.extend([f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}", "-lmusart"])
-    return tuple(flags)
-
-
-def _torch_musa_package_dirs() -> tuple[Path, ...]:
-    global _TORCH_MUSA_DIRS_CACHE
-
-    if _TORCH_MUSA_DIRS_CACHE is not None:
-        return _TORCH_MUSA_DIRS_CACHE
-    spec = importlib.util.find_spec("torch_musa")
-    if spec is None or spec.submodule_search_locations is None:
-        dirs: tuple[Path, ...] = ()
-    else:
-        dirs = tuple(Path(location) for location in spec.submodule_search_locations)
-    _TORCH_MUSA_DIRS_CACHE = dirs
-    return dirs
-
-
-def _musa_roots() -> tuple[Path, ...]:
-    roots: list[Path] = []
-    for name in ("MUSA_HOME", "MUSA_PATH", "MUSA_ROOT"):
-        value = os.environ.get(name)
-        if value:
-            roots.append(Path(value))
-    roots.append(Path("/usr/local/musa"))
-    roots.extend(Path(path) for path in glob.glob("/usr/local/musa-*"))
-    return tuple(roots)
 
 
 def _dedupe(items: list[str]) -> list[str]:
