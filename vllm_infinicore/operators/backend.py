@@ -17,23 +17,28 @@ from typing import Any, Callable
 import torch
 import torch.nn.functional as F
 
-from ..device.detection import ASCEND_TENSOR_BRIDGE_UNAVAILABLE
-
 REAL_BACKEND_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_REAL_BACKEND"
 STRICT_BACKEND_ENV = "VLLM_INFINICORE_STRICT_BACKEND"
-RAY_BACKEND_ENV = "VLLM_INFINICORE_RAY_BACKEND"
-RAY_STORE_KV_CACHE_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_RAY_STORE_KV_CACHE"
+ASCEND_TENSOR_BRIDGE_UNAVAILABLE = (
+    "InfiniCore NPU adapter is not supported without "
+    "VLLM_INFINICORE_ASCEND_LIBRARY; using native NPU ops"
+)
 
 logger = logging.getLogger(__name__)
 _CALL_COUNTS: dict[str, int] = {}
 _FALLBACK_COUNTS: dict[str, int] = {}
 _FALLBACK_REASONS: dict[str, str] = {}
 _FUSED_ADD_RMS_NORM_SUPPORTED: bool | None = None
+_DEFAULT_DEVICE_INDEX_SET: int | None = None
 _PY_CAPSULE_GET_POINTER: Any | None = None
 _INFINICORE_STREAM_PTRS: dict[tuple[str, int], int] = {}
 _EXTERNAL_STREAMS: dict[tuple[str, int, int], Any] = {}
 _INFINI_TENSOR_CACHE_MAX = 4096
 _INFINI_TENSOR_CACHE: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+_ROPE_TABLE_CACHE_MAX = 16
+_ROPE_TABLE_CACHE: OrderedDict[
+    tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]
+] = OrderedDict()
 
 
 def rms_norm(input_tensor: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -171,84 +176,10 @@ def rotary_embedding(
     )
 
 
-def store_kv_cache(
-    kv_cache: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    slot_mapping: torch.Tensor,
-) -> None:
-    _route_or_fallback(
-        "store_kv_cache",
-        key,
-        lambda: _store_kv_cache_infinicore(kv_cache, key, value, slot_mapping),
-        lambda: _store_kv_cache_torch(kv_cache, key, value, slot_mapping),
-    )
-
-
-def paged_attention_prefill(
-    attn_layer: Any,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-) -> None:
-    _route_or_fallback(
-        "paged_attention_prefill",
-        query,
-        lambda: _paged_attention_prefill_infinicore(
-            attn_layer.impl, query, key, kv_cache, attn_metadata, output
-        ),
-        lambda: attn_layer.impl.forward(
-            attn_layer,
-            query,
-            key,
-            value,
-            kv_cache,
-            attn_metadata,
-            output=output,
-        ),
-    )
-
-
-def paged_attention_decode(
-    attn_layer: Any,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-) -> None:
-    _route_or_fallback(
-        "paged_attention_decode",
-        query,
-        lambda: _paged_attention_decode_infinicore(
-            attn_layer.impl, query, key, kv_cache, attn_metadata, output
-        ),
-        lambda: attn_layer.impl.forward(
-            attn_layer,
-            query,
-            key,
-            value,
-            kv_cache,
-            attn_metadata,
-            output=output,
-        ),
-    )
-
-
 def real_backend_enabled(reference_tensor: torch.Tensor) -> bool:
     if reference_tensor.device.type == "npu":
         return bool(os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY")) and not _env_truthy(REAL_BACKEND_DISABLE_ENV)
     return _should_use_infinicore(reference_tensor)
-
-
-def store_kv_cache_backend_enabled(reference_tensor: torch.Tensor) -> bool:
-    if not _should_use_infinicore(reference_tensor):
-        return False
-    return not _env_truthy(RAY_STORE_KV_CACHE_DISABLE_ENV)
 
 
 def backend_call_counts() -> dict[str, int]:
@@ -277,80 +208,14 @@ def reset_backend_call_counts() -> None:
         pass
 
 
-def record_backend_call(op_name: str) -> None:
-    _record_call(op_name)
-
-
 def clear_tensor_wrapper_cache() -> None:
     _INFINI_TENSOR_CACHE.clear()
+    _ROPE_TABLE_CACHE.clear()
 
 
 def clear_stream_cache() -> None:
     _INFINICORE_STREAM_PTRS.clear()
     _EXTERNAL_STREAMS.clear()
-
-
-def paged_attention_prefill_infinicore_only(
-    attn_impl: Any,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-) -> None:
-    if not _should_use_infinicore(query):
-        raise RuntimeError("InfiniCore paged attention prefill backend is disabled")
-    _paged_attention_prefill_infinicore(
-        attn_impl,
-        query,
-        key,
-        kv_cache,
-        attn_metadata,
-        output,
-    )
-    _record_call("paged_attention_prefill")
-
-
-def paged_attention_decode_infinicore_only(
-    attn_impl: Any,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-) -> None:
-    if not _should_use_infinicore(query):
-        raise RuntimeError("InfiniCore paged attention decode backend is disabled")
-    _paged_attention_decode_infinicore(
-        attn_impl,
-        query,
-        key,
-        kv_cache,
-        attn_metadata,
-        output,
-    )
-    _record_call("paged_attention_decode")
-
-
-def paged_attention_decode_as_prefill_infinicore_only(
-    attn_impl: Any,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-) -> None:
-    if not _should_use_infinicore(query):
-        raise RuntimeError("InfiniCore paged attention prefill backend is disabled")
-    _paged_attention_decode_as_prefill_infinicore(
-        attn_impl,
-        query,
-        key,
-        kv_cache,
-        attn_metadata,
-        output,
-    )
-    _record_call("paged_attention_prefill")
 
 
 def _route_or_fallback(
@@ -364,6 +229,8 @@ def _route_or_fallback(
             _FALLBACK_COUNTS[op_name] = _FALLBACK_COUNTS.get(op_name, 0) + 1
             _FALLBACK_REASONS[op_name] = ASCEND_TENSOR_BRIDGE_UNAVAILABLE
         return call_torch()
+
+    _set_default_device_index(reference_tensor)
 
     # InfiniCore resets the accelerator's current device to 0 while it
     # dispatches. On a tensor-parallel rank above 0 that leaves every later
@@ -398,6 +265,16 @@ def _record_call(op_name: str) -> None:
     _CALL_COUNTS[op_name] = _CALL_COUNTS.get(op_name, 0) + 1
 
 
+def _set_default_device_index(tensor: torch.Tensor) -> None:
+    """Point InfiniCore's lazy runtime at the vendor worker's selected card."""
+
+    global _DEFAULT_DEVICE_INDEX_SET
+    index = tensor.device.index
+    if index is not None and index != _DEFAULT_DEVICE_INDEX_SET:
+        os.environ["INFINICORE_DEFAULT_DEVICE_INDEX"] = str(index)
+        _DEFAULT_DEVICE_INDEX_SET = index
+
+
 def _should_use_infinicore(tensor: torch.Tensor) -> bool:
     # This predicate selects the existing Python CUDA/MUSA bridge. Supported
     # NPU entry points dispatch separately through ascend_backend's C API;
@@ -411,10 +288,6 @@ def _should_use_infinicore(tensor: torch.Tensor) -> bool:
 
 def strict_backend_enabled() -> bool:
     return _env_truthy(STRICT_BACKEND_ENV)
-
-
-def ray_backend_enabled() -> bool:
-    return _env_truthy(RAY_BACKEND_ENV)
 
 
 def _is_non_fallback_error(exc: Exception) -> bool:
@@ -508,6 +381,22 @@ def _tensor_cache_key(tensor: torch.Tensor) -> tuple[Any, ...]:
     )
 
 
+def _contiguous_rope_table_cached(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.is_contiguous():
+        return tensor
+    cache_key = _tensor_cache_key(tensor) + (tensor._version,)
+    cached = _ROPE_TABLE_CACHE.get(cache_key)
+    if cached is not None:
+        _ROPE_TABLE_CACHE.move_to_end(cache_key)
+        return cached[1]
+
+    contiguous = tensor.contiguous()
+    _ROPE_TABLE_CACHE[cache_key] = (tensor, contiguous)
+    if len(_ROPE_TABLE_CACHE) > _ROPE_TABLE_CACHE_MAX:
+        _ROPE_TABLE_CACHE.popitem(last=False)
+    return contiguous
+
+
 def _run_on_infinicore_stream(
     reference_tensor: torch.Tensor,
     launch: Callable[[], Any],
@@ -534,6 +423,11 @@ def _run_on_infinicore_stream(
         return launch()
 
     original_stream = device_api.current_stream(reference_tensor.device)
+    if (
+        reference_tensor.device.type == "cuda"
+        and original_stream.cuda_stream == stream.cuda_stream
+    ):
+        return launch()
     stream.wait_stream(original_stream)
     with device_api.stream(stream):
         result = launch()
@@ -1030,8 +924,12 @@ def _rotary_embedding_cpp_bridge(
     max_position = int(cos_sin_cache.shape[0]) - 1
     if max_position >= 0:
         positions = positions.clamp(0, max_position)
-    sin = sin.contiguous()
-    cos = cos.contiguous()
+    if cpp_bridge.bridge_target() == cpp_bridge.KUNLUN_TARGET:
+        sin = _contiguous_rope_table_cached(sin)
+        cos = _contiguous_rope_table_cached(cos)
+    else:
+        sin = sin.contiguous()
+        cos = cos.contiguous()
 
     def apply_one(tensor: torch.Tensor) -> torch.Tensor:
         original_shape = tensor.shape
@@ -1079,511 +977,6 @@ def _rotary_embedding_torch(
         return torch.cat((out_rot, passthrough), dim=-1).reshape(original_shape)
 
     return apply_one(query), apply_one(key) if key is not None else None
-
-
-def _cache_views(kv_cache: torch.Tensor, key: torch.Tensor) -> tuple[Any, Any]:
-    key_cache, value_cache = _cache_tensors(kv_cache, key, heads_dim=1)
-    return _as_infini_strided_cached(key_cache), _as_infini_strided_cached(value_cache)
-
-
-def _cache_views_bshd(kv_cache: torch.Tensor, key: torch.Tensor) -> tuple[Any, Any]:
-    key_cache, value_cache = _cache_tensors(kv_cache, key, heads_dim=2)
-    return _as_infini_strided_cached(key_cache), _as_infini_strided_cached(value_cache)
-
-
-def _cache_tensors(
-    kv_cache: torch.Tensor,
-    key: torch.Tensor,
-    *,
-    heads_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    key_cache, value_cache = _split_kv_cache(kv_cache)
-    num_kv_heads = key.shape[1]
-    if key_cache.shape[heads_dim] == num_kv_heads:
-        return key_cache, value_cache
-    if key_cache.shape[3 - heads_dim] == num_kv_heads:
-        return key_cache.permute(0, 2, 1, 3), value_cache.permute(0, 2, 1, 3)
-    raise RuntimeError(
-        f"cannot infer KV cache layout from key={key.shape}, cache={kv_cache.shape}"
-    )
-
-
-def _split_kv_cache(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if not isinstance(kv_cache, torch.Tensor):
-        raise RuntimeError(f"expected tensor KV cache, got {type(kv_cache)!r}")
-    if kv_cache.numel() == 0 or kv_cache.ndim < 5:
-        raise RuntimeError(f"expected non-empty 5D KV cache, got {kv_cache.shape}")
-    if kv_cache.shape[0] == 2:
-        return kv_cache.unbind(0)
-    if kv_cache.shape[1] == 2:
-        return kv_cache.unbind(1)
-    raise RuntimeError(f"cannot infer KV cache split axis from cache={kv_cache.shape}")
-
-
-def _store_kv_cache_infinicore(
-    kv_cache: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    slot_mapping: torch.Tensor,
-) -> None:
-    from . import cpp_bridge
-
-    if cpp_bridge.enabled_for(cpp_bridge.STORE_KV_CACHE_ROUTE):
-        _store_kv_cache_cpp_bridge(kv_cache, key, value, slot_mapping)
-        return
-
-    import infinicore
-
-    key_cache, value_cache = _cache_views(kv_cache, key)
-    slot_mapping = _on_reference_device(slot_mapping, key)
-    _run_on_infinicore_stream(
-        key,
-        lambda: infinicore.paged_caching(
-            key_cache,
-            value_cache,
-            _as_infini(key),
-            _as_infini(value),
-            _as_infini(slot_mapping.flatten()),
-        ),
-    )
-
-
-def _store_kv_cache_cpp_bridge(
-    kv_cache: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    slot_mapping: torch.Tensor,
-) -> None:
-    from . import cpp_bridge
-
-    module = cpp_bridge.module()
-    module.store_kv_cache_current_stream(
-        kv_cache,
-        key,
-        value,
-        _on_reference_device(slot_mapping, key),
-    )
-    cpp_bridge.record_call(cpp_bridge.STORE_KV_CACHE_ROUTE)
-
-
-def _store_kv_cache_torch(
-    kv_cache: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    slot_mapping: torch.Tensor,
-) -> None:
-    key_cache, value_cache = _split_kv_cache(kv_cache)
-    flat_slots = slot_mapping.flatten().long()
-    num_kv_heads = key.shape[1]
-    if key_cache.shape[1] == num_kv_heads:
-        block_size = key_cache.shape[2]
-        cache_layout = "hnd"
-    else:
-        block_size = key_cache.shape[1]
-        cache_layout = "nhd"
-    for token_idx, slot in enumerate(flat_slots.tolist()):
-        block = slot // block_size
-        offset = slot % block_size
-        if cache_layout == "hnd":
-            key_cache[block, :, offset, :].copy_(key[token_idx])
-            value_cache[block, :, offset, :].copy_(value[token_idx])
-        else:
-            key_cache[block, offset].copy_(key[token_idx])
-            value_cache[block, offset].copy_(value[token_idx])
-
-
-def _prefill_total_lens(attn_metadata: Any) -> torch.Tensor:
-    cu_prefix_kv_lens = getattr(attn_metadata, "cu_prefix_kv_lens", None)
-    if cu_prefix_kv_lens is not None:
-        return (cu_prefix_kv_lens[1:] - cu_prefix_kv_lens[:-1]).to(torch.int64)
-    seq_lens = getattr(attn_metadata, "seq_lens", None)
-    if seq_lens is None:
-        raise RuntimeError("missing seq_lens for paged attention prefill")
-    num_decodes = int(getattr(attn_metadata, "num_decodes", 0))
-    num_prefills = int(getattr(attn_metadata, "num_prefills", 0))
-    if seq_lens.shape[0] >= num_decodes + num_prefills:
-        return seq_lens[num_decodes : num_decodes + num_prefills]
-    if seq_lens.shape[0] == num_prefills:
-        return seq_lens
-    raise RuntimeError("cannot derive prefill total lengths")
-
-
-def _paged_attention_prefill_infinicore(
-    attn_impl: Any,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-) -> None:
-    from . import cpp_bridge
-
-    if cpp_bridge.enabled_for(cpp_bridge.PREFILL_ROUTE):
-        _paged_attention_prefill_cpp_bridge(
-            attn_impl,
-            query,
-            key,
-            kv_cache,
-            attn_metadata,
-            output,
-        )
-        return
-
-    import infinicore
-
-    key_cache, value_cache = _cache_views_bshd(kv_cache, key)
-    num_decode_tokens = int(getattr(attn_metadata, "num_decode_tokens", 0))
-    num_actual_tokens = int(attn_metadata.num_actual_tokens)
-    q = query[num_decode_tokens:num_actual_tokens]
-    if q.numel() == 0:
-        return
-    out = output[num_decode_tokens:num_actual_tokens].view(q.shape)
-    total_lens = getattr(attn_metadata, "cu_prefix_kv_lens", None)
-    if total_lens is None:
-        total_lens = _prefill_total_lens(attn_metadata)
-        total_lens = torch.nn.functional.pad(total_lens, (1, 0), value=0).cumsum(
-            dim=0, dtype=torch.int32
-        )
-    total_lens = _on_reference_device(total_lens, query)
-    query_start_loc = _on_reference_device(attn_metadata.prefill_query_start_loc, query)
-    block_table = _on_reference_device(attn_metadata.prefill_block_table, query)
-    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
-    max_query_len = int(getattr(attn_metadata, "max_query_len", q.shape[0]))
-    max_seq_len = int(getattr(attn_metadata, "prefill_max_seq_len", max_query_len))
-    _run_on_infinicore_stream(
-        query,
-        lambda: infinicore.mha_varlen(
-            _as_infini(q),
-            key_cache,
-            value_cache,
-            _as_infini_cached(query_start_loc),
-            _as_infini_cached(total_lens),
-            _as_infini_cached(block_table),
-            max_query_len,
-            max_seq_len,
-            _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
-            attn_impl.scale,
-            out=_as_infini(out),
-        ),
-    )
-
-
-def _paged_attention_prefill_cpp_bridge(
-    attn_impl: Any,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-) -> None:
-    from . import cpp_bridge
-
-    key_cache, value_cache = _cache_tensors(kv_cache, key, heads_dim=1)
-    num_decode_tokens = int(getattr(attn_metadata, "num_decode_tokens", 0))
-    num_actual_tokens = int(attn_metadata.num_actual_tokens)
-    q = query[num_decode_tokens:num_actual_tokens]
-    if q.numel() == 0:
-        return
-    total_lens = _on_reference_device(_prefill_total_lens(attn_metadata), query)
-    query_start_loc = _on_reference_device(attn_metadata.prefill_query_start_loc, query)
-    block_table = _on_reference_device(attn_metadata.prefill_block_table, query)
-    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
-
-    module = cpp_bridge.module()
-    module.paged_attention_prefill_current_stream(
-        q,
-        key_cache,
-        value_cache,
-        block_table,
-        total_lens,
-        query_start_loc,
-        alibi_slopes,
-        float(attn_impl.scale),
-        output[num_decode_tokens:num_actual_tokens].view(q.shape),
-    )
-    cpp_bridge.record_call(cpp_bridge.PREFILL_ROUTE)
-
-
-def _paged_attention_decode_infinicore(
-    attn_impl: Any,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-) -> None:
-    num_decode_tokens = int(getattr(attn_metadata, "num_decode_tokens", 0))
-    num_decodes = int(getattr(attn_metadata, "num_decodes", 0))
-    if num_decode_tokens == 0:
-        return
-    if num_decode_tokens != num_decodes:
-        raise RuntimeError("InfiniCore paged attention wrapper does not support speculative decode")
-    from . import cpp_bridge
-
-    if cpp_bridge.enabled_for(cpp_bridge.FLASH_DECODE_ROUTE):
-        if cpp_bridge.bridge_target() == cpp_bridge.MUSA_TARGET:
-            _paged_attention_decode_flash_musa(
-                attn_impl,
-                query,
-                key,
-                kv_cache,
-                attn_metadata,
-                output,
-                num_decode_tokens,
-            )
-            return
-        _paged_attention_decode_flash_cpp_bridge(
-            query,
-            key,
-            kv_cache,
-            attn_metadata,
-            output,
-            attn_impl.alibi_slopes,
-            attn_impl.scale,
-            num_decode_tokens,
-            num_decodes,
-        )
-        return
-    if cpp_bridge.enabled_for(cpp_bridge.DECODE_ROUTE):
-        _paged_attention_decode_cpp_bridge(
-            query,
-            key,
-            kv_cache,
-            attn_metadata,
-            output,
-            attn_impl.alibi_slopes,
-            attn_impl.scale,
-            num_decode_tokens,
-            num_decodes,
-        )
-        return
-    import infinicore
-
-    key_cache, value_cache = _cache_views(kv_cache, key)
-    q = query[:num_decode_tokens]
-    out = output[:num_decode_tokens].view(q.shape)
-    decode_block_table = _on_reference_device(attn_metadata.decode_block_table, query)
-    decode_seq_lens = _on_reference_device(attn_metadata.decode_seq_lens, query)
-    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
-    _run_on_infinicore_stream(
-        query,
-        lambda: infinicore.paged_attention(
-            _as_infini(q),
-            key_cache,
-            value_cache,
-            _as_infini_cached(decode_block_table),
-            _as_infini_cached(decode_seq_lens),
-            _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
-            attn_impl.scale,
-            out=_as_infini(out),
-        ),
-    )
-
-
-def _paged_attention_decode_cpp_bridge(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-    alibi_slopes: torch.Tensor | None,
-    scale: float,
-    num_decode_tokens: int,
-    num_decodes: int,
-) -> None:
-    from . import cpp_bridge
-
-    module = cpp_bridge.module()
-    module.paged_attention_decode_out(
-        query,
-        key,
-        kv_cache,
-        attn_metadata.decode_seq_lens,
-        attn_metadata.decode_block_table,
-        alibi_slopes,
-        float(scale),
-        int(num_decode_tokens),
-        int(num_decodes),
-        output,
-    )
-    cpp_bridge.record_call(cpp_bridge.DECODE_ROUTE)
-
-
-def _paged_attention_decode_flash_cpp_bridge(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-    alibi_slopes: torch.Tensor | None,
-    scale: float,
-    num_decode_tokens: int,
-    num_decodes: int,
-) -> None:
-    from . import cpp_bridge
-
-    module = cpp_bridge.module()
-    module.paged_attention_decode_flash_out(
-        query,
-        key,
-        kv_cache,
-        attn_metadata.decode_seq_lens,
-        attn_metadata.decode_block_table,
-        alibi_slopes,
-        float(scale),
-        int(num_decode_tokens),
-        int(num_decodes),
-        cpp_bridge.flash_decode_num_splits(),
-        output,
-    )
-    cpp_bridge.record_call(cpp_bridge.FLASH_DECODE_ROUTE)
-
-
-def _paged_attention_decode_flash_musa(
-    attn_impl: Any,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-    num_decode_tokens: int,
-) -> None:
-    from . import cpp_bridge
-
-    try:
-        from flash_attn.vllm_interface import flash_attn_varlen_func
-    except Exception as exc:
-        raise RuntimeError("MUSA flash attention varlen interface is unavailable") from exc
-
-    q = query[:num_decode_tokens]
-    out = output[:num_decode_tokens].view(q.shape)
-    key_cache, value_cache = _cache_tensors(kv_cache, key, heads_dim=2)
-    decode_query_start_loc = _on_reference_device(
-        attn_metadata.decode_query_start_loc,
-        query,
-    )
-    decode_seq_lens = _on_reference_device(attn_metadata.decode_seq_lens, query)
-    decode_block_table = _on_reference_device(attn_metadata.decode_block_table, query)
-    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
-    sliding_window = getattr(attn_impl, "sliding_window", (-1, -1))
-    if sliding_window is not None and not isinstance(sliding_window, list):
-        sliding_window = list(sliding_window)
-
-    flash_attn_varlen_func(
-        q=q,
-        k=key_cache,
-        v=value_cache,
-        out=out,
-        cu_seqlens_q=decode_query_start_loc,
-        max_seqlen_q=1,
-        seqused_k=decode_seq_lens,
-        max_seqlen_k=int(getattr(attn_metadata, "max_seq_len", 0) or q.shape[0]),
-        softmax_scale=float(attn_impl.scale),
-        causal=True,
-        alibi_slopes=alibi_slopes,
-        window_size=sliding_window,
-        block_table=decode_block_table,
-        softcap=float(getattr(attn_impl, "logits_soft_cap", 0.0) or 0.0),
-        num_splits=cpp_bridge.flash_decode_num_splits(),
-        fa_version=getattr(attn_impl, "vllm_flash_attn_version", 3),
-        s_aux=getattr(attn_impl, "sinks", None),
-    )
-    cpp_bridge.record_call(cpp_bridge.FLASH_DECODE_ROUTE)
-
-
-def _paged_attention_decode_as_prefill_infinicore(
-    attn_impl: Any,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-) -> None:
-    from . import cpp_bridge
-
-    if cpp_bridge.enabled_for(cpp_bridge.PREFILL_ROUTE):
-        _paged_attention_decode_as_prefill_cpp_bridge(
-            attn_impl,
-            query,
-            key,
-            kv_cache,
-            attn_metadata,
-            output,
-        )
-        return
-
-    import infinicore
-
-    num_actual_tokens = int(attn_metadata.num_actual_tokens)
-    q = query[:num_actual_tokens]
-    if q.numel() == 0:
-        return
-    key_cache, value_cache = _cache_views(kv_cache, key)
-    query_start_loc = torch.tensor(
-        [0, num_actual_tokens],
-        dtype=torch.int32,
-        device=query.device,
-    )
-    decode_block_table = _on_reference_device(attn_metadata.decode_block_table, query)
-    decode_seq_lens = _on_reference_device(attn_metadata.decode_seq_lens, query)
-    total_lens = decode_seq_lens[:1].to(torch.int64)
-    out = output[:num_actual_tokens].view(q.shape)
-    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
-    _run_on_infinicore_stream(
-        query,
-        lambda: infinicore.paged_attention_prefill(
-            _as_infini(q),
-            key_cache,
-            value_cache,
-            _as_infini_cached(decode_block_table[:1]),
-            _as_infini_cached(total_lens),
-            _as_infini_cached(query_start_loc),
-            _as_infini_cached(alibi_slopes) if alibi_slopes is not None else None,
-            attn_impl.scale,
-            out=_as_infini(out),
-        ),
-    )
-
-
-def _paged_attention_decode_as_prefill_cpp_bridge(
-    attn_impl: Any,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    kv_cache: torch.Tensor,
-    attn_metadata: Any,
-    output: torch.Tensor,
-) -> None:
-    from . import cpp_bridge
-
-    num_actual_tokens = int(attn_metadata.num_actual_tokens)
-    q = query[:num_actual_tokens]
-    if q.numel() == 0:
-        return
-    key_cache, value_cache = _cache_tensors(kv_cache, key, heads_dim=1)
-    query_start_loc = torch.tensor(
-        [0, num_actual_tokens],
-        dtype=torch.int32,
-        device=query.device,
-    )
-    decode_block_table = _on_reference_device(attn_metadata.decode_block_table, query)
-    decode_seq_lens = _on_reference_device(attn_metadata.decode_seq_lens, query)
-    total_lens = decode_seq_lens[:1].to(torch.int64)
-    out = output[:num_actual_tokens].view(q.shape)
-    alibi_slopes = _on_reference_device(attn_impl.alibi_slopes, query)
-
-    module = cpp_bridge.module()
-    module.paged_attention_prefill_current_stream(
-        q,
-        key_cache,
-        value_cache,
-        decode_block_table[:1],
-        total_lens,
-        query_start_loc,
-        alibi_slopes,
-        float(attn_impl.scale),
-        out,
-    )
-    cpp_bridge.record_call(cpp_bridge.PREFILL_ROUTE)
 
 
 def _env_truthy(name: str) -> bool:

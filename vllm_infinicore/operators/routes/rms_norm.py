@@ -6,7 +6,13 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.model_executor.custom_op import CustomOp, op_registry_oot
+from vllm.model_executor.custom_op import CustomOp
+
+try:
+    from vllm.model_executor.custom_op import op_registry_oot
+except ImportError:
+    op_registry_oot = CustomOp.op_registry_oot
+
 from vllm.model_executor.layers.layernorm import RMSNorm as VllmRMSNorm
 
 from ..custom_ops import FUSED_ADD_RMS_NORM_OP, RMS_NORM_OP, load_custom_ops
@@ -37,6 +43,13 @@ class InfiniCoreRMSNorm(VllmRMSNorm):
     those on vLLM's native lowering cost a separate add plus a slower
     non-fused norm. Variant paths still use vLLM's native implementation.
     """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return self._forward_method(x, residual)
 
     def forward_cuda(
         self,
@@ -101,9 +114,9 @@ class InfiniCoreRMSNorm(VllmRMSNorm):
             return False
         if residual is None:
             return True
-        # vLLM applies the weight on the fused path only when pass_weight_add
-        # is set, while this route always applies it.
-        if not getattr(self, "pass_weight_add", False):
+        # Older vLLM releases always apply the weight. Newer releases can
+        # explicitly disable it on the fused path with pass_weight_add=False.
+        if not getattr(self, "pass_weight_add", True):
             return False
         return residual.shape == x.shape and residual.dtype == x.dtype
 

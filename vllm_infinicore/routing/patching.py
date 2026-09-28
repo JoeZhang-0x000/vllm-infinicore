@@ -1,8 +1,7 @@
-"""Conservative Qwen3 operator routing scaffold.
+"""Opt-in Qwen3 operator routes layered over vendor vLLM platform plugins.
 
-Routes are default-off and graph-conservative. A route is installed only through
-explicit environment gates; otherwise requested operators remain on vLLM native
-fallback paths.
+The vendor platform owns device, worker, attention, and KV cache behavior.
+This module installs only supported non-attention routes.
 """
 
 from __future__ import annotations
@@ -18,8 +17,6 @@ ROUTE_DISABLE_ENV = "VLLM_INFINICORE_DISABLED_ROUTES"
 FORCE_NATIVE_FALLBACK_ENV = "VLLM_INFINICORE_FORCE_NATIVE_FALLBACK"
 
 ALL_ROUTES_TOKEN = "all"
-THROUGHPUT_ROUTES_TOKEN = "throughput"
-THROUGHPUT_ROUTE_NAMES = ("RMSNorm", "SiluAndMul", "Embedding")
 ROUTE_STATE_DISABLED = "disabled"
 ROUTE_STATE_INSTALLED = "installed"
 ROUTE_STATE_NATIVE_FALLBACK = "native_fallback"
@@ -35,8 +32,6 @@ class OperatorRoute:
     default_enabled: bool
     graph_policy: str
     native_fallback: str
-    validation: str
-    notes: str
 
 
 @dataclass(frozen=True)
@@ -49,7 +44,6 @@ class RouteState:
     status: str
     implementation: str
     native_fallback: str
-    validation: str
     graph_policy: str
     reason: str
 
@@ -135,8 +129,6 @@ QWEN3_OPERATOR_ROUTES: tuple[OperatorRoute, ...] = (
         default_enabled=False,
         graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM RMSNorm forward_native",
-        validation="unit_numeric_compare; qwen3_exact_token_smoke; graph_smoke",
-        notes="InfiniCore-backed OOT RMSNorm route.",
     ),
     OperatorRoute(
         name="SiluAndMul",
@@ -145,8 +137,6 @@ QWEN3_OPERATOR_ROUTES: tuple[OperatorRoute, ...] = (
         default_enabled=False,
         graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native SiluAndMul activation",
-        validation="qwen3_exact_token_smoke and graph_smoke",
-        notes="InfiniCore swiglu-backed fused activation route.",
     ),
     OperatorRoute(
         name="RoPE",
@@ -155,8 +145,6 @@ QWEN3_OPERATOR_ROUTES: tuple[OperatorRoute, ...] = (
         default_enabled=False,
         graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native rotary embedding",
-        validation="qwen3_exact_token_smoke and graph evidence",
-        notes="InfiniCore RoPE route with stream-bridge graph validation.",
     ),
     OperatorRoute(
         name="Embedding",
@@ -165,8 +153,6 @@ QWEN3_OPERATOR_ROUTES: tuple[OperatorRoute, ...] = (
         default_enabled=False,
         graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native token embedding",
-        validation="qwen3_exact_token_smoke and graph capture probe",
-        notes="InfiniCore embedding route with stream-bridge graph validation.",
     ),
     OperatorRoute(
         name="MatMul",
@@ -175,8 +161,6 @@ QWEN3_OPERATOR_ROUTES: tuple[OperatorRoute, ...] = (
         default_enabled=False,
         graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native linear layers",
-        validation="operator numeric compare; qwen3_exact_token_smoke; graph_smoke",
-        notes="Covers QKV, gate/up, down, and output projection candidates.",
     ),
     OperatorRoute(
         name="LMHead",
@@ -185,39 +169,39 @@ QWEN3_OPERATOR_ROUTES: tuple[OperatorRoute, ...] = (
         default_enabled=False,
         graph_policy="stream_bridge_graph_validated",
         native_fallback="vLLM native LMHead/logits projection",
-        validation="logits numeric compare; qwen3_exact_token_smoke; graph_smoke",
-        notes="Separate route name for final logits projection accounting.",
     ),
     OperatorRoute(
         name="StoreKVCache",
         category="kv-cache",
-        implementation="infinicore_attention_backend",
+        implementation="native_platform",
         default_enabled=False,
-        graph_policy="stream_bridge_graph_validated",
+        graph_policy="native_platform",
         native_fallback="vLLM native KV cache store path",
-        validation="attention probe; qwen3_exact_token_smoke; graph_smoke",
-        notes="Patches attention backend KV update to InfiniCore paged_caching.",
     ),
     OperatorRoute(
         name="PagedAttentionPrefill",
         category="paged-attention",
-        implementation="infinicore_attention_backend",
+        implementation="native_platform",
         default_enabled=False,
-        graph_policy="stream_bridge_graph_validated",
+        graph_policy="native_platform",
         native_fallback="vLLM native paged attention prefill backend",
-        validation="attention output compare; qwen3_exact_token_smoke; graph evidence",
-        notes="Patches attention backend prefill path to InfiniCore paged_attention_prefill.",
     ),
     OperatorRoute(
         name="PagedAttentionDecode",
         category="paged-attention",
-        implementation="infinicore_attention_backend",
+        implementation="native_platform",
         default_enabled=False,
-        graph_policy="stream_bridge_graph_validated",
+        graph_policy="native_platform",
         native_fallback="vLLM native paged attention decode backend",
-        validation="decode health; qwen3_exact_token_smoke; graph evidence",
-        notes="Patches attention backend decode path to InfiniCore paged_attention.",
     ),
+)
+
+NATIVE_ATTENTION_ROUTES = frozenset(
+    {"StoreKVCache", "PagedAttentionPrefill", "PagedAttentionDecode"}
+)
+NON_ATTENTION_ROUTES = tuple(
+    route.name for route in QWEN3_OPERATOR_ROUTES
+    if route.name not in NATIVE_ATTENTION_ROUTES
 )
 
 
@@ -233,8 +217,10 @@ class PatchRegistry:
         native_fallback_reasons: Mapping[str, str] | None = None,
     ) -> None:
         self._routes = {route.name: route for route in routes}
-        self._installers = dict(installers or _DEFAULT_INSTALLERS)
-        self._uninstallers = dict(uninstallers or _DEFAULT_UNINSTALLERS)
+        self._installers = dict(_DEFAULT_INSTALLERS if installers is None else installers)
+        self._uninstallers = dict(
+            _DEFAULT_UNINSTALLERS if uninstallers is None else uninstallers
+        )
         self._native_fallback_reasons = dict(native_fallback_reasons or {})
 
     @property
@@ -371,9 +357,7 @@ class PatchRegistry:
 
             unsupported_reason = self._native_fallback_reasons.get(route_name)
             if unsupported_reason is not None:
-                # A missing adapter is a supported native-fallback state, not
-                # an installation failure. In particular, never register a
-                # competing OOT class before Ascend registers its own classes.
+                # A missing adapter is a supported native-fallback state.
                 skipped_routes.append(route_name)
                 route_states.append(
                     self._route_state(
@@ -382,6 +366,19 @@ class PatchRegistry:
                         disabled_by_env=False,
                         status=ROUTE_STATE_NATIVE_FALLBACK,
                         reason=unsupported_reason,
+                    )
+                )
+                continue
+
+            if route_name in NATIVE_ATTENTION_ROUTES:
+                skipped_routes.append(route_name)
+                route_states.append(
+                    self._route_state(
+                        route,
+                        requested=True,
+                        disabled_by_env=False,
+                        status=ROUTE_STATE_NATIVE_FALLBACK,
+                        reason="v1 keeps attention and KV cache on the vendor platform",
                     )
                 )
                 continue
@@ -559,7 +556,6 @@ class PatchRegistry:
             status=status,
             implementation=route.implementation,
             native_fallback=route.native_fallback,
-            validation=route.validation,
             graph_policy=route.graph_policy,
             reason=reason,
         )
@@ -568,57 +564,81 @@ class PatchRegistry:
 def get_default_registry() -> PatchRegistry:
     from dataclasses import replace
 
-    from ..device.detection import (
-        ascend_native_fallback_reasons,
-        ascend_platform_selected,
-    )
+    from ..device.detection import selected_platform
 
-    if ascend_platform_selected():
-        fallback_reasons = ascend_native_fallback_reasons()
+    platform = selected_platform().name
+    vendor_names = {
+        "ascend": "vLLM-Ascend",
+        "metax": "vLLM-MetaX",
+        "kunlun": "vLLM-Kunlun",
+    }
+    vendor = vendor_names.get(platform, "vLLM")
+    supported = set(NON_ATTENTION_ROUTES)
+    if platform == "ascend":
+        if not os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
+            supported.clear()
+    elif platform == "kunlun":
+        supported &= {"RoPE", "Embedding", "MatMul", "LMHead"}
+    elif platform != "metax":
+        supported.clear()
 
-        def installer(name):
-            def install():
+    fallback_reasons = {}
+    for route in QWEN3_OPERATOR_ROUTES:
+        if route.name in supported:
+            continue
+        if route.name in NATIVE_ATTENTION_ROUTES:
+            reason = "v1 keeps attention and KV cache on the vendor platform"
+        elif platform == "ascend" and not os.environ.get(
+            "VLLM_INFINICORE_ASCEND_LIBRARY"
+        ):
+            reason = "VLLM_INFINICORE_ASCEND_LIBRARY is unset"
+        else:
+            reason = f"{vendor} operator adapter is unavailable on this platform"
+        fallback_reasons[route.name] = reason
+
+    if platform == "ascend":
+
+        def installer(name: str) -> PatchInstaller:
+            def install() -> PatchInstallResult:
                 from ..operators.ascend.routes import install
 
                 return install(name)
 
             return install
 
-        def uninstaller(name):
-            def uninstall():
+        def uninstaller(name: str) -> PatchUninstaller:
+            def uninstall() -> PatchUninstallResult:
                 from ..operators.ascend.routes import uninstall
 
                 return uninstall(name)
 
             return uninstall
 
-        return PatchRegistry(
-            tuple(
-                replace(
-                    route,
-                    native_fallback=f"vLLM-Ascend native {route.name}",
-                    implementation="ascend_class_adapter"
-                    if route.name not in fallback_reasons
-                    else route.implementation,
-                    graph_policy="ascend_graph_capturable"
-                    if route.name not in fallback_reasons
-                    else "native_platform",
-                )
-                for route in QWEN3_OPERATOR_ROUTES
-            ),
-            installers={
-                r.name: installer(r.name)
-                for r in QWEN3_OPERATOR_ROUTES
-                if r.name not in fallback_reasons
-            },
-            uninstallers={
-                r.name: uninstaller(r.name)
-                for r in QWEN3_OPERATOR_ROUTES
-                if r.name not in fallback_reasons
-            },
-            native_fallback_reasons=fallback_reasons,
+        installers = {name: installer(name) for name in supported}
+        uninstallers = {name: uninstaller(name) for name in supported}
+    else:
+        installers = {name: _DEFAULT_INSTALLERS[name] for name in supported}
+        uninstallers = {name: _DEFAULT_UNINSTALLERS[name] for name in supported}
+
+    routes = tuple(
+        replace(
+            route,
+            native_fallback=f"{vendor} native {route.name}",
+            implementation="ascend_class_adapter"
+            if platform == "ascend" and route.name in supported
+            else route.implementation,
+            graph_policy="ascend_graph_capturable"
+            if platform == "ascend" and route.name in supported
+            else ("native_platform" if route.name not in supported else route.graph_policy),
         )
-    return PatchRegistry(QWEN3_OPERATOR_ROUTES)
+        for route in QWEN3_OPERATOR_ROUTES
+    )
+    return PatchRegistry(
+        routes,
+        installers=installers,
+        uninstallers=uninstallers,
+        native_fallback_reasons=fallback_reasons,
+    )
 
 def _install_rms_norm_route() -> PatchInstallResult:
     from ..operators.routes.rms_norm import install_vllm_rms_norm_oot
@@ -696,26 +716,6 @@ def _make_linear_uninstaller(route_name: str) -> PatchUninstaller:
     return uninstaller
 
 
-def _make_attention_installer(route_name: str) -> PatchInstaller:
-    def installer() -> PatchInstallResult:
-        from ..operators.routes.attention import install_infinicore_attention_backend
-
-        status = install_infinicore_attention_backend(route_name)
-        return PatchInstallResult(installed=status.installed, reason=status.reason)
-
-    return installer
-
-
-def _make_attention_uninstaller(route_name: str) -> PatchUninstaller:
-    def uninstaller() -> PatchUninstallResult:
-        from ..operators.routes.attention import uninstall_infinicore_attention_backend
-
-        status = uninstall_infinicore_attention_backend(route_name)
-        return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
-
-    return uninstaller
-
-
 _DEFAULT_INSTALLERS: Mapping[str, PatchInstaller] = MappingProxyType(
     {
         "RMSNorm": _install_rms_norm_route,
@@ -724,9 +724,6 @@ _DEFAULT_INSTALLERS: Mapping[str, PatchInstaller] = MappingProxyType(
         "Embedding": _install_embedding_route,
         "MatMul": _make_linear_installer("MatMul"),
         "LMHead": _make_linear_installer("LMHead"),
-        "StoreKVCache": _make_attention_installer("StoreKVCache"),
-        "PagedAttentionPrefill": _make_attention_installer("PagedAttentionPrefill"),
-        "PagedAttentionDecode": _make_attention_installer("PagedAttentionDecode"),
     }
 )
 _DEFAULT_UNINSTALLERS: Mapping[str, PatchUninstaller] = MappingProxyType(
@@ -737,9 +734,6 @@ _DEFAULT_UNINSTALLERS: Mapping[str, PatchUninstaller] = MappingProxyType(
         "Embedding": _uninstall_embedding_route,
         "MatMul": _make_linear_uninstaller("MatMul"),
         "LMHead": _make_linear_uninstaller("LMHead"),
-        "StoreKVCache": _make_attention_uninstaller("StoreKVCache"),
-        "PagedAttentionPrefill": _make_attention_uninstaller("PagedAttentionPrefill"),
-        "PagedAttentionDecode": _make_attention_uninstaller("PagedAttentionDecode"),
     }
 )
 
@@ -763,8 +757,6 @@ def _parse_route_names(
         route_token = route_name.lower()
         if route_token == ALL_ROUTES_TOKEN and available_routes:
             expanded_routes = available_routes
-        elif route_token == THROUGHPUT_ROUTES_TOKEN:
-            expanded_routes = THROUGHPUT_ROUTE_NAMES
         else:
             expanded_routes = ()
         if expanded_routes:

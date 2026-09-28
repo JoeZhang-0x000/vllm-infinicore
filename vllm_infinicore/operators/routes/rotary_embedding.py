@@ -6,7 +6,13 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.model_executor.custom_op import CustomOp, op_registry_oot
+from vllm.model_executor.custom_op import CustomOp
+
+try:
+    from vllm.model_executor.custom_op import op_registry_oot
+except ImportError:
+    op_registry_oot = CustomOp.op_registry_oot
+
 from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbedding as VllmRotaryEmbedding,
 )
@@ -32,6 +38,14 @@ class VllmRotaryEmbeddingUninstallStatus:
 
 class InfiniCoreRotaryEmbedding(VllmRotaryEmbedding):
     """Default Qwen3 RoPE replacement backed by ``vllm_infinicore`` ops."""
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self._forward_method(positions, query, key)
 
     def forward_cuda(
         self,
@@ -81,20 +95,26 @@ class InfiniCoreRotaryEmbedding(VllmRotaryEmbedding):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         try:
             self._match_cos_sin_cache_dtype(query)
+            cos_sin_cache = self.cos_sin_cache
+            if cos_sin_cache.ndim == 4 and cos_sin_cache.shape[:2] == (1, 1):
+                cos_sin_cache = cos_sin_cache[0, 0]
             return torch.ops.vllm_infinicore.rotary_embedding(
                 positions,
                 query,
                 key,
                 self.head_size,
                 self.rotary_dim,
-                self.cos_sin_cache,
+                cos_sin_cache,
                 self.is_neox_style,
             )
         except Exception:
-            from .infinicore_backend import strict_backend_enabled
+            from ..backend import strict_backend_enabled
 
             if strict_backend_enabled():
                 raise
+            # Platform forward overrides may expect a different cache layout.
+            if VllmRotaryEmbedding.forward is not CustomOp.forward:
+                return VllmRotaryEmbedding.forward(self, positions, query, key)
             return super().forward_native(positions, query, key)
 
 

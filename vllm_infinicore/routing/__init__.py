@@ -1,1 +1,1 @@
-"""Routing registry, declarative route config, and vLLM compatibility patches."""
+"""Scoped operator routing for vendor vLLM platforms."""

@@ -91,7 +91,7 @@ def _patched_embedding(
     try:
         return torch.ops.vllm_infinicore.embedding(input_, layer.weight)
     except Exception:
-        from .infinicore_backend import strict_backend_enabled
+        from ..backend import strict_backend_enabled
 
         if strict_backend_enabled():
             raise

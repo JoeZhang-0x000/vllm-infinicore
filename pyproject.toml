@@ -5,24 +5,16 @@ build-backend = "hatchling.build"
 [project]
 name = "vllm-infinicore"
 version = "0.1.0"
-description = "InfiniCore operator integration for vLLM, optimizing adaptation, scheduling, and resource-management overhead on high-frequency calls"
+description = "InfiniCore operator routes for vendor vLLM platforms"
 requires-python = ">=3.10"
-dependencies = [
-    "PyYAML>=6.0",
-]
+dependencies = []
 
 [project.entry-points."vllm.general_plugins"]
 vllm_infinicore = "vllm_infinicore:register"
 
-[project.entry-points."vllm.platform_plugins"]
-infinicore = "vllm_infinicore.device.platform:register_platform"
-
 [tool.hatch.build.targets.wheel]
 packages = ["vllm_infinicore"]
 include = [
-    "AGENTS.md",
-    "configs/*.yaml",
-    "docs/*.md",
     "vllm_infinicore/operators/csrc/*.cpp",
     "vllm_infinicore/operators/ascend/csrc/*",
     "vllm_infinicore/infinicore.lock.json",

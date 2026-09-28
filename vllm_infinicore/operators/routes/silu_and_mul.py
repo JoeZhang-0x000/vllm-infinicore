@@ -6,7 +6,13 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.model_executor.custom_op import CustomOp, op_registry_oot
+from vllm.model_executor.custom_op import CustomOp
+
+try:
+    from vllm.model_executor.custom_op import op_registry_oot
+except ImportError:
+    op_registry_oot = CustomOp.op_registry_oot
+
 from vllm.model_executor.layers.activation import SiluAndMul as VllmSiluAndMul
 
 from ..custom_ops import SILU_AND_MUL_OP, load_custom_ops
@@ -50,7 +56,7 @@ class InfiniCoreSiluAndMul(VllmSiluAndMul):
         try:
             return torch.ops.vllm_infinicore.silu_and_mul(x)
         except Exception:
-            from .infinicore_backend import strict_backend_enabled
+            from ..backend import strict_backend_enabled
 
             if strict_backend_enabled():
                 raise

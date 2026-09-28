@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import logging
 
-from .routing.patching import PatchUninstallSummary, RegistrationResult, get_default_registry
-from .device.detection import ascend_platform_selected
+from .routing.patching import (
+    PatchRegistry,
+    PatchUninstallSummary,
+    RegistrationResult,
+    get_default_registry,
+)
+from .device.detection import selected_platform
 from .device.distributed import register_vllm_environment
-from .routing.runtime_patches import apply_vllm_020_compat_patches, vllm_020_compat_status
 
 logger = logging.getLogger(__name__)
 
 _REGISTERED = False
 _REGISTRATION_RESULT: RegistrationResult | None = None
+_REGISTRY: PatchRegistry | None = None
 
 
 def register() -> RegistrationResult:
@@ -23,32 +28,26 @@ def register() -> RegistrationResult:
     native operators intact and are reported explicitly as native fallback.
     """
 
-    global _REGISTERED, _REGISTRATION_RESULT
+    global _REGISTERED, _REGISTRATION_RESULT, _REGISTRY
 
     if _REGISTERED and _REGISTRATION_RESULT is not None:
         return _REGISTRATION_RESULT
 
     register_vllm_environment()
-    compat_status = (
-        vllm_020_compat_status()
-        if ascend_platform_selected()
-        else apply_vllm_020_compat_patches()
-    )
-
     registry = get_default_registry()
     result = registry.register_from_environment()
 
     _REGISTERED = True
     _REGISTRATION_RESULT = result
+    _REGISTRY = registry
     logger.info(
-        "vllm-infinicore registered: routes=%d patching=%s installed=%s reason=%s",
+        "vllm-infinicore registered: platform=%s routes=%d patching=%s installed=%s reason=%s",
+        selected_platform().name,
         result.route_count,
         "enabled" if result.patching_enabled else "disabled",
         ",".join(result.installed_routes) or "-",
         result.reason,
     )
-    if compat_status.applied:
-        logger.info("vllm-infinicore vLLM 0.20 compatibility patches: %s", compat_status)
     for state in result.route_states:
         if state.fallback_active:
             logger.info("vllm-infinicore %s: native_fallback (%s)", state.name, state.reason)
@@ -58,17 +57,18 @@ def register() -> RegistrationResult:
 def unregister() -> PatchUninstallSummary:
     """Uninstall patches owned by this plugin and reset registration state."""
 
-    global _REGISTERED, _REGISTRATION_RESULT
+    global _REGISTERED, _REGISTRATION_RESULT, _REGISTRY
 
     installed_routes = (
         _REGISTRATION_RESULT.installed_routes
         if _REGISTRATION_RESULT is not None
         else ()
     )
-    registry = get_default_registry()
+    registry = _REGISTRY or get_default_registry()
     result = registry.uninstall_routes(installed_routes)
     _REGISTERED = False
     _REGISTRATION_RESULT = None
+    _REGISTRY = None
     logger.info(
         "vllm-infinicore unregistered: uninstalled=%s skipped=%s reason=%s",
         ",".join(result.uninstalled_routes) or "-",

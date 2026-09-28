@@ -12,13 +12,14 @@ CPP_BRIDGE_ENABLE_ENV = "VLLM_INFINICORE_ENABLE_CPP_BRIDGE"
 CPP_BRIDGE_ROUTES_ENV = "VLLM_INFINICORE_CPP_BRIDGE_ROUTES"
 CPP_BRIDGE_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_CPP_BRIDGE"
 CPP_BRIDGE_TARGET_ENV = "VLLM_INFINICORE_CPP_BRIDGE_TARGET"
-FLASH_DECODE_NUM_SPLITS_ENV = "VLLM_INFINICORE_FLASH_DECODE_NUM_SPLITS"
 
 CUDA_TARGET = "cuda"
 MUSA_TARGET = "musa"
+KUNLUN_TARGET = "kunlun"
 BRIDGE_TARGET_ALIASES = {
     CUDA_TARGET: frozenset({"cuda", "metax", "muxi"}),
     MUSA_TARGET: frozenset({"musa", "moore"}),
+    KUNLUN_TARGET: frozenset({"kunlun", "xpu"}),
 }
 
 DECODE_ROUTE = "PagedAttentionDecode"
@@ -33,39 +34,27 @@ LM_HEAD_ROUTE = "LMHead"
 PREFILL_ROUTE = "PagedAttentionPrefill"
 SUPPORTED_ROUTES = frozenset(
     {
-        DECODE_ROUTE,
-        FLASH_DECODE_ROUTE,
         EMBEDDING_ROUTE,
         MATMUL_ROUTE,
         RMS_NORM_ROUTE,
         SILU_AND_MUL_ROUTE,
         ROPE_ROUTE,
-        STORE_KV_CACHE_ROUTE,
         LM_HEAD_ROUTE,
-        PREFILL_ROUTE,
     }
 )
-DEFAULT_ROUTES = (
-    FLASH_DECODE_ROUTE,
-    MATMUL_ROUTE,
-    STORE_KV_CACHE_ROUTE,
+NATIVE_ATTENTION_ROUTES = frozenset(
+    {DECODE_ROUTE, FLASH_DECODE_ROUTE, STORE_KV_CACHE_ROUTE, PREFILL_ROUTE}
 )
-MUSA_DEFAULT_ROUTES = (
-    DECODE_ROUTE,
+DEFAULT_ROUTES = (MATMUL_ROUTE,)
+MUSA_DEFAULT_ROUTES: tuple[str, ...] = ()
+KUNLUN_VALIDATED_ROUTES = (
     EMBEDDING_ROUTE,
     LM_HEAD_ROUTE,
     MATMUL_ROUTE,
-    PREFILL_ROUTE,
-    RMS_NORM_ROUTE,
     ROPE_ROUTE,
-    SILU_AND_MUL_ROUTE,
-    STORE_KV_CACHE_ROUTE,
 )
-RAY_DEFAULT_ROUTES = (
-    FLASH_DECODE_ROUTE,
-    MATMUL_ROUTE,
-    STORE_KV_CACHE_ROUTE,
-)
+KUNLUN_SUPPORTED_ROUTES = KUNLUN_VALIDATED_ROUTES
+RAY_DEFAULT_ROUTES = (MATMUL_ROUTE,)
 
 _MODULE: Any | None = None
 _LOAD_ERROR: str | None = None
@@ -129,6 +118,8 @@ def _parse_selected_routes() -> tuple[str, ...]:
 
     raw = os.environ.get(CPP_BRIDGE_ROUTES_ENV)
     if raw is None or not raw.strip():
+        if _bridge_target() == KUNLUN_TARGET:
+            return ()
         if _bridge_target() == MUSA_TARGET:
             return MUSA_DEFAULT_ROUTES
         if _env_truthy("VLLM_INFINICORE_RAY_BACKEND"):
@@ -137,12 +128,26 @@ def _parse_selected_routes() -> tuple[str, ...]:
     routes = tuple(route.strip() for route in raw.split(",") if route.strip())
     target = _bridge_target()
     if routes == ("all",):
+        if target == KUNLUN_TARGET:
+            return tuple(sorted(KUNLUN_VALIDATED_ROUTES))
         if target == MUSA_TARGET:
             return tuple(sorted(MUSA_DEFAULT_ROUTES))
         return tuple(sorted(SUPPORTED_ROUTES))
-    unknown = tuple(route for route in routes if route not in SUPPORTED_ROUTES)
+    unknown = tuple(
+        route for route in routes
+        if route not in SUPPORTED_ROUTES and route not in NATIVE_ATTENTION_ROUTES
+    )
     if unknown:
         raise CppBridgeError(f"unsupported C++ bridge route(s): {', '.join(unknown)}")
+    routes = tuple(route for route in routes if route in SUPPORTED_ROUTES)
+    if target == KUNLUN_TARGET:
+        unsupported = tuple(
+            route for route in routes if route not in KUNLUN_SUPPORTED_ROUTES
+        )
+        if unsupported:
+            raise CppBridgeError(
+                f"unsupported Kunlun C++ bridge route(s): {', '.join(unsupported)}"
+            )
     return routes
 
 
@@ -181,21 +186,6 @@ def record_call(route_name: str) -> None:
     _CALL_COUNTS[route_name] = _CALL_COUNTS.get(route_name, 0) + 1
 
 
-def flash_decode_num_splits() -> int:
-    raw = os.environ.get(FLASH_DECODE_NUM_SPLITS_ENV)
-    if raw is None or not raw.strip():
-        return 0
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise CppBridgeError(
-            f"{FLASH_DECODE_NUM_SPLITS_ENV} must be an integer, got {raw!r}"
-        ) from exc
-    if value < 0:
-        raise CppBridgeError(f"{FLASH_DECODE_NUM_SPLITS_ENV} must be >= 0")
-    return value
-
-
 def _compile_bridge() -> Any:
     from torch.utils.cpp_extension import load
 
@@ -213,7 +203,7 @@ def _compile_bridge() -> Any:
 def _bridge_build_config() -> dict[str, Any]:
     source = Path(__file__).resolve().parent / "csrc" / "infinicore_bridge.cpp"
     infini_root = Path(os.environ.get("INFINI_ROOT", str(Path.home() / ".infini")))
-    maca_path = Path(os.environ.get("MACA_PATH", "/opt/maca-3.5.3"))
+    infini_lib_dir = Path(os.environ.get("INFINI_LIB_DIR", str(infini_root / "lib")))
     target = _bridge_target()
 
     include_paths = [str(infini_root / "include")]
@@ -222,8 +212,8 @@ def _bridge_build_config() -> dict[str, Any]:
         "-DINFINICORE_HPCC_VERSION_MAJOR=3",
     ]
     ldflags = [
-        f"-L{infini_root / 'lib'}",
-        f"-Wl,-rpath,{infini_root / 'lib'}",
+        f"-L{infini_lib_dir}",
+        f"-Wl,-rpath,{infini_lib_dir}",
         "-linfinicore_cpp_api",
         "-linfiniop",
         "-linfinirt",
@@ -238,22 +228,20 @@ def _bridge_build_config() -> dict[str, Any]:
         cflags.extend(["-DENABLE_MUSA_API", "-DENABLE_MOORE_API"])
         include_paths.extend(str(path) for path in _musa_include_paths())
         ldflags.extend(str(flag) for flag in _musa_link_flags())
-    else:
-        cflags.extend(["-DENABLE_FLASH_ATTN", "-DENABLE_METAX_API"])
-        ldflags.extend(
-            [
-                os.environ.get(
-                    "FLASH_ATTN_2_CUDA_SO",
-                    "/opt/conda/lib/python3.12/site-packages/"
-                    "flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so",
-                ),
-                f"-Wl,-rpath,{maca_path / 'lib'}",
-                f"-Wl,-rpath,{maca_path / 'lib64'}",
-            ]
+    elif target == KUNLUN_TARGET:
+        cflags.extend(["-DENABLE_CUDA_API", "-DENABLE_KUNLUN_API"])
+        include_paths.append(
+            str(Path(os.environ.get("XPU_HOME", "/usr/local/xpu")) / "include")
         )
+    else:
+        cflags.append("-DENABLE_METAX_API")
 
     return {
-        "name": "vllm_infinicore_cpp_bridge",
+        "name": (
+            "vllm_infinicore_kunlun_cpp_bridge"
+            if target == KUNLUN_TARGET
+            else "vllm_infinicore_cpp_bridge"
+        ),
         "sources": [str(source)],
         "extra_include_paths": _dedupe(include_paths),
         "extra_cflags": _dedupe(cflags),
@@ -264,8 +252,8 @@ def _bridge_build_config() -> dict[str, Any]:
 
 def _bridge_target() -> str:
     # Resolved once per distinct override value. The auto-detected target is a
-    # machine property, and probing it ran once per decode attention call, which
-    # cost more host time than the bridge kernel launches themselves.
+    # machine property, so repeated device probing in hot operator paths adds
+    # avoidable host overhead.
     raw = os.environ.get(CPP_BRIDGE_TARGET_ENV)
     key = raw.strip() if raw is not None else ""
     cached = _BRIDGE_TARGET_CACHE.get(key)
