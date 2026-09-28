@@ -10,8 +10,7 @@ from .routing.patching import (
     RegistrationResult,
     get_default_registry,
 )
-from .device.detection import selected_platform
-from .device.distributed import register_vllm_environment
+from .operators.selection import selected_backend
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +23,8 @@ def register() -> RegistrationResult:
     """Register the plugin with vLLM.
 
     vLLM calls this function with no arguments from the
-    ``vllm.general_plugins`` entry point. Unsupported platform adapters leave
-    native operators intact and are reported explicitly as native fallback.
+    ``vllm.general_plugins`` entry point. Missing operator implementations
+    leave native operators intact and are reported as native fallback.
     """
 
     global _REGISTERED, _REGISTRATION_RESULT, _REGISTRY
@@ -33,7 +32,6 @@ def register() -> RegistrationResult:
     if _REGISTERED and _REGISTRATION_RESULT is not None:
         return _REGISTRATION_RESULT
 
-    register_vllm_environment()
     registry = get_default_registry()
     result = registry.register_from_environment()
 
@@ -41,8 +39,8 @@ def register() -> RegistrationResult:
     _REGISTRATION_RESULT = result
     _REGISTRY = registry
     logger.info(
-        "vllm-infinicore registered: platform=%s routes=%d patching=%s installed=%s reason=%s",
-        selected_platform().name,
+        "vllm-infinicore registered: operator_backend=%s routes=%d patching=%s installed=%s reason=%s",
+        selected_backend() or "unset",
         result.route_count,
         "enabled" if result.patching_enabled else "disabled",
         ",".join(result.installed_routes) or "-",

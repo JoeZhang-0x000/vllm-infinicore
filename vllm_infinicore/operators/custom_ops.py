@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import os
 from typing import Any
 
+from .selection import selected_backend
+
 CUSTOM_OP_ENABLE_ENV = "VLLM_INFINICORE_ENABLE_CUSTOM_OPS"
 RMS_NORM_OP = "vllm_infinicore::rms_norm"
 FUSED_ADD_RMS_NORM_OP = "vllm_infinicore::fused_add_rms_norm"
@@ -60,6 +62,17 @@ def load_custom_ops(
         return CustomOpStatus(
             available=False,
             reason=f"{CUSTOM_OP_ENABLE_ENV} is unset or false; custom ops disabled",
+            registered_ops=_REGISTERED_OPS,
+        )
+
+    backend = selected_backend()
+    if backend not in {"cuda", "metax", "kunlun"}:
+        return CustomOpStatus(
+            available=False,
+            reason=(
+                "torch custom op wrappers require a CUDA, MetaX, or Kunlun "
+                "operator backend; Ascend uses its own route adapters"
+            ),
             registered_ops=_REGISTERED_OPS,
         )
 

@@ -1,12 +1,9 @@
-"""Opt-in Qwen3 operator routes layered over vendor vLLM platform plugins.
-
-The vendor platform owns device, worker, attention, and KV cache behavior.
-This module installs only supported non-attention routes.
-"""
+"""Opt-in Qwen3 operator forwarding with native attention and KV cache."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import import_module
 import os
 from types import MappingProxyType
 from typing import Callable, Mapping
@@ -173,25 +170,25 @@ QWEN3_OPERATOR_ROUTES: tuple[OperatorRoute, ...] = (
     OperatorRoute(
         name="StoreKVCache",
         category="kv-cache",
-        implementation="native_platform",
+        implementation="native_vllm",
         default_enabled=False,
-        graph_policy="native_platform",
+        graph_policy="native_vllm",
         native_fallback="vLLM native KV cache store path",
     ),
     OperatorRoute(
         name="PagedAttentionPrefill",
         category="paged-attention",
-        implementation="native_platform",
+        implementation="native_vllm",
         default_enabled=False,
-        graph_policy="native_platform",
+        graph_policy="native_vllm",
         native_fallback="vLLM native paged attention prefill backend",
     ),
     OperatorRoute(
         name="PagedAttentionDecode",
         category="paged-attention",
-        implementation="native_platform",
+        implementation="native_vllm",
         default_enabled=False,
-        graph_policy="native_platform",
+        graph_policy="native_vllm",
         native_fallback="vLLM native paged attention decode backend",
     ),
 )
@@ -217,10 +214,8 @@ class PatchRegistry:
         native_fallback_reasons: Mapping[str, str] | None = None,
     ) -> None:
         self._routes = {route.name: route for route in routes}
-        self._installers = dict(_DEFAULT_INSTALLERS if installers is None else installers)
-        self._uninstallers = dict(
-            _DEFAULT_UNINSTALLERS if uninstallers is None else uninstallers
-        )
+        self._installers = dict(installers or {})
+        self._uninstallers = dict(uninstallers or {})
         self._native_fallback_reasons = dict(native_fallback_reasons or {})
 
     @property
@@ -378,7 +373,7 @@ class PatchRegistry:
                         requested=True,
                         disabled_by_env=False,
                         status=ROUTE_STATE_NATIVE_FALLBACK,
-                        reason="v1 keeps attention and KV cache on the vendor platform",
+                        reason="v1 keeps attention and KV cache on native vLLM operators",
                     )
                 )
                 continue
@@ -564,24 +559,24 @@ class PatchRegistry:
 def get_default_registry() -> PatchRegistry:
     from dataclasses import replace
 
-    from ..device.detection import selected_platform
+    from ..operators.selection import OPERATOR_BACKEND_ENV, selected_backend
 
-    # The vendor vLLM plugin owns the platform. This general plugin only
-    # chooses its operator adapter for that already-selected platform.
-    platform = selected_platform().name
-    vendor_names = {
-        "ascend": "vLLM-Ascend",
-        "metax": "vLLM-MetaX",
-        "kunlun": "vLLM-Kunlun",
-    }
-    vendor = vendor_names.get(platform, "vLLM")
-    supported = set(NON_ATTENTION_ROUTES)
-    if platform == "ascend":
-        if not os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-            supported.clear()
-    elif platform == "kunlun":
-        supported &= {"RoPE", "Embedding", "MatMul", "LMHead"}
-    elif platform != "metax":
+    backend_name = selected_backend()
+    adapter = (
+        import_module(f"..operators.{backend_name}", __package__)
+        if backend_name is not None
+        else None
+    )
+    supported = set(adapter.SUPPORTED_ROUTES) if adapter is not None else set()
+    unsupported = supported.difference(NON_ATTENTION_ROUTES)
+    if unsupported:
+        raise ValueError(
+            f"operator backend {backend_name} declares unsupported routes: "
+            + ", ".join(sorted(unsupported))
+        )
+    if backend_name == "ascend" and not os.environ.get(
+        "VLLM_INFINICORE_ASCEND_LIBRARY"
+    ):
         supported.clear()
 
     fallback_reasons = {}
@@ -589,155 +584,55 @@ def get_default_registry() -> PatchRegistry:
         if route.name in supported:
             continue
         if route.name in NATIVE_ATTENTION_ROUTES:
-            reason = "v1 keeps attention and KV cache on the vendor platform"
-        elif platform == "ascend" and not os.environ.get(
+            reason = "v1 keeps attention and KV cache on native vLLM operators"
+        elif backend_name is None:
+            reason = f"{OPERATOR_BACKEND_ENV} is unset"
+        elif backend_name == "ascend" and not os.environ.get(
             "VLLM_INFINICORE_ASCEND_LIBRARY"
         ):
             reason = "VLLM_INFINICORE_ASCEND_LIBRARY is unset"
         else:
-            reason = f"{vendor} operator adapter is unavailable on this platform"
+            reason = f"{backend_name} operator adapter does not support this route"
         fallback_reasons[route.name] = reason
 
-    if platform == "ascend":
+    def installer(name: str) -> PatchInstaller:
+        def install() -> PatchInstallResult:
+            routes = import_module(f"..operators.{backend_name}.routes", __package__)
+            status = routes.install(name)
+            return PatchInstallResult(status.installed, status.reason)
 
-        def installer(name: str) -> PatchInstaller:
-            def install() -> PatchInstallResult:
-                from ..operators.ascend.routes import install
+        return install
 
-                return install(name)
+    def uninstaller(name: str) -> PatchUninstaller:
+        def uninstall() -> PatchUninstallResult:
+            routes = import_module(f"..operators.{backend_name}.routes", __package__)
+            status = routes.uninstall(name)
+            return PatchUninstallResult(status.uninstalled, status.reason)
 
-            return install
-
-        def uninstaller(name: str) -> PatchUninstaller:
-            def uninstall() -> PatchUninstallResult:
-                from ..operators.ascend.routes import uninstall
-
-                return uninstall(name)
-
-            return uninstall
-
-        installers = {name: installer(name) for name in supported}
-        uninstallers = {name: uninstaller(name) for name in supported}
-    else:
-        installers = {name: _DEFAULT_INSTALLERS[name] for name in supported}
-        uninstallers = {name: _DEFAULT_UNINSTALLERS[name] for name in supported}
+        return uninstall
 
     routes = tuple(
         replace(
             route,
-            native_fallback=f"{vendor} native {route.name}",
-            implementation="ascend_class_adapter"
-            if platform == "ascend" and route.name in supported
-            else route.implementation,
-            graph_policy="ascend_graph_capturable"
-            if platform == "ascend" and route.name in supported
-            else ("native_platform" if route.name not in supported else route.graph_policy),
+            implementation=(
+                f"{backend_name}_operator_adapter"
+                if route.name in supported
+                else "native_vllm"
+            ),
+            graph_policy=(
+                adapter.GRAPH_POLICY
+                if route.name in supported
+                else "native_vllm"
+            ),
         )
         for route in QWEN3_OPERATOR_ROUTES
     )
     return PatchRegistry(
         routes,
-        installers=installers,
-        uninstallers=uninstallers,
+        installers={name: installer(name) for name in supported},
+        uninstallers={name: uninstaller(name) for name in supported},
         native_fallback_reasons=fallback_reasons,
     )
-
-def _install_rms_norm_route() -> PatchInstallResult:
-    from ..operators.routes.rms_norm import install_vllm_rms_norm_oot
-
-    status = install_vllm_rms_norm_oot()
-    return PatchInstallResult(installed=status.installed, reason=status.reason)
-
-
-def _uninstall_rms_norm_route() -> PatchUninstallResult:
-    from ..operators.routes.rms_norm import uninstall_vllm_rms_norm_oot
-
-    status = uninstall_vllm_rms_norm_oot()
-    return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
-
-
-def _install_silu_and_mul_route() -> PatchInstallResult:
-    from ..operators.routes.silu_and_mul import install_vllm_silu_and_mul_oot
-
-    status = install_vllm_silu_and_mul_oot()
-    return PatchInstallResult(installed=status.installed, reason=status.reason)
-
-
-def _uninstall_silu_and_mul_route() -> PatchUninstallResult:
-    from ..operators.routes.silu_and_mul import uninstall_vllm_silu_and_mul_oot
-
-    status = uninstall_vllm_silu_and_mul_oot()
-    return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
-
-
-def _install_rotary_embedding_route() -> PatchInstallResult:
-    from ..operators.routes.rotary_embedding import install_vllm_rotary_embedding_oot
-
-    status = install_vllm_rotary_embedding_oot()
-    return PatchInstallResult(installed=status.installed, reason=status.reason)
-
-
-def _uninstall_rotary_embedding_route() -> PatchUninstallResult:
-    from ..operators.routes.rotary_embedding import uninstall_vllm_rotary_embedding_oot
-
-    status = uninstall_vllm_rotary_embedding_oot()
-    return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
-
-
-def _install_embedding_route() -> PatchInstallResult:
-    from ..operators.routes.embedding import install_vllm_unquantized_embedding_route
-
-    status = install_vllm_unquantized_embedding_route()
-    return PatchInstallResult(installed=status.installed, reason=status.reason)
-
-
-def _uninstall_embedding_route() -> PatchUninstallResult:
-    from ..operators.routes.embedding import uninstall_vllm_unquantized_embedding_route
-
-    status = uninstall_vllm_unquantized_embedding_route()
-    return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
-
-
-def _make_linear_installer(route_name: str) -> PatchInstaller:
-    def installer() -> PatchInstallResult:
-        from ..operators.routes.linear import install_vllm_unquantized_linear_route
-
-        status = install_vllm_unquantized_linear_route(route_name)
-        return PatchInstallResult(installed=status.installed, reason=status.reason)
-
-    return installer
-
-
-def _make_linear_uninstaller(route_name: str) -> PatchUninstaller:
-    def uninstaller() -> PatchUninstallResult:
-        from ..operators.routes.linear import uninstall_vllm_unquantized_linear_route
-
-        status = uninstall_vllm_unquantized_linear_route(route_name)
-        return PatchUninstallResult(uninstalled=status.uninstalled, reason=status.reason)
-
-    return uninstaller
-
-
-_DEFAULT_INSTALLERS: Mapping[str, PatchInstaller] = MappingProxyType(
-    {
-        "RMSNorm": _install_rms_norm_route,
-        "SiluAndMul": _install_silu_and_mul_route,
-        "RoPE": _install_rotary_embedding_route,
-        "Embedding": _install_embedding_route,
-        "MatMul": _make_linear_installer("MatMul"),
-        "LMHead": _make_linear_installer("LMHead"),
-    }
-)
-_DEFAULT_UNINSTALLERS: Mapping[str, PatchUninstaller] = MappingProxyType(
-    {
-        "RMSNorm": _uninstall_rms_norm_route,
-        "SiluAndMul": _uninstall_silu_and_mul_route,
-        "RoPE": _uninstall_rotary_embedding_route,
-        "Embedding": _uninstall_embedding_route,
-        "MatMul": _make_linear_uninstaller("MatMul"),
-        "LMHead": _make_linear_uninstaller("LMHead"),
-    }
-)
 
 
 def _env_truthy(name: str) -> bool:

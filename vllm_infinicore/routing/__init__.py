@@ -1,1 +1,1 @@
-"""Scoped operator routing for vendor vLLM platforms."""
+"""Scoped operator forwarding for vLLM."""

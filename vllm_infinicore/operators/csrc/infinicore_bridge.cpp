@@ -2,7 +2,7 @@
 
 #if defined(ENABLE_KUNLUN_API)
 #include <c10/cuda/CUDAStream.h>
-#elif defined(ENABLE_METAX_API)
+#elif defined(ENABLE_METAX_API) || defined(ENABLE_NVIDIA_API)
 #include <ATen/cuda/CUDAContext.h>
 #endif
 #include <infiniop/ops/embedding.h>
@@ -50,12 +50,14 @@ infinicore::DataType dtype_from_torch(const at::Tensor &tensor) {
 
 infinicore::Device device_from_torch(const at::Tensor &tensor) {
     auto index = tensor.device().index();
-#if defined(ENABLE_METAX_API) || defined(ENABLE_KUNLUN_API)
+#if defined(ENABLE_METAX_API) || defined(ENABLE_NVIDIA_API) || defined(ENABLE_KUNLUN_API)
     if (tensor.is_cuda()) {
 #if defined(ENABLE_KUNLUN_API)
         return infinicore::Device(infinicore::Device::Type::KUNLUN,
-#else
+#elif defined(ENABLE_METAX_API)
         return infinicore::Device(infinicore::Device::Type::METAX,
+#else
+        return infinicore::Device(infinicore::Device::Type::NVIDIA,
 #endif
                                   index < 0 ? 0 : static_cast<size_t>(index));
     }
@@ -70,7 +72,7 @@ void *current_stream_from_torch(const at::Tensor &tensor) {
     if (tensor.is_cuda()) {
         return c10::cuda::getCurrentCUDAStream(device_index).stream();
     }
-#elif defined(ENABLE_METAX_API)
+#elif defined(ENABLE_METAX_API) || defined(ENABLE_NVIDIA_API)
     if (tensor.is_cuda()) {
         return at::cuda::getCurrentCUDAStream(device_index).stream();
     }

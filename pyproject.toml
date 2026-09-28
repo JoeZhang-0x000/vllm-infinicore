@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "vllm-infinicore"
 version = "0.1.0"
-description = "InfiniCore operator routes for vendor vLLM platforms"
+description = "InfiniCore operator forwarding for vLLM"
 requires-python = ">=3.10"
 dependencies = []
 

@@ -1,4 +1,4 @@
-"""InfiniCore Python API adapters for torch-backed vLLM routes.
+"""Shared InfiniCore Python helpers for CUDA-like operator implementations.
 
 These helpers bridge torch tensors to the installed ``infinicore`` Python
 package, whose public functional APIs call the underlying ``_infinicore``
@@ -19,15 +19,8 @@ import torch.nn.functional as F
 
 REAL_BACKEND_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_REAL_BACKEND"
 STRICT_BACKEND_ENV = "VLLM_INFINICORE_STRICT_BACKEND"
-ASCEND_TENSOR_BRIDGE_UNAVAILABLE = (
-    "InfiniCore NPU adapter is not supported without "
-    "VLLM_INFINICORE_ASCEND_LIBRARY; using native NPU ops"
-)
-
 logger = logging.getLogger(__name__)
 _CALL_COUNTS: dict[str, int] = {}
-_FALLBACK_COUNTS: dict[str, int] = {}
-_FALLBACK_REASONS: dict[str, str] = {}
 _FUSED_ADD_RMS_NORM_SUPPORTED: bool | None = None
 _DEFAULT_DEVICE_INDEX_SET: int | None = None
 _PY_CAPSULE_GET_POINTER: Any | None = None
@@ -42,13 +35,8 @@ _ROPE_TABLE_CACHE: OrderedDict[
 
 
 def rms_norm(input_tensor: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    if input_tensor.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from .ascend import backend as ascend_backend
-        return ascend_backend.execute("rms_norm", input_tensor,
-            lambda: ascend_backend.rms_norm(input_tensor, weight, eps), lambda: _rms_norm_torch(input_tensor, weight, eps))
     return _route_or_fallback(
-        "rms_norm",
-        input_tensor,
+        "rms_norm", input_tensor,
         lambda: _rms_norm_infinicore(input_tensor, weight, eps),
         lambda: _rms_norm_torch(input_tensor, weight, eps),
     )
@@ -60,29 +48,20 @@ def fused_add_rms_norm(
     weight: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Counted separately from the plain norm: both belong to the RMSNorm route,
-    # but a shared counter cannot show whether the fused path is actually live,
-    # and these counters are the only evidence that a route reaches the hot path.
     if _should_use_infinicore(input_tensor) and not fused_add_rms_norm_supported(
         input_tensor, residual, weight, eps
     ):
         return _fused_add_rms_norm_torch(input_tensor, residual, weight, eps)
     return _route_or_fallback(
-        "fused_add_rms_norm",
-        input_tensor,
+        "fused_add_rms_norm", input_tensor,
         lambda: _fused_add_rms_norm_infinicore(input_tensor, residual, weight, eps),
         lambda: _fused_add_rms_norm_torch(input_tensor, residual, weight, eps),
     )
 
 
 def silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
-    if input_tensor.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from .ascend import backend as ascend_backend
-        return ascend_backend.execute("silu_and_mul", input_tensor,
-            lambda: ascend_backend.silu_and_mul(input_tensor), lambda: _silu_and_mul_torch(input_tensor))
     return _route_or_fallback(
-        "silu_and_mul",
-        input_tensor,
+        "silu_and_mul", input_tensor,
         lambda: _silu_and_mul_infinicore(input_tensor),
         lambda: _silu_and_mul_torch(input_tensor),
     )
@@ -93,13 +72,8 @@ def linear(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if input_tensor.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from .ascend import backend as ascend_backend
-        return ascend_backend.execute("linear", input_tensor,
-            lambda: ascend_backend.linear(input_tensor, weight, bias), lambda: F.linear(input_tensor, weight, bias))
     return _route_or_fallback(
-        "linear",
-        input_tensor,
+        "linear", input_tensor,
         lambda: _linear_infinicore(input_tensor, weight, bias),
         lambda: F.linear(input_tensor, weight, bias),
     )
@@ -110,26 +84,16 @@ def lm_head(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if input_tensor.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from .ascend import backend as ascend_backend
-        return ascend_backend.execute("lm_head", input_tensor,
-            lambda: ascend_backend.linear(input_tensor, weight, bias), lambda: F.linear(input_tensor, weight, bias))
     return _route_or_fallback(
-        "lm_head",
-        input_tensor,
+        "lm_head", input_tensor,
         lambda: _lm_head_infinicore(input_tensor, weight, bias),
         lambda: F.linear(input_tensor, weight, bias),
     )
 
 
 def embedding(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    if input_tensor.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from .ascend import backend as ascend_backend
-        return ascend_backend.execute("embedding", input_tensor,
-            lambda: ascend_backend.embedding(input_tensor, weight), lambda: F.embedding(input_tensor.long(), weight))
     return _route_or_fallback(
-        "embedding",
-        input_tensor,
+        "embedding", input_tensor,
         lambda: _embedding_infinicore(input_tensor, weight),
         lambda: F.embedding(input_tensor.long(), weight),
     )
@@ -144,41 +108,18 @@ def rotary_embedding(
     cos_sin_cache: torch.Tensor,
     is_neox_style: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if query.device.type == "npu" and os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
-        from .ascend import backend as ascend_backend
-        return ascend_backend.execute(
-            "rotary_embedding", query,
-            lambda: ascend_backend.rotary_embedding(
-                positions, query, key, head_size, rotary_dim, cos_sin_cache, is_neox_style),
-            lambda: _rotary_embedding_torch(
-                positions, query, key, head_size, rotary_dim, cos_sin_cache, is_neox_style))
+    args = (
+        positions, query, key, head_size, rotary_dim, cos_sin_cache,
+        is_neox_style,
+    )
     return _route_or_fallback(
-        "rotary_embedding",
-        query,
-        lambda: _rotary_embedding_infinicore(
-            positions,
-            query,
-            key,
-            head_size,
-            rotary_dim,
-            cos_sin_cache,
-            is_neox_style,
-        ),
-        lambda: _rotary_embedding_torch(
-            positions,
-            query,
-            key,
-            head_size,
-            rotary_dim,
-            cos_sin_cache,
-            is_neox_style,
-        ),
+        "rotary_embedding", query,
+        lambda: _rotary_embedding_infinicore(*args),
+        lambda: _rotary_embedding_torch(*args),
     )
 
 
 def real_backend_enabled(reference_tensor: torch.Tensor) -> bool:
-    if reference_tensor.device.type == "npu":
-        return bool(os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY")) and not _env_truthy(REAL_BACKEND_DISABLE_ENV)
     return _should_use_infinicore(reference_tensor)
 
 
@@ -186,20 +127,8 @@ def backend_call_counts() -> dict[str, int]:
     return dict(_CALL_COUNTS)
 
 
-def backend_fallback_counts() -> dict[str, int]:
-    """Calls deliberately kept on native NPU ops by the capability gate."""
-
-    return dict(_FALLBACK_COUNTS)
-
-
-def backend_fallback_reasons() -> dict[str, str]:
-    return dict(_FALLBACK_REASONS)
-
-
 def reset_backend_call_counts() -> None:
     _CALL_COUNTS.clear()
-    _FALLBACK_COUNTS.clear()
-    _FALLBACK_REASONS.clear()
     try:
         from . import cpp_bridge
 
@@ -225,9 +154,6 @@ def _route_or_fallback(
     call_torch: Callable[[], Any],
 ) -> Any:
     if not _should_use_infinicore(reference_tensor):
-        if reference_tensor.device.type == "npu":
-            _FALLBACK_COUNTS[op_name] = _FALLBACK_COUNTS.get(op_name, 0) + 1
-            _FALLBACK_REASONS[op_name] = ASCEND_TENSOR_BRIDGE_UNAVAILABLE
         return call_torch()
 
     _set_default_device_index(reference_tensor)
@@ -276,12 +202,11 @@ def _set_default_device_index(tensor: torch.Tensor) -> None:
 
 
 def _should_use_infinicore(tensor: torch.Tensor) -> bool:
-    # This predicate selects the existing CUDA-compatible torch bridge. Supported
-    # NPU entry points dispatch separately through ascend_backend's C API;
-    # remaining direct NPU calls use their explicit native fallback.
+    from .selection import selected_backend
+
     return (
-        _is_accelerator_tensor(tensor)
-        and tensor.device.type != "npu"
+        selected_backend() in {"cuda", "metax", "kunlun"}
+        and _is_accelerator_tensor(tensor)
         and not _env_truthy(REAL_BACKEND_DISABLE_ENV)
     )
 
@@ -346,7 +271,7 @@ def _as_infini_strided(tensor: torch.Tensor) -> Any:
         list(tensor.shape),
         list(tensor.stride()),
         dtype=to_infinicore_dtype(tensor.dtype),
-        device=infinicore.device(_infinicore_device_type(tensor), device_index),
+        device=infinicore.device(_torch_device_type(tensor), device_index),
     )
 
 
@@ -486,7 +411,7 @@ def _set_infinicore_device(tensor: torch.Tensor) -> None:
 
         device_index = tensor.device.index if tensor.device.index is not None else 0
         infinicore.set_device(
-            infinicore.device(_infinicore_device_type(tensor), device_index)
+            infinicore.device(_torch_device_type(tensor), device_index)
         )
     except Exception:
         return
@@ -507,22 +432,19 @@ def _is_graph_capturing(reference_tensor: torch.Tensor) -> bool:
 def _is_accelerator_tensor(tensor: torch.Tensor) -> bool:
     device = getattr(tensor, "device", None)
     device_type = getattr(device, "type", "")
-    return (
-        bool(getattr(tensor, "is_cuda", False))
-        or device_type in {"cuda", "npu"}
-    )
+    return bool(getattr(tensor, "is_cuda", False)) or device_type == "cuda"
 
 
 def _torch_device_api(tensor: torch.Tensor) -> Any | None:
     device_type = getattr(getattr(tensor, "device", None), "type", "")
-    if device_type == "npu":
-        return getattr(torch, "npu", None)
     if bool(getattr(tensor, "is_cuda", False)) or device_type == "cuda":
         return getattr(torch, "cuda", None)
     return None
 
 
-def _infinicore_device_type(tensor: torch.Tensor) -> str:
+def _torch_device_type(tensor: torch.Tensor) -> str:
+    # InfiniCore's Python tensor adaptor uses torch device names. The C++
+    # bridge selects NVIDIA, METAX, or KUNLUN independently of this name.
     return getattr(getattr(tensor, "device", None), "type", "")
 
 
@@ -580,9 +502,8 @@ def fused_add_rms_norm_supported(
     """Whether this device has a fused add + RMSNorm kernel, probed once.
 
     ``infiniopAddRMSNorm`` is not registered for every backend that registers
-    plain ``infiniopRMSNorm`` -- Ascend is the current example. A device with no
-    kernel is a capability fact, not a failure, so it must not fail a strict
-    run; it falls back for the life of the process instead.
+    plain ``infiniopRMSNorm``. A device with no kernel is a capability fact,
+    so residual calls use the native fallback for the life of the process.
 
     Probed from inside the custom op, where the tensors are real. Probing from
     ``_should_use_infinicore`` would run under torch.compile tracing on fake
@@ -627,7 +548,7 @@ def fused_add_rms_norm_supported(
 
 
 def reset_fused_add_rms_norm_support() -> None:
-    """Forget the probed capability. For tests."""
+    """Forget the probed capability."""
 
     global _FUSED_ADD_RMS_NORM_SUPPORTED
 
