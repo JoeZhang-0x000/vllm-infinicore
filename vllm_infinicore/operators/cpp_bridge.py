@@ -36,6 +36,9 @@ SUPPORTED_ROUTES = frozenset(
         SILU_AND_MUL_ROUTE,
         ROPE_ROUTE,
         LM_HEAD_ROUTE,
+        STORE_KV_CACHE_ROUTE,
+        PREFILL_ROUTE,
+        DECODE_ROUTE,
     }
 )
 NATIVE_ATTENTION_ROUTES = frozenset(
@@ -115,6 +118,13 @@ def _parse_selected_routes() -> tuple[str, ...]:
         return config.DEFAULT_ROUTES
 
     routes = tuple(route.strip() for route in raw.split(",") if route.strip())
+    if "recommended" in routes:
+        from ..routing.policy import recommended_routes
+        routes = tuple(dict.fromkeys(
+            item for route in routes
+            for item in (recommended_routes(bridge_target())
+                         if route == "recommended" else (route,))
+        ))
     if routes == ("all",):
         return tuple(sorted(config.SUPPORTED_ROUTES))
     unknown = tuple(

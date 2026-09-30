@@ -1,4 +1,4 @@
-"""Opt-in Qwen3 operator forwarding with native attention and KV cache."""
+"""Opt-in Qwen3 operator forwarding, including paged attention and KV cache."""
 
 from __future__ import annotations
 
@@ -193,12 +193,12 @@ QWEN3_OPERATOR_ROUTES: tuple[OperatorRoute, ...] = (
     ),
 )
 
-NATIVE_ATTENTION_ROUTES = frozenset(
+ATTENTION_ROUTES = frozenset(
     {"StoreKVCache", "PagedAttentionPrefill", "PagedAttentionDecode"}
 )
 NON_ATTENTION_ROUTES = tuple(
     route.name for route in QWEN3_OPERATOR_ROUTES
-    if route.name not in NATIVE_ATTENTION_ROUTES
+    if route.name not in ATTENTION_ROUTES
 )
 
 
@@ -361,19 +361,6 @@ class PatchRegistry:
                         disabled_by_env=False,
                         status=ROUTE_STATE_NATIVE_FALLBACK,
                         reason=unsupported_reason,
-                    )
-                )
-                continue
-
-            if route_name in NATIVE_ATTENTION_ROUTES:
-                skipped_routes.append(route_name)
-                route_states.append(
-                    self._route_state(
-                        route,
-                        requested=True,
-                        disabled_by_env=False,
-                        status=ROUTE_STATE_NATIVE_FALLBACK,
-                        reason="v1 keeps attention and KV cache on native vLLM operators",
                     )
                 )
                 continue
@@ -568,7 +555,7 @@ def get_default_registry() -> PatchRegistry:
         else None
     )
     supported = set(adapter.SUPPORTED_ROUTES) if adapter is not None else set()
-    unsupported = supported.difference(NON_ATTENTION_ROUTES)
+    unsupported = supported.difference(route.name for route in QWEN3_OPERATOR_ROUTES)
     if unsupported:
         raise ValueError(
             f"operator backend {backend_name} declares unsupported routes: "
@@ -583,9 +570,7 @@ def get_default_registry() -> PatchRegistry:
     for route in QWEN3_OPERATOR_ROUTES:
         if route.name in supported:
             continue
-        if route.name in NATIVE_ATTENTION_ROUTES:
-            reason = "v1 keeps attention and KV cache on native vLLM operators"
-        elif backend_name is None:
+        if backend_name is None:
             reason = f"{OPERATOR_BACKEND_ENV} is unset"
         elif backend_name == "ascend" and not os.environ.get(
             "VLLM_INFINICORE_ASCEND_LIBRARY"
@@ -654,6 +639,10 @@ def _parse_route_names(
         route_token = route_name.lower()
         if route_token == ALL_ROUTES_TOKEN and available_routes:
             expanded_routes = available_routes
+        elif route_token == "recommended":
+            from ..operators.selection import selected_backend
+            from .policy import recommended_routes
+            expanded_routes = recommended_routes(selected_backend())
         else:
             expanded_routes = ()
         if expanded_routes:

@@ -5,6 +5,9 @@
 #elif defined(ENABLE_METAX_API) || defined(ENABLE_NVIDIA_API)
 #include <ATen/cuda/CUDAContext.h>
 #endif
+#include <infiniop/ops/paged_caching.h>
+#include <infiniop/ops/paged_attention.h>
+#include <infiniop/ops/paged_attention_prefill.h>
 #include <infiniop/ops/embedding.h>
 #include <infiniop/ops/gemm.h>
 #include <infiniop/ops/add_rms_norm.h>
@@ -567,7 +570,242 @@ at::Tensor rope_current_stream(at::Tensor input,
     return out;
 }
 
+void store_kv_cache_current_stream(at::Tensor key_cache,
+                                   at::Tensor value_cache,
+                                   at::Tensor key,
+                                   at::Tensor value,
+                                   at::Tensor slot_mapping) {
+    auto flat_slots = slot_mapping.flatten();
+    auto k_cache_tensor = wrap_strided(key_cache);
+    auto v_cache_tensor = wrap_strided(value_cache);
+    auto key_tensor = wrap_strided(key);
+    auto value_tensor = wrap_strided(value);
+    auto slot_tensor = wrap_strided(flat_slots);
+
+    infiniopPagedCachingDescriptor_t desc = nullptr;
+    auto handle = infinicore::context::getInfiniopHandle(device_from_torch(key));
+    check_infini_status(
+        infiniopCreatePagedCachingDescriptor(
+            handle,
+            &desc,
+            k_cache_tensor->desc(),
+            v_cache_tensor->desc(),
+            key_tensor->desc(),
+            value_tensor->desc(),
+            slot_tensor->desc()),
+        "infiniopCreatePagedCachingDescriptor");
+
+    size_t workspace_size = 0;
+    try {
+        check_infini_status(
+            infiniopGetPagedCachingWorkspaceSize(desc, &workspace_size),
+            "infiniopGetPagedCachingWorkspaceSize");
+        at::Tensor workspace;
+        void *workspace_ptr = nullptr;
+        if (workspace_size > 0) {
+            workspace = at::empty(
+                {static_cast<int64_t>(workspace_size)},
+                key.options().dtype(at::kByte));
+            workspace_ptr = workspace.data_ptr();
+        }
+        void *stream = current_stream_from_torch(key);
+        check_infini_status(
+            infiniopPagedCaching(
+                desc,
+                workspace_ptr,
+                workspace_size,
+                key_cache.data_ptr(),
+                value_cache.data_ptr(),
+                key.data_ptr(),
+                value.data_ptr(),
+                flat_slots.data_ptr(),
+                stream),
+            "infiniopPagedCaching");
+    } catch (...) {
+        infiniopDestroyPagedCachingDescriptor(desc);
+        throw;
+    }
+    check_infini_status(
+        infiniopDestroyPagedCachingDescriptor(desc),
+        "infiniopDestroyPagedCachingDescriptor");
+}
+
+void paged_attention_prefill_current_stream(at::Tensor query,
+                                            at::Tensor key_cache,
+                                            at::Tensor value_cache,
+                                            at::Tensor block_table,
+                                            at::Tensor total_kv_lens,
+                                            at::Tensor query_start_loc,
+                                            c10::optional<at::Tensor> alibi_slopes,
+                                            double scale,
+                                            at::Tensor output) {
+    if (query.numel() == 0) {
+        return;
+    }
+    if (query.dim() != 3 || output.sizes() != query.sizes()) {
+        throw std::runtime_error("paged_attention_prefill_current_stream expects query/output [tokens, heads, head_dim]");
+    }
+
+    auto out_tensor = wrap_strided(output);
+    auto q_tensor = wrap_strided(query);
+    auto k_tensor = wrap_strided(key_cache);
+    auto v_tensor = wrap_strided(value_cache);
+    auto block_tensor = wrap_strided(block_table);
+    auto len_tensor = wrap_strided(total_kv_lens);
+    auto q_start_tensor = wrap_strided(query_start_loc);
+    std::optional<infinicore::Tensor> alibi;
+    if (alibi_slopes.has_value() && alibi_slopes.value().defined()) {
+        alibi = wrap_strided(alibi_slopes.value());
+    }
+
+    infiniopPagedAttentionPrefillDescriptor_t desc = nullptr;
+    auto handle = infinicore::context::getInfiniopHandle(device_from_torch(query));
+    check_infini_status(
+        infiniopCreatePagedAttentionPrefillDescriptor(
+            handle,
+            &desc,
+            out_tensor->desc(),
+            q_tensor->desc(),
+            k_tensor->desc(),
+            v_tensor->desc(),
+            block_tensor->desc(),
+            len_tensor->desc(),
+            q_start_tensor->desc(),
+            alibi.has_value() ? alibi.value()->desc() : nullptr,
+            static_cast<float>(scale)),
+        "infiniopCreatePagedAttentionPrefillDescriptor");
+
+    size_t workspace_size = 0;
+    try {
+        check_infini_status(
+            infiniopGetPagedAttentionPrefillWorkspaceSize(desc, &workspace_size),
+            "infiniopGetPagedAttentionPrefillWorkspaceSize");
+        at::Tensor workspace;
+        void *workspace_ptr = nullptr;
+        if (workspace_size > 0) {
+            workspace = at::empty(
+                {static_cast<int64_t>(workspace_size)},
+                query.options().dtype(at::kByte));
+            workspace_ptr = workspace.data_ptr();
+        }
+        check_infini_status(
+            infiniopPagedAttentionPrefill(
+                desc,
+                workspace_ptr,
+                workspace_size,
+                output.data_ptr(),
+                query.data_ptr(),
+                key_cache.data_ptr(),
+                value_cache.data_ptr(),
+                block_table.data_ptr(),
+                total_kv_lens.data_ptr(),
+                query_start_loc.data_ptr(),
+                alibi_slopes.has_value() && alibi_slopes.value().defined()
+                    ? alibi_slopes.value().data_ptr()
+                    : nullptr,
+                current_stream_from_torch(query)),
+            "infiniopPagedAttentionPrefill");
+    } catch (...) {
+        infiniopDestroyPagedAttentionPrefillDescriptor(desc);
+        throw;
+    }
+    check_infini_status(
+        infiniopDestroyPagedAttentionPrefillDescriptor(desc),
+        "infiniopDestroyPagedAttentionPrefillDescriptor");
+}
+
+void paged_attention_decode_out(at::Tensor query,
+                                at::Tensor key_cache,
+                                at::Tensor value_cache,
+                                at::Tensor decode_seq_lens,
+                                at::Tensor decode_block_table,
+                                c10::optional<at::Tensor> alibi_slopes,
+                                double scale,
+                                int64_t num_decode_tokens,
+                                int64_t num_decodes,
+                                at::Tensor output) {
+    if (num_decode_tokens == 0) {
+        return;
+    }
+    if (num_decode_tokens != num_decodes) {
+        throw std::runtime_error("InfiniCore bridge does not support speculative decode");
+    }
+    if (query.dim() != 3) {
+        throw std::runtime_error("expected query shape [tokens, heads, head_dim]");
+    }
+
+    auto q = query.narrow(0, 0, num_decode_tokens);
+    auto out = output.narrow(0, 0, num_decode_tokens).view(q.sizes());
+
+    auto out_tensor = wrap_strided(out);
+    auto q_tensor = wrap_strided(q);
+    auto k_tensor = wrap_strided(key_cache);
+    auto v_tensor = wrap_strided(value_cache);
+    auto block_tensor = wrap_strided(decode_block_table);
+    auto len_tensor = wrap_strided(decode_seq_lens);
+    std::optional<infinicore::Tensor> alibi;
+    if (alibi_slopes.has_value() && alibi_slopes.value().defined()) {
+        alibi = wrap_strided(alibi_slopes.value());
+    }
+
+    infiniopPagedAttentionDescriptor_t desc = nullptr;
+    auto handle = infinicore::context::getInfiniopHandle(device_from_torch(query));
+    check_infini_status(
+        infiniopCreatePagedAttentionDescriptor(
+            handle,
+            &desc,
+            out_tensor->desc(),
+            q_tensor->desc(),
+            k_tensor->desc(),
+            v_tensor->desc(),
+            block_tensor->desc(),
+            len_tensor->desc(),
+            alibi.has_value() ? alibi.value()->desc() : nullptr,
+            static_cast<float>(scale)),
+        "infiniopCreatePagedAttentionDescriptor");
+
+    size_t workspace_size = 0;
+    try {
+        check_infini_status(
+            infiniopGetPagedAttentionWorkspaceSize(desc, &workspace_size),
+            "infiniopGetPagedAttentionWorkspaceSize");
+        at::Tensor workspace;
+        void *workspace_ptr = nullptr;
+        if (workspace_size > 0) {
+            workspace = at::empty(
+                {static_cast<int64_t>(workspace_size)},
+                query.options().dtype(at::kByte));
+            workspace_ptr = workspace.data_ptr();
+        }
+        check_infini_status(
+            infiniopPagedAttention(
+                desc,
+                workspace_ptr,
+                workspace_size,
+                out.data_ptr(),
+                q.data_ptr(),
+                key_cache.data_ptr(),
+                value_cache.data_ptr(),
+                decode_block_table.data_ptr(),
+                decode_seq_lens.data_ptr(),
+                alibi_slopes.has_value() && alibi_slopes.value().defined()
+                    ? alibi_slopes.value().data_ptr()
+                    : nullptr,
+                current_stream_from_torch(query)),
+            "infiniopPagedAttention");
+    } catch (...) {
+        infiniopDestroyPagedAttentionDescriptor(desc);
+        throw;
+    }
+    check_infini_status(
+        infiniopDestroyPagedAttentionDescriptor(desc),
+        "infiniopDestroyPagedAttentionDescriptor");
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("store_kv_cache_current_stream", &store_kv_cache_current_stream);
+    m.def("paged_attention_prefill_current_stream", &paged_attention_prefill_current_stream);
+    m.def("paged_attention_decode_out", &paged_attention_decode_out);
     m.def("embedding_current_stream", &embedding_current_stream);
     m.def("linear_current_stream", &linear_current_stream);
     m.def("rms_norm_current_stream", &rms_norm_current_stream);
