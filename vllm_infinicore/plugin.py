@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from .routing.patching import (
     PatchRegistry,
@@ -34,6 +35,16 @@ def register() -> RegistrationResult:
 
     registry = get_default_registry()
     result = registry.register_from_environment()
+    if os.environ.get("VLLM_INFINICORE_STRICT_BACKEND", "0").lower() in {"1", "true", "yes", "on"}:
+        missing = [s.name for s in result.route_states
+                   if s.name in {"StoreKVCache", "PagedAttentionPrefill", "PagedAttentionDecode"}
+                   and s.requested and not s.disabled_by_env and not s.installed]
+        if missing:
+            registry.uninstall_routes(result.installed_routes)
+            raise RuntimeError(
+                f"Required InfiniCore attention routes unavailable: {', '.join(missing)}; "
+                f"{result.failure_reason or result.reason}"
+            )
 
     _REGISTERED = True
     _REGISTRATION_RESULT = result

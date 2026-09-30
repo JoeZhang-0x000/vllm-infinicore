@@ -213,6 +213,7 @@ def _register_rms_norm(torch: Any) -> None:
         return infinicore_backend.rms_norm(input_tensor, weight, float(eps))
 
     library.impl("rms_norm", _rms_norm_impl, "CompositeExplicitAutograd")
+    library.impl("rms_norm", lambda x, weight, eps: torch.empty_like(x), "Meta")
 
     _REGISTERED_OPS = (*_REGISTERED_OPS, RMS_NORM_OP)
 
@@ -244,6 +245,9 @@ def _register_fused_add_rms_norm(torch: Any) -> None:
     library.impl(
         "fused_add_rms_norm", _fused_add_rms_norm_impl, "CompositeExplicitAutograd"
     )
+    library.impl("fused_add_rms_norm",
+                 lambda x, residual, weight, eps: (torch.empty_like(x), torch.empty_like(residual)),
+                 "Meta")
 
     _REGISTERED_OPS = (*_REGISTERED_OPS, FUSED_ADD_RMS_NORM_OP)
 
