@@ -102,6 +102,26 @@ def library():
     return lib
 
 
+@lru_cache(maxsize=1)
+def attention_library():
+    """Require the additive PA/KV API only when attention is requested."""
+    lib = library()
+    P, S, I = C.c_void_p, C.c_size_t, C.c_int
+    for op, count in (("PagedCaching", 5), ("PagedAttention", 7),
+                      ("PagedAttentionPrefill", 8)):
+        signatures = {
+            f"infiniopCreate{op}Descriptor": [P, C.POINTER(P)] + [P] * count
+                + ([] if op == "PagedCaching" else [C.c_float]),
+            f"infiniopGet{op}WorkspaceSize": [P, C.POINTER(S)],
+            f"infiniop{op}": [P, P, S] + [P] * count + [P],
+            f"infiniopDestroy{op}Descriptor": [P],
+        }
+        for name, args in signatures.items():
+            fn = getattr(lib, name)
+            fn.argtypes, fn.restype = args, I
+    return lib
+
+
 def fallback(name, reason, native):
     # Trace the original tensor program without Python counter side effects.
     # These calls are not runtime InfiniCore launches and must not be counted.
@@ -193,6 +213,9 @@ class _Descriptor:
         try:
             for tensor in tensors:
                 ptr = C.c_void_p()
+                if tensor is None:
+                    descs.append(ptr)
+                    continue
                 shape = (C.c_size_t * tensor.ndim)(*tensor.shape)
                 stride = (C.c_ssize_t * tensor.ndim)(*tensor.stride())
                 _check(
@@ -222,7 +245,8 @@ class _Descriptor:
             raise
         finally:
             for ptr in descs:
-                lib.infiniopDestroyTensorDescriptor(ptr)
+                if ptr.value:
+                    lib.infiniopDestroyTensorDescriptor(ptr)
 
     def workspace(self, capturing):
         """Scratch for one launch, shared by every descriptor on the device.
@@ -299,7 +323,7 @@ def clear_cache():
 
 def launch(op, tensors, scalar=()):
     lib = library()
-    if any(t.device != tensors[0].device for t in tensors):
+    if any(t is not None and t.device != tensors[0].device for t in tensors):
         raise Unsupported("mixed-device tensors")
     stream = torch.npu.current_stream(tensors[0].device)
     # The stream is a launch argument, not part of the descriptor, so it stays
@@ -308,7 +332,7 @@ def launch(op, tensors, scalar=()):
     key = (
         op,
         tensors[0].device,
-        tuple((tuple(t.shape), t.stride(), t.dtype) for t in tensors),
+        tuple((tuple(t.shape), t.stride(), t.dtype) if t is not None else None for t in tensors),
         scalar,
     )
     if not hasattr(_LOCAL, "descriptors"):
@@ -343,7 +367,7 @@ def launch(op, tensors, scalar=()):
     # 2.0 s against native's 1.8 s, and removed a 16x spread in allocation cost
     # between ranks. Reintroduce it only alongside a launch on some other stream,
     # and never during capture, where the graph pool owns the addresses.
-    args += [t.data_ptr() for t in tensors]
+    args += [t.data_ptr() if t is not None else None for t in tensors]
     if op == "Gemm":
         args += [1.0, 0.0]
     args += [stream.npu_stream]

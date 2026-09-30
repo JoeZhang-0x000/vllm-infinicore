@@ -15,7 +15,10 @@ set(OPS "${INFINICORE_SOURCE}/src/infiniop/ops")
 ascendc_library(infinicore_ascend_kernels STATIC
   "${OPS}/swiglu/ascend/swiglu_ascend_kernel.cpp"
   "${OPS}/rope/ascend/rope_ascend_kernel.cpp"
-  "${OPS}/rms_norm/ascend/cast_kernel.cpp")
+  "${OPS}/rms_norm/ascend/cast_kernel.cpp"
+  "${OPS}/paged_caching/ascend/paged_caching_ascend_kernel.cpp"
+  "${OPS}/paged_attention/ascend/paged_attention_ascend_kernel.cpp"
+  "${OPS}/paged_attention_prefill/ascend/paged_attention_prefill_ascend_kernel.cpp")
 target_include_directories(infinicore_ascend_kernels PRIVATE "${INFINICORE_SOURCE}/include")
 set(SOURCES
   "${INFINICORE_SOURCE}/src/utils/custom_types.cc"
@@ -23,7 +26,7 @@ set(SOURCES
   "${INFINICORE_SOURCE}/src/infiniop/operator_descriptor.cc"
   "${INFINICORE_SOURCE}/src/infiniop/devices/ascend/ascend_handle.cc"
   "${INFINICORE_SOURCE}/src/infiniop/devices/ascend/common_ascend.cc")
-foreach(OP rms_norm swiglu rope embedding gemm)
+foreach(OP rms_norm swiglu rope embedding gemm paged_caching paged_attention paged_attention_prefill)
   file(GLOB DEVICE_SOURCES "${OPS}/${OP}/ascend/*.cc")
   list(APPEND SOURCES "${OPS}/${OP}/operator.cc" ${DEVICE_SOURCES})
 endforeach()

@@ -21,6 +21,8 @@ REAL_BACKEND_DISABLE_ENV = "VLLM_INFINICORE_DISABLE_REAL_BACKEND"
 STRICT_BACKEND_ENV = "VLLM_INFINICORE_STRICT_BACKEND"
 logger = logging.getLogger(__name__)
 _CALL_COUNTS: dict[str, int] = {}
+_FALLBACK_COUNTS: dict[str, int] = {}
+_FALLBACK_REASONS: dict[str, str] = {}
 _FUSED_ADD_RMS_NORM_SUPPORTED: bool | None = None
 _DEFAULT_DEVICE_INDEX_SET: int | None = None
 _PY_CAPSULE_GET_POINTER: Any | None = None
@@ -127,8 +129,18 @@ def backend_call_counts() -> dict[str, int]:
     return dict(_CALL_COUNTS)
 
 
+def backend_fallback_counts() -> dict[str, int]:
+    return dict(_FALLBACK_COUNTS)
+
+
+def backend_fallback_reasons() -> dict[str, str]:
+    return dict(_FALLBACK_REASONS)
+
+
 def reset_backend_call_counts() -> None:
     _CALL_COUNTS.clear()
+    _FALLBACK_COUNTS.clear()
+    _FALLBACK_REASONS.clear()
     try:
         from . import cpp_bridge
 

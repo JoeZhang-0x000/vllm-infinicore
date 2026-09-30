@@ -235,6 +235,10 @@ def _wrapper(route, original):
 
 
 def install(route):
+    from .. import attention
+
+    if route in attention.ROUTES:
+        return attention.install(route, "ascend")
     backend.library()  # Reject a mismatched lock/ABI before modifying any class.
     if route in _PATCHES:
         return PatchInstallResult(True, "Ascend adapter already installed")
@@ -252,6 +256,10 @@ def install(route):
 
 
 def uninstall(route):
+    from .. import attention
+
+    if route in attention.ROUTES:
+        return attention.uninstall(route, "ascend")
     patch = _PATCHES.get(route)
     if patch is None:
         return PatchUninstallResult(False, "Ascend adapter not installed")
