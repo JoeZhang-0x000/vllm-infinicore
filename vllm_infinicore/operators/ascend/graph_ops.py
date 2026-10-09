@@ -67,7 +67,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 @rms_norm.register_fake
 def _(x, weight, eps):
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 @torch.library.custom_op("vllm_infinicore_ascend::silu_and_mul", mutates_args=())
@@ -101,4 +101,4 @@ def rotary_embedding(
 
 @rotary_embedding.register_fake
 def _(positions, query, key, head_size, rotary_dim, cache, neox):
-    return torch.empty_like(query), torch.empty_like(key)
+    return query.new_empty(query.shape), key.new_empty(key.shape)

@@ -69,6 +69,20 @@ CUDA_VISIBLE_DEVICES=7 vllm-infinicore-gsm8k \
 
 `--prepare-only` 仅下载数据；`--dataset-file` 复用冻结数据；`--limit` 指定样本数；`--rescore-only` 离线重评分。也可执行 `python -m vllm_infinicore.benchmarks.gsm8k`，完整参数见 `--help`。Ascend 使用 `--platform ascend` 和 `ASCEND_RT_VISIBLE_DEVICES`。
 
+## Ascend 构建
+
+```sh
+python scripts/build_ascend.py --source /path/to/locked-InfiniCore \
+  --build-dir /path/to/ascend-build --soc Ascend910B4 \
+  --cann "$ASCEND_TOOLKIT_HOME" --ascend-patches local
+export VLLM_INFINICORE_OPERATOR_BACKEND=ascend
+export VLLM_INFINICORE_ASCEND_LIBRARY=/path/to/ascend-build/libvllm_infinicore_ascend.so
+```
+
+Ascend 使用锁文件的 legacy_ascend 提交和 ABI 1。默认在独立源码副本中应用 [算子补丁](scripts/patches/ascend/README.md)：KV launch 越界与向量搬运、RoPE token/head 并行和表 stride、SwiGLU token 并行，以及 128 维 BF16 Q/K RMSNorm。补丁、源码文件及动态库 SHA256 记录在构建目录的 manifest.json；`--ascend-patches none` 构建未修复版本。切换补丁集时使用新的构建目录。
+
+插件通过动态库能力位选择直接读取 cos/sin cache 视图，并让 Q/K RMSNorm 保留 packed QKV stride；旧动态库使用连续输入和连续表兼容路径。Attention、集合通信与请求调度由 vllm-ascend 提供，融合 Add+RMSNorm 及不支持尺寸的 SwiGLU 保留 native。算子与插件的消融结果见 [NPU 优化记录](docs/npu-optimization-summary.md)。
+
 ## 其他入口与兼容范围
 
 - [scripts/run-vllm-metax.sh](scripts/run-vllm-metax.sh)：加载 `metax-1` 的 `/opt/conda`、MACA 3.8.0 环境并启动原生 vLLM；`--chat` 进入聊天。支持 `METAX_GPU`、`METAX_PORT`、`METAX_HOST` 和 `METAX_MODEL`。
