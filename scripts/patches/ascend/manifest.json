@@ -1,0 +1,48 @@
+{
+  "repository": "https://github.com/InfiniTensor/InfiniCore",
+  "base_revision": "d3551f37538896056e164abf91b120e38c27007b",
+  "patches": [
+    {
+      "name": "ascend-paged-caching",
+      "file": "ascend-paged-caching.patch",
+      "sha256": "0b7d8f1869319cfa85102eca75d599ead7c4d6dedc98b8ad313892ccd96c9b0b"
+    },
+    {
+      "name": "ascend-rope",
+      "file": "ascend-rope.patch",
+      "sha256": "830173876aebc20d61e4817033ab068b2a7d7e6d9bdee1b871041cbef0d4ee25"
+    },
+    {
+      "name": "ascend-swiglu",
+      "file": "ascend-swiglu.patch",
+      "sha256": "af0b623da18fd2f2aba61cbec5739f1bf6c04f1d90df8c3c5b369f47d0436e17"
+    },
+    {
+      "name": "ascend-rope-strides",
+      "file": "ascend-rope-strides.patch",
+      "sha256": "f6b6f412928bc1b920a485b7e2b5f77d4a636ce5855fd8556b64cdb12b0fb84a"
+    },
+    {
+      "name": "ascend-rope-tiled",
+      "file": "ascend-rope-tiled.patch",
+      "sha256": "d285fda954dc3b98decd261c8cb23620bd93f8000f07e595c80096d2dcafd779"
+    },
+    {
+      "name": "ascend-rmsnorm-tiled",
+      "file": "ascend-rmsnorm-tiled.patch",
+      "sha256": "231a44e211b6cbc81aceabe01477ba8aa96c353b6c83ec594ccdbe65b9836170"
+    }
+  ],
+  "files": {
+    "src/infiniop/ops/paged_caching/ascend/paged_caching_ascend_kernel.cpp": "27e334ff9a30cbf2e52d6912eb2c61f0e3cb4f77a709f84fe7ac01247669acb7",
+    "src/infiniop/ops/rope/ascend/rope_ascend_kernel.cpp": "0872c549f290998c446ec7a375b755afc4bb02ffb7713e614858e80ae558f70e",
+    "src/infiniop/ops/swiglu/ascend/swiglu_ascend_kernel.cpp": "697e40e4509326a44e2fd2097ac32d7d2f3a4595b86c4e807097ab7335779e13",
+    "src/infiniop/ops/rope/rope.h": "4c784b8c09583c77c9dabddf2f164b2f9a0bb4840aef044173cff63b8623f9bf",
+    "src/infiniop/ops/rope/ascend/rope_ascend.h": "afd247ce8f8e95d17f1e82ec17759ac22e8aa81f9ea1a90698836591a7c9ffb2",
+    "src/infiniop/ops/rope/ascend/rope_ascend.cc": "b7beb9a5315414ec6f7310d08bfe40c2adb289a777dfbee621602491de4e811d",
+    "src/infiniop/ops/rope/ascend/rope_neox_tiled.h": "8bd5f264a24c8b396afc53abecc1bc4d95ee5f903e16beeb8d19bc8b98c0685a",
+    "src/infiniop/ops/rms_norm/ascend/rms_norm_aclnn.cc": "86cf59a17c33803626c0a6ddd3c10880b3765a1d5a1d842cfab8da1d9ff511bc",
+    "src/infiniop/ops/rms_norm/ascend/cast_kernel.cpp": "bcb18721a2b0feb7c0b87ed00d24cfd0fb6653b9cba877192f37a287491a36a3",
+    "src/infiniop/ops/rms_norm/ascend/rms_norm_tiled.h": "06f890c72a3cf4654054003479baab7f51880d682766e80864ec9fc1c5902870"
+  }
+}

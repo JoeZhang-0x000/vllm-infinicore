@@ -32,6 +32,9 @@ foreach(OP rms_norm swiglu rope embedding gemm paged_caching paged_attention pag
 endforeach()
 add_library(vllm_infinicore_ascend SHARED bridge.cpp ${SOURCES})
 target_compile_definitions(vllm_infinicore_ascend PRIVATE ENABLE_ASCEND_API INFINICORE_REVISION="${INFINICORE_REVISION}")
+if(VLLM_INFINICORE_ASCEND_STRIDED_ROPE)
+  target_compile_definitions(vllm_infinicore_ascend PRIVATE VLLM_INFINICORE_ASCEND_STRIDED_ROPE)
+endif()
 target_include_directories(vllm_infinicore_ascend PRIVATE
   "${INFINICORE_SOURCE}/include" "${INFINICORE_SOURCE}/src"
   "${ASCEND_CANN_PACKAGE_PATH}/include" "${ASCEND_CANN_PACKAGE_PATH}/include/aclnn"

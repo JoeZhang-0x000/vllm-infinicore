@@ -1,0 +1,35 @@
+--- a/src/infiniop/ops/swiglu/ascend/swiglu_ascend_kernel.cpp
++++ b/src/infiniop/ops/swiglu/ascend/swiglu_ascend_kernel.cpp
+@@ -56,7 +56,7 @@
+     _stride_seq_b = stride_seq_b;
+     _stride_seq_c = stride_seq_c;
+ 
+-    _block_idx = GetBlockIdx();
++    _block_idx = GetBlockIdx() % BLOCK_NUM;
+     _tile_len = _block_idx < (_hidden_size % BLOCK_NUM) ? (_hidden_size / BLOCK_NUM) + 1 : (_hidden_size / BLOCK_NUM);
+     _copy_len = alignTileLen<T>(_tile_len, BYTE_ALIGN);
+ 
+@@ -147,7 +147,7 @@
+ 
+ template <typename T>
+ __aicore__ inline void SwigluKernel<T>::process() {
+-    for (size_t i = 0; i < _batch * _seq_len; ++i) {
++    for (size_t i = GetBlockIdx() / BLOCK_NUM; i < _batch * _seq_len; i += GetBlockNum() / BLOCK_NUM) {
+         copyIn(i);
+         compute(i);
+         copyOut(i);
+@@ -182,10 +182,13 @@
+     infiniDtype_t dtype, size_t batch, size_t seq, size_t hd,
+     ptrdiff_t stride_batch_c, ptrdiff_t stride_batch_a, ptrdiff_t stride_batch_b,
+     ptrdiff_t stride_seq_c, ptrdiff_t stride_seq_a, ptrdiff_t stride_seq_b, void *stream) {
++    const size_t rows = batch * seq;
++    if (rows == 0) return INFINI_STATUS_SUCCESS;
++    const size_t block_dim = (rows < 8 ? rows : 8) * BLOCK_NUM;
+ 
+ #define LAUNCH_SWIGLU_KERNEL(DTYPE_ENUM, KERNEL_NAME)       \
+     case DTYPE_ENUM:                                        \
+-        KERNEL_NAME<<<BLOCK_NUM, nullptr, stream>>>(        \
++        KERNEL_NAME<<<block_dim, nullptr, stream>>>(        \
+             c, a, b,                                        \
+             batch,                                          \
+             seq,                                            \

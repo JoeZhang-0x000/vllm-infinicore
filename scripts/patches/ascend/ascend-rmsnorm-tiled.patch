@@ -1,0 +1,201 @@
+--- a/src/infiniop/ops/rms_norm/ascend/rms_norm_aclnn.cc
++++ b/src/infiniop/ops/rms_norm/ascend/rms_norm_aclnn.cc
+@@ -6,6 +6,10 @@
+     void *dst, const void *src,
+     infiniDtype_t src_dtype, infiniDtype_t dst_dtype,
+     size_t count, void *stream);
++
++extern "C" infiniStatus_t rms_norm_bf16_tiled_launch(
++    void *y, const void *x, const void *weight, size_t tokens, size_t heads,
++    ptrdiff_t y_token, ptrdiff_t x_token, float epsilon, void *stream);
+ 
+ namespace op::rms_norm::ascend {
+ 
+@@ -16,6 +20,7 @@
+     aclnnTensorDescriptor_t rstd;
+     size_t workspaceSize;
+     aclOpExecutor *executor;
++    bool tiled = false;
+     bool full_tensor;
+     bool needs_cast_w;
+     size_t cast_w_offset;
+@@ -39,7 +44,7 @@
+         delete x;
+         delete w;
+         delete rstd;
+-        aclDestroyAclOpExecutor(executor);
++        if (executor) aclDestroyAclOpExecutor(executor);
+     }
+ };
+ 
+@@ -60,6 +65,21 @@
+     auto info = result.take();
+ 
+     auto handle_ascend = reinterpret_cast<device::ascend::Handle *>(handle);
++
++    const size_t heads = info.ndim() == 3 ? info.shape[1] : 1;
++    const bool tiled = info.atype == INFINI_DTYPE_BF16 && info.wtype == info.atype
++                       && info.dim() == 128 && heads > 0 && heads <= 32
++                       && (info.ndim() == 2 || (info.x_strides[1] == 128 && info.y_strides[1] == 128))
++                       && info.x_strides[0] >= static_cast<ptrdiff_t>(heads * 128)
++                       && info.y_strides[0] >= static_cast<ptrdiff_t>(heads * 128);
++    if (tiled) {
++        auto *opaque = new Opaque{nullptr, nullptr, nullptr, nullptr, 0, nullptr,
++                                  true, false, 0, 0, 0};
++        opaque->tiled = true;
++        *desc_ptr = new Descriptor(opaque, std::move(info), 0,
++                                   handle_ascend->device, handle_ascend->device_id);
++        return INFINI_STATUS_SUCCESS;
++    }
+ 
+     const bool full_tensor = [&]() {
+         ptrdiff_t expected_stride = 1;
+@@ -184,6 +204,13 @@
+ 
+     if (workspace_size < workspaceSize()) {
+         return INFINI_STATUS_INSUFFICIENT_WORKSPACE;
++    }
++
++    if (_opaque->tiled) {
++        return rms_norm_bf16_tiled_launch(y, x, w, _info.shape[0],
++                                         _info.ndim() == 3 ? _info.shape[1] : 1,
++                                         _info.y_strides[0], _info.x_strides[0],
++                                         _info.epsilon, stream);
+     }
+ 
+     void *rstd_ptr = static_cast<uint8_t *>(workspace) + _opaque->workspaceSize;
+--- a/src/infiniop/ops/rms_norm/ascend/cast_kernel.cpp
++++ b/src/infiniop/ops/rms_norm/ascend/cast_kernel.cpp
+@@ -106,3 +106,24 @@
+ 
+ #undef LAUNCH_CAST
+ }
++
++#include "rms_norm_tiled.h"
++
++__global__ __aicore__ void rms_norm_bf16_tiled_kernel(
++    GM_ADDR y, GM_ADDR x, GM_ADDR weight, size_t tokens, size_t heads,
++    ptrdiff_t y_token, ptrdiff_t x_token, float epsilon) {
++    RMSNormBF16Tiled op;
++    op.init(y, x, weight, heads, y_token, x_token, epsilon);
++    op.process(tokens);
++}
++
++extern "C" infiniStatus_t rms_norm_bf16_tiled_launch(
++    void *y, const void *x, const void *weight, size_t tokens, size_t heads,
++    ptrdiff_t y_token, ptrdiff_t x_token, float epsilon, void *stream) {
++    if (!tokens) return INFINI_STATUS_SUCCESS;
++    const size_t blocks = tokens < 64 ? tokens : 64;
++    rms_norm_bf16_tiled_kernel<<<blocks, nullptr, stream>>>(
++        y, const_cast<void *>(x), const_cast<void *>(weight), tokens, heads,
++        y_token, x_token, epsilon);
++    return INFINI_STATUS_SUCCESS;
++}
+--- /dev/null
++++ b/src/infiniop/ops/rms_norm/ascend/rms_norm_tiled.h
+@@ -0,0 +1,105 @@
++// One token's contiguous 128-element heads are normalized together.
++// Reduction and broadcast stay in UB; packed QKV token strides are preserved.
++class RMSNormBF16Tiled {
++public:
++    __aicore__ inline void init(GM_ADDR y, GM_ADDR x, GM_ADDR weight,
++                               size_t heads, ptrdiff_t y_token,
++                               ptrdiff_t x_token, float epsilon) {
++        _heads = heads;
++        _y_token = y_token;
++        _x_token = x_token;
++        _epsilon = epsilon;
++        _x.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(x));
++        _y.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(y));
++        _weight.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(weight));
++        const size_t elements = heads * 128;
++        _pipe.InitBuffer(_input, 2, elements * sizeof(bfloat16_t));
++        _pipe.InitBuffer(_output, 2, elements * sizeof(bfloat16_t));
++        _pipe.InitBuffer(_weight_input, 1, 128 * sizeof(bfloat16_t));
++        _pipe.InitBuffer(_x_f, elements * sizeof(float));
++        _pipe.InitBuffer(_square_f, elements * sizeof(float));
++        _pipe.InitBuffer(_out_f, elements * sizeof(float));
++        _pipe.InitBuffer(_weight_f, 128 * sizeof(float));
++        _pipe.InitBuffer(_rstd, 32 * sizeof(float));
++        _pipe.InitBuffer(_variance, 32 * sizeof(float));
++        _pipe.InitBuffer(_ones, 32 * sizeof(float));
++        _pipe.InitBuffer(_rstd_blocks, 32 * 8 * sizeof(float));
++    }
++
++    __aicore__ inline void process(size_t tokens) {
++        LocalTensor<bfloat16_t> weight = _weight_input.AllocTensor<bfloat16_t>();
++        DataCopy(weight, _weight, 128);
++        _weight_input.EnQue(weight);
++        weight = _weight_input.DeQue<bfloat16_t>();
++        LocalTensor<float> wf = _weight_f.Get<float>();
++        Cast(wf, weight, RoundMode::CAST_NONE, 128);
++        _weight_input.FreeTensor(weight);
++        PipeBarrier<PIPE_V>();
++        LocalTensor<float> ones = _ones.Get<float>();
++        Duplicate(ones, 1.0f, 32);
++        PipeBarrier<PIPE_V>();
++        for (size_t token = GetBlockIdx(); token < tokens; token += GetBlockNum()) {
++            LocalTensor<bfloat16_t> input = _input.AllocTensor<bfloat16_t>();
++            DataCopy(input, _x[token * _x_token], _heads * 128);
++            _input.EnQue(input);
++            input = _input.DeQue<bfloat16_t>();
++            LocalTensor<bfloat16_t> output = _output.AllocTensor<bfloat16_t>();
++            LocalTensor<float> x = _x_f.Get<float>();
++            LocalTensor<float> squares = _square_f.Get<float>();
++            LocalTensor<float> out = _out_f.Get<float>();
++            LocalTensor<float> rstd = _rstd.Get<float>();
++            LocalTensor<float> variance = _variance.Get<float>();
++            LocalTensor<float> factors = _rstd_blocks.Get<float>();
++            Cast(x, input, RoundMode::CAST_NONE, _heads * 128);
++            PipeBarrier<PIPE_V>();
++            Mul(squares, x, x, _heads * 128);
++            PipeBarrier<PIPE_V>();
++            // Sum corresponding elements of the two halves, then reduce 64.
++            BinaryRepeatParams halves{1, 1, 1, 16, 16, 16};
++            Add(out, squares, squares[64], uint64_t(64),
++                static_cast<uint8_t>(_heads), halves);
++            PipeBarrier<PIPE_V>();
++            WholeReduceSum(rstd, out, 64, static_cast<int32_t>(_heads), 1, 1, 16);
++            PipeBarrier<PIPE_V>();
++            Muls(variance, rstd, 1.0f / 128.0f, _heads);
++            PipeBarrier<PIPE_V>();
++            Adds(variance, variance, _epsilon, _heads);
++            PipeBarrier<PIPE_V>();
++            // Match the native sqrt/divide sequence before BF16 rounding.
++            Sqrt(rstd, variance, _heads);
++            PipeBarrier<PIPE_V>();
++            Div(rstd, ones, rstd, _heads);
++            PipeBarrier<PIPE_V>();
++            Brcb(factors, rstd, static_cast<uint8_t>((_heads + 7) / 8), {1, 8});
++            PipeBarrier<PIPE_V>();
++            BinaryRepeatParams normalize{1, 1, 0, 16, 16, 1};
++            Mul(out, x, factors, uint64_t(64), static_cast<uint8_t>(_heads), normalize);
++            Mul(out[64], x[64], factors, uint64_t(64),
++                static_cast<uint8_t>(_heads), normalize);
++            PipeBarrier<PIPE_V>();
++            BinaryRepeatParams broadcast_weight{1, 1, 1, 16, 16, 0};
++            Mul(out, out, wf, uint64_t(64), static_cast<uint8_t>(_heads), broadcast_weight);
++            Mul(out[64], out[64], wf[64], uint64_t(64),
++                static_cast<uint8_t>(_heads), broadcast_weight);
++            PipeBarrier<PIPE_V>();
++            Cast(output, out, RoundMode::CAST_RINT, _heads * 128);
++            _output.EnQue(output);
++            _input.FreeTensor(input);
++            output = _output.DeQue<bfloat16_t>();
++            DataCopy(_y[token * _y_token], output, _heads * 128);
++            _output.FreeTensor(output);
++        }
++    }
++
++private:
++    TPipe _pipe;
++    TQue<QuePosition::VECIN, 2> _input;
++    TQue<QuePosition::VECIN, 1> _weight_input;
++    TQue<QuePosition::VECOUT, 2> _output;
++    TBuf<QuePosition::VECCALC> _x_f, _square_f, _out_f, _weight_f;
++    TBuf<QuePosition::VECCALC> _rstd, _variance, _ones, _rstd_blocks;
++    GlobalTensor<bfloat16_t> _x, _y, _weight;
++    size_t _heads;
++    ptrdiff_t _x_token, _y_token;
++    float _epsilon;
++};

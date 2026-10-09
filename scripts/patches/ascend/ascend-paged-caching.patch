@@ -1,0 +1,161 @@
+--- a/src/infiniop/ops/paged_caching/ascend/paged_caching_ascend_kernel.cpp
++++ b/src/infiniop/ops/paged_caching/ascend/paged_caching_ascend_kernel.cpp
+@@ -13,6 +13,7 @@
+         GM_ADDR k,
+         GM_ADDR v,
+         GM_ADDR slot_mapping,
++        size_t num_tokens,
+         size_t num_kv_heads,
+         size_t head_size,
+         size_t v_head_size,
+@@ -27,7 +28,9 @@
+         ptrdiff_t v_cache_head_stride,
+         ptrdiff_t k_cache_slot_stride,
+         ptrdiff_t v_cache_slot_stride) {
++        _num_tokens = num_tokens;
+         _num_kv_heads = num_kv_heads;
++        _pipe.InitBuffer(_copy_buffer, 1024 * sizeof(Tdata));
+         _head_size = head_size;
+         _v_head_size = v_head_size;
+         _block_size = block_size;
+@@ -41,6 +44,10 @@
+         _v_cache_head_stride = v_cache_head_stride;
+         _k_cache_slot_stride = k_cache_slot_stride;
+         _v_cache_slot_stride = v_cache_slot_stride;
++        _group_heads = k_src_head_stride == static_cast<ptrdiff_t>(head_size)
++                       && v_src_head_stride == static_cast<ptrdiff_t>(v_head_size)
++                       && k_cache_head_stride == static_cast<ptrdiff_t>(head_size)
++                       && v_cache_head_stride == static_cast<ptrdiff_t>(v_head_size);
+ 
+         _k_cache_gm.SetGlobalBuffer(reinterpret_cast<__gm__ Tdata *>(k_cache));
+         _v_cache_gm.SetGlobalBuffer(reinterpret_cast<__gm__ Tdata *>(v_cache));
+@@ -50,34 +57,50 @@
+     }
+ 
+     __aicore__ inline void process() {
+-        const size_t work_idx = GetBlockIdx();
+-        const size_t head_idx = work_idx % _num_kv_heads;
+-        const size_t token_idx = work_idx / _num_kv_heads;
+-
+-        const int64_t slot_idx = _slot_mapping_gm.GetValue(token_idx);
+-        if (slot_idx < 0) {
+-            return;
++        // Launch a bounded grid; rows beyond the grid are handled in subsequent iterations.
++        const size_t heads = _group_heads ? 1 : _num_kv_heads;
++        for (size_t work_idx = GetBlockIdx(); work_idx < _num_tokens * heads;
++             work_idx += GetBlockNum()) {
++            const size_t head_idx = work_idx % heads;
++            const size_t token_idx = work_idx / heads;
++
++            const int64_t slot_idx = _slot_mapping_gm.GetValue(token_idx);
++            if (slot_idx < 0) {
++                continue;
++            }
++
++            const int64_t physical_block_idx = slot_idx / static_cast<int64_t>(_block_size);
++            const int64_t block_offset = slot_idx % static_cast<int64_t>(_block_size);
++
++            const ptrdiff_t k_src_base = static_cast<ptrdiff_t>(token_idx) * _k_src_stride
++                                       + static_cast<ptrdiff_t>(head_idx) * _k_src_head_stride;
++            const ptrdiff_t v_src_base = static_cast<ptrdiff_t>(token_idx) * _v_src_stride
++                                       + static_cast<ptrdiff_t>(head_idx) * _v_src_head_stride;
++            const ptrdiff_t k_dst_base = static_cast<ptrdiff_t>(physical_block_idx) * _k_cache_block_stride
++                                       + static_cast<ptrdiff_t>(head_idx) * _k_cache_head_stride
++                                       + static_cast<ptrdiff_t>(block_offset) * _k_cache_slot_stride;
++            const ptrdiff_t v_dst_base = static_cast<ptrdiff_t>(physical_block_idx) * _v_cache_block_stride
++                                       + static_cast<ptrdiff_t>(head_idx) * _v_cache_head_stride
++                                       + static_cast<ptrdiff_t>(block_offset) * _v_cache_slot_stride;
++
++            copy(_k_cache_gm, k_dst_base, _k_gm, k_src_base, _head_size * (_group_heads ? _num_kv_heads : 1));
++            copy(_v_cache_gm, v_dst_base, _v_gm, v_src_base, _v_head_size * (_group_heads ? _num_kv_heads : 1));
+         }
+-
+-        const int64_t physical_block_idx = slot_idx / static_cast<int64_t>(_block_size);
+-        const int64_t block_offset = slot_idx % static_cast<int64_t>(_block_size);
+-
+-        const ptrdiff_t k_src_base = static_cast<ptrdiff_t>(token_idx) * _k_src_stride
+-                                   + static_cast<ptrdiff_t>(head_idx) * _k_src_head_stride;
+-        const ptrdiff_t v_src_base = static_cast<ptrdiff_t>(token_idx) * _v_src_stride
+-                                   + static_cast<ptrdiff_t>(head_idx) * _v_src_head_stride;
+-        const ptrdiff_t k_dst_base = static_cast<ptrdiff_t>(physical_block_idx) * _k_cache_block_stride
+-                                   + static_cast<ptrdiff_t>(head_idx) * _k_cache_head_stride
+-                                   + static_cast<ptrdiff_t>(block_offset) * _k_cache_slot_stride;
+-        const ptrdiff_t v_dst_base = static_cast<ptrdiff_t>(physical_block_idx) * _v_cache_block_stride
+-                                   + static_cast<ptrdiff_t>(head_idx) * _v_cache_head_stride
+-                                   + static_cast<ptrdiff_t>(block_offset) * _v_cache_slot_stride;
+-
+-        for (size_t d = 0; d < _head_size; ++d) {
+-            _k_cache_gm.SetValue(k_dst_base + static_cast<ptrdiff_t>(d), _k_gm.GetValue(k_src_base + static_cast<ptrdiff_t>(d)));
+-        }
+-        for (size_t d = 0; d < _v_head_size; ++d) {
+-            _v_cache_gm.SetValue(v_dst_base + static_cast<ptrdiff_t>(d), _v_gm.GetValue(v_src_base + static_cast<ptrdiff_t>(d)));
++    }
++
++    __aicore__ inline void copy(GlobalTensor<Tdata> &dst, ptrdiff_t dst_base,
++                                GlobalTensor<Tdata> &src, ptrdiff_t src_base, size_t count) {
++        for (size_t offset = 0; offset < count; offset += 1024) {
++            const size_t size = count - offset < 1024 ? count - offset : 1024;
++            LocalTensor<Tdata> local = _copy_buffer.Get<Tdata>();
++            DataCopyExtParams params{1, static_cast<uint32_t>(size * sizeof(Tdata)), 0, 0, 0};
++            DataCopyPadExtParams<Tdata> padding{false, 0, 0, 0};
++            DataCopyPad(local, src[src_base + offset], params, padding);
++            SetFlag<HardEvent::MTE2_MTE3>(0);
++            WaitFlag<HardEvent::MTE2_MTE3>(0);
++            DataCopyPad(dst[dst_base + offset], local, params);
++            SetFlag<HardEvent::MTE3_MTE2>(0);
++            WaitFlag<HardEvent::MTE3_MTE2>(0);
+         }
+     }
+ 
+@@ -88,6 +111,10 @@
+     GlobalTensor<Tdata> _v_gm;
+     GlobalTensor<int64_t> _slot_mapping_gm;
+ 
++    TPipe _pipe;
++    TBuf<QuePosition::VECCALC> _copy_buffer;
++    bool _group_heads;
++    size_t _num_tokens;
+     size_t _num_kv_heads;
+     size_t _head_size;
+     size_t _v_head_size;
+@@ -107,7 +134,7 @@
+ #define DEFINE_PAGED_CACHING_KERNEL(KERNEL_NAME, TYPE)                 \
+     extern "C" __global__ __aicore__ void KERNEL_NAME(                 \
+         GM_ADDR k_cache, GM_ADDR v_cache, GM_ADDR k, GM_ADDR v,        \
+-        GM_ADDR slot_mapping, size_t num_kv_heads, size_t head_size,   \
++        GM_ADDR slot_mapping, size_t num_tokens, size_t num_kv_heads, size_t head_size,   \
+         size_t v_head_size, size_t block_size, ptrdiff_t k_src_stride, \
+         ptrdiff_t v_src_stride, ptrdiff_t k_src_head_stride,           \
+         ptrdiff_t v_src_head_stride, ptrdiff_t k_cache_block_stride,   \
+@@ -115,7 +142,7 @@
+         ptrdiff_t v_cache_head_stride, ptrdiff_t k_cache_slot_stride,  \
+         ptrdiff_t v_cache_slot_stride) {                               \
+         PagedCachingKernel<TYPE> op;                                   \
+-        op.init(k_cache, v_cache, k, v, slot_mapping, num_kv_heads,    \
++        op.init(k_cache, v_cache, k, v, slot_mapping, num_tokens, num_kv_heads,    \
+                 head_size, v_head_size, block_size, k_src_stride,      \
+                 v_src_stride, k_src_head_stride, v_src_head_stride,    \
+                 k_cache_block_stride, v_cache_block_stride,            \
+@@ -153,7 +180,12 @@
+     ptrdiff_t k_cache_slot_stride,
+     ptrdiff_t v_cache_slot_stride,
+     void *stream) {
+-    const size_t block_dim = num_tokens * num_kv_heads;
++    const bool group_heads = k_src_head_stride == static_cast<ptrdiff_t>(head_size)
++                             && v_src_head_stride == static_cast<ptrdiff_t>(v_head_size)
++                             && k_cache_head_stride == static_cast<ptrdiff_t>(head_size)
++                             && v_cache_head_stride == static_cast<ptrdiff_t>(v_head_size);
++    const size_t work = num_tokens * (group_heads ? 1 : num_kv_heads);
++    const size_t block_dim = work < 64 ? work : 64;
+     if (block_dim == 0) {
+         return INFINI_STATUS_SUCCESS;
+     }
+@@ -162,7 +194,7 @@
+     case DTYPE_ENUM:                                                        \
+         KERNEL_NAME<<<block_dim, nullptr, stream>>>(                        \
+             k_cache, v_cache, const_cast<void *>(k), const_cast<void *>(v), \
+-            const_cast<void *>(slot_mapping), num_kv_heads, head_size,      \
++            const_cast<void *>(slot_mapping), num_tokens, num_kv_heads, head_size,      \
+             v_head_size, block_size, k_src_stride, v_src_stride,            \
+             k_src_head_stride, v_src_head_stride,                           \
+             k_cache_block_stride, v_cache_block_stride,                     \
