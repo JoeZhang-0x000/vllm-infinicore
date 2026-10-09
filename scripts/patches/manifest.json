@@ -1,0 +1,40 @@
+{
+  "repository": "https://github.com/InfiniTensor/InfiniOps",
+  "base_revision": "8c2f70a2eebcdeb2f63b2184d1d2d3b087a8db02",
+  "patches": [
+    {
+      "name": "metax-embedding",
+      "commit": "ab2a5af5049a62e3a9a4805c9ba148cc01284722",
+      "pull_request": "https://github.com/InfiniTensor/InfiniOps/pull/997",
+      "url": "https://github.com/InfiniTensor/InfiniOps/commit/ab2a5af5049a62e3a9a4805c9ba148cc01284722.patch",
+      "file": "metax-embedding.patch",
+      "sha256": "8b705c3ef4d9e1f4e00a1fa71c54473acf2ac45e05b07a8df386ecc7ce34dad9"
+    },
+    {
+      "name": "metax-fused-add-rms-norm",
+      "commit": "465ff90169f59cb0345a4af427f6ff83ab1eb98a",
+      "pull_request": "https://github.com/InfiniTensor/InfiniOps/pull/998",
+      "url": "https://github.com/InfiniTensor/InfiniOps/commit/465ff90169f59cb0345a4af427f6ff83ab1eb98a.patch",
+      "file": "metax-fused-add-rms-norm.patch",
+      "sha256": "f28eb425f66b06b64c7145d4d9baef7953b4bab997a63f8c89a1525d2ef4f405"
+    },
+    {
+      "name": "metax-rms-norm",
+      "commit": "10ad53399aaf0dcba1d2f3d1d9164e9c61da7833",
+      "pull_request": "https://github.com/InfiniTensor/InfiniOps/pull/999",
+      "url": "https://github.com/InfiniTensor/InfiniOps/commit/10ad53399aaf0dcba1d2f3d1d9164e9c61da7833.patch",
+      "file": "metax-rms-norm.patch",
+      "sha256": "ff24c1bdb6c7d5a9532212d4435aaffed82e8aa199f581338daaac4238a79234"
+    }
+  ],
+  "files": {
+    "src/native/cuda/metax/ops/embedding/kernel.cuh": "2d0364c89ade2b40bb08325584a7b9af166d10d071218d675ea242eafa8fd128",
+    "src/native/cuda/metax/ops/embedding/kernel.h": "f7fa050c852853a511df8173680a03eb430de4a4eb4e5a7e916836a81fc7749f",
+    "tests/test_embedding.py": "0f44a958084df891f3b0f67e964a4ddb27c003f7483ed17f8769d8012e697f47",
+    "src/native/cuda/metax/ops/fused_add_rms_norm/kernel.cuh": "2fabb1b054545283819a3bf42980c3fd53f89a1530d8ca99d3bcf32e11b40124",
+    "src/native/cuda/metax/ops/fused_add_rms_norm/kernel.h": "9d3557857d4c664f38c4b509f5cb16de4f9e46e75238ef1573f61e38ac9b075e",
+    "tests/test_fused_add_rms_norm.py": "630a57fe4ba4d00628a53d05cc9ccee249509d43e44c3226886579e7f6bc6ea6",
+    "src/native/cuda/ops/rms_norm/kernel.h": "2af229861bcaa4f7471620ac2725599fe3f3c3c756ce8f20c3807a4d98459c1f",
+    "tests/test_rms_norm.py": "59bc034a447d47cb370857f4d8b54992c4df91186524ee84f00eb9e48eec661d"
+  }
+}

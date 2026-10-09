@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib import import_module
-import os
 from types import MappingProxyType
-from typing import Callable, Mapping
 
 PATCH_ENABLE_ENV = "VLLM_INFINICORE_ENABLE_PATCHES"
 ROUTE_SELECT_ENV = "VLLM_INFINICORE_ROUTES"
@@ -74,16 +74,12 @@ class RegistrationResult:
 
     @property
     def native_fallback_routes(self) -> tuple[str, ...]:
-        return tuple(
-            state.name for state in self.route_states if state.fallback_active
-        )
+        return tuple(state.name for state in self.route_states if state.fallback_active)
 
     @property
     def disabled_routes(self) -> tuple[str, ...]:
         return tuple(
-            state.name
-            for state in self.route_states
-            if state.status == ROUTE_STATE_DISABLED
+            state.name for state in self.route_states if state.status == ROUTE_STATE_DISABLED
         )
 
 
@@ -193,12 +189,9 @@ QWEN3_OPERATOR_ROUTES: tuple[OperatorRoute, ...] = (
     ),
 )
 
-ATTENTION_ROUTES = frozenset(
-    {"StoreKVCache", "PagedAttentionPrefill", "PagedAttentionDecode"}
-)
+ATTENTION_ROUTES = frozenset({"StoreKVCache", "PagedAttentionPrefill", "PagedAttentionDecode"})
 NON_ATTENTION_ROUTES = tuple(
-    route.name for route in QWEN3_OPERATOR_ROUTES
-    if route.name not in ATTENTION_ROUTES
+    route.name for route in QWEN3_OPERATOR_ROUTES if route.name not in ATTENTION_ROUTES
 )
 
 
@@ -223,9 +216,7 @@ class PatchRegistry:
         return MappingProxyType(self._routes)
 
     def enabled_route_names(self) -> tuple[str, ...]:
-        return tuple(
-            name for name, route in self._routes.items() if route.default_enabled
-        )
+        return tuple(name for name, route in self._routes.items() if route.default_enabled)
 
     def register_from_environment(self) -> RegistrationResult:
         patching_requested = _env_truthy(PATCH_ENABLE_ENV)
@@ -276,13 +267,9 @@ class PatchRegistry:
                 route_states=route_states,
             )
 
-        unknown_routes = self._unknown_routes(
-            (*requested_routes, *disabled_route_names)
-        )
+        unknown_routes = self._unknown_routes((*requested_routes, *disabled_route_names))
         if unknown_routes:
-            failure_reason = (
-                f"unknown {ROUTE_SELECT_ENV} route(s): {', '.join(unknown_routes)}"
-            )
+            failure_reason = f"unknown {ROUTE_SELECT_ENV} route(s): {', '.join(unknown_routes)}"
             route_states = self._build_disabled_states(
                 requested_routes=requested_routes,
                 disabled_route_names=disabled_route_names,
@@ -343,8 +330,7 @@ class PatchRegistry:
                         disabled_by_env=False,
                         status=ROUTE_STATE_NATIVE_FALLBACK,
                         reason=(
-                            f"{FORCE_NATIVE_FALLBACK_ENV} is true; using "
-                            f"{route.native_fallback}"
+                            f"{FORCE_NATIVE_FALLBACK_ENV} is true; using {route.native_fallback}"
                         ),
                     )
                 )
@@ -401,8 +387,7 @@ class PatchRegistry:
             else:
                 skipped_routes.append(route_name)
                 failure_reasons.append(
-                    f"{route_name}: {install_result.reason}; "
-                    f"using {route.native_fallback}"
+                    f"{route_name}: {install_result.reason}; using {route.native_fallback}"
                 )
                 route_states.append(
                     self._route_state(
@@ -419,9 +404,7 @@ class PatchRegistry:
 
         failure_reason = "; ".join(failure_reasons) or None
         if installed_routes:
-            reason = "installed vLLM patches for routes: " + ", ".join(
-                installed_routes
-            )
+            reason = "installed vLLM patches for routes: " + ", ".join(installed_routes)
             if skipped_routes:
                 reason += "; skipped routes: " + ", ".join(skipped_routes)
         elif failure_reason:
@@ -498,9 +481,7 @@ class PatchRegistry:
         )
 
     def _unknown_routes(self, route_names: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(
-            route_name for route_name in route_names if route_name not in self._routes
-        )
+        return tuple(route_name for route_name in route_names if route_name not in self._routes)
 
     def _build_disabled_states(
         self,
@@ -561,9 +542,7 @@ def get_default_registry() -> PatchRegistry:
             f"operator backend {backend_name} declares unsupported routes: "
             + ", ".join(sorted(unsupported))
         )
-    if backend_name == "ascend" and not os.environ.get(
-        "VLLM_INFINICORE_ASCEND_LIBRARY"
-    ):
+    if backend_name == "ascend" and not os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
         supported.clear()
 
     fallback_reasons = {}
@@ -572,9 +551,7 @@ def get_default_registry() -> PatchRegistry:
             continue
         if backend_name is None:
             reason = f"{OPERATOR_BACKEND_ENV} is unset"
-        elif backend_name == "ascend" and not os.environ.get(
-            "VLLM_INFINICORE_ASCEND_LIBRARY"
-        ):
+        elif backend_name == "ascend" and not os.environ.get("VLLM_INFINICORE_ASCEND_LIBRARY"):
             reason = "VLLM_INFINICORE_ASCEND_LIBRARY is unset"
         else:
             reason = f"{backend_name} operator adapter does not support this route"
@@ -600,15 +577,9 @@ def get_default_registry() -> PatchRegistry:
         replace(
             route,
             implementation=(
-                f"{backend_name}_operator_adapter"
-                if route.name in supported
-                else "native_vllm"
+                f"{backend_name}_operator_adapter" if route.name in supported else "native_vllm"
             ),
-            graph_policy=(
-                adapter.GRAPH_POLICY
-                if route.name in supported
-                else "native_vllm"
-            ),
+            graph_policy=(adapter.GRAPH_POLICY if route.name in supported else "native_vllm"),
         )
         for route in QWEN3_OPERATOR_ROUTES
     )
@@ -642,6 +613,7 @@ def _parse_route_names(
         elif route_token == "recommended":
             from ..operators.selection import selected_backend
             from .policy import recommended_routes
+
             expanded_routes = recommended_routes(selected_backend())
         else:
             expanded_routes = ()

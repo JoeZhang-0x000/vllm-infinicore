@@ -1,0 +1,41 @@
+From 10ad53399aaf0dcba1d2f3d1d9164e9c61da7833 Mon Sep 17 00:00:00 2001
+From: JoeZhang-0x000 <77204052+JoeZhang-0x000@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 14:32:46 +0800
+Subject: [PATCH] perf(metax): reduce RMSNorm blocks for small head dimensions
+
+---
+ src/native/cuda/ops/rms_norm/kernel.h | 6 ++++++
+ tests/test_rms_norm.py                | 3 +++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/src/native/cuda/ops/rms_norm/kernel.h b/src/native/cuda/ops/rms_norm/kernel.h
+index 0cd3be915..4e05611c7 100644
+--- a/src/native/cuda/ops/rms_norm/kernel.h
++++ b/src/native/cuda/ops/rms_norm/kernel.h
+@@ -35,6 +35,12 @@ class CudaRmsNorm : public RmsNorm {
+     assert(out.dtype() == input.dtype());
+ 
+     int block_size = RuntimeUtils<Backend::kDeviceType>::GetOptimalBlockSize();
++    if constexpr (Backend::kDeviceType == Device::Type::kMetax) {
++      // Q/K rows need fewer reduction threads than the device-wide default.
++      if (dim_ <= 128) {
++        block_size = 128;
++      }
++    }
+ 
+     DispatchFunc<ConcatType<List<DataType::kFloat32>, ReducedFloatTypes>,
+                  ConcatType<List<DataType::kFloat32>, ReducedFloatTypes>,
+diff --git a/tests/test_rms_norm.py b/tests/test_rms_norm.py
+index 707f9a85f..8fb2410db 100644
+--- a/tests/test_rms_norm.py
++++ b/tests/test_rms_norm.py
+@@ -15,6 +15,9 @@
+         ((2, 4, 2048), (2048,), None, None, None),
+         ((1, 64), (64,), (64, 1), (1,), (64, 1)),
+         ((4, 48, 64), (64,), (3072, 64, 1), (1,), (3072, 64, 1)),
++        ((64, 16, 128), (128,), (3072, 128, 1), None, None),
++        ((2048, 4, 128), (128,), (3072, 128, 1), None, None),
++        ((64, 16, 129), (129,), None, None, None),
+     ),
+ )
+ @pytest.mark.parametrize("eps", (1e-6, 1e-5))

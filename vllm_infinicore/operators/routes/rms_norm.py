@@ -1,11 +1,10 @@
-"""vLLM OOT RMSNorm route for the InfiniCore prototype op."""
+"""vLLM OOT RMSNorm route for the InfiniCore custom op."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
-
 from vllm.model_executor.custom_op import CustomOp
 
 try:
@@ -35,7 +34,7 @@ class VllmRMSNormUninstallStatus:
 
 
 class InfiniCoreRMSNorm(VllmRMSNorm):
-    """Narrow vLLM RMSNorm replacement backed by the prototype custom ops.
+    """Narrow vLLM RMSNorm replacement backed by the custom ops.
 
     Both the plain and the fused residual-add paths are routed when the layer
     is weighted and has no variance override. The fused path matters: in a
@@ -183,8 +182,7 @@ def uninstall_vllm_rms_norm_oot() -> VllmRMSNormUninstallStatus:
     return VllmRMSNormUninstallStatus(
         uninstalled=False,
         reason=(
-            f"{VLLM_RMS_NORM_CLASS} OOT route is owned by "
-            f"{existing.__module__}.{existing.__name__}"
+            f"{VLLM_RMS_NORM_CLASS} OOT route is owned by {existing.__module__}.{existing.__name__}"
         ),
     )
 

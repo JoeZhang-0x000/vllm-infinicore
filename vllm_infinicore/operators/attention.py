@@ -8,8 +8,8 @@ fail on unsupported configurations; they never silently select native kernels.
 
 from __future__ import annotations
 
-from functools import wraps
 import importlib
+from functools import wraps
 
 import torch
 
@@ -78,16 +78,38 @@ def _unsupported(impl, metadata, output_scale, output_block_scale):
     return None
 
 
-def _fallback(reason, native):
+def _unsupported_error(reason):
     raise NotImplementedError(f"InfiniCore attention: {reason}")
 
 
 def _forward(original, backend):
     @wraps(original)
-    def forward(self, layer, query, key, value, kv_cache, attn_metadata,
-                output=None, output_scale=None, output_block_scale=None):
-        native = lambda: original(self, layer, query, key, value, kv_cache,
-                                  attn_metadata, output, output_scale, output_block_scale)
+    def forward(
+        self,
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output=None,
+        output_scale=None,
+        output_block_scale=None,
+    ):
+        def native():
+            return original(
+                self,
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
+
         if attn_metadata is None:
             return native()  # vLLM's memory profiling has no attention work.
         m = attn_metadata
@@ -103,12 +125,12 @@ def _forward(original, backend):
                 _record_native(name)
             return native()
         if not needs.issubset(_ACTIVE):
-            return _fallback("mixed batch requires both attention routes", native)
+            return _unsupported_error("mixed batch requires both attention routes")
         reason = _unsupported(self, m, output_scale, output_block_scale)
         if nt and nt != nd:
             reason = "multi-token speculative decode"
         if reason:
-            return _fallback(reason, native)
+            return _unsupported_error(reason)
         q = query.view(-1, self.num_heads, self.head_size)
         if output is None:
             output = torch.empty_like(q)
@@ -124,7 +146,11 @@ def _forward(original, backend):
                 module.kunlun_ops.reshape_and_cache_flash(
                     key.view(-1, self.num_kv_heads, self.head_size)[:n],
                     value.view(-1, self.num_kv_heads, self.head_size)[:n],
-                    k, v, m.slot_mapping[:n], BLHD_LAYOUT=False)
+                    k,
+                    v,
+                    m.slot_mapping[:n],
+                    BLHD_LAYOUT=False,
+                )
         if backend == "kunlun":
             lengths, blocks = m.seq_lens_tensor, m.block_tables
         elif backend == "ascend":
@@ -132,14 +158,25 @@ def _forward(original, backend):
         else:
             lengths, blocks = m.seq_lens, m.block_table
         if nt:
-            ops.compute(q[:nt], k, v, blocks[:nd], lengths[:nd], None,
-                        self.scale, out[:nt], decode=True)
+            ops.compute(
+                q[:nt], k, v, blocks[:nd], lengths[:nd], None, self.scale, out[:nt], decode=True
+            )
         if n > nt:
             nr = nd + m.num_prefills
-            starts = m.query_start_loc[nd:nr + 1] - nt
-            ops.compute(q[nt:n], k, v, blocks[nd:nr], lengths[nd:nr], starts,
-                        self.scale, out[nt:n], decode=False)
+            starts = m.query_start_loc[nd : nr + 1] - nt
+            ops.compute(
+                q[nt:n],
+                k,
+                v,
+                blocks[nd:nr],
+                lengths[nd:nr],
+                starts,
+                self.scale,
+                out[nt:n],
+                decode=False,
+            )
         return output.view(-1, self.num_heads * self.head_size) if backend == "kunlun" else output
+
     return forward
 
 
@@ -150,10 +187,16 @@ def _update(original):
             return original(self, layer, key, value, kv_cache, slot_mapping)
         reason = _unsupported(self, None, None, None)
         if reason:
-            return _fallback(reason, lambda: original(self, layer, key, value, kv_cache, slot_mapping))
+            return _unsupported_error(reason)
         k, v = ops.cache_views(kv_cache, self.num_kv_heads)
-        ops.store(k, v, key.view(-1, self.num_kv_heads, self.head_size),
-                  value.view(-1, self.num_kv_heads, self.head_size), slot_mapping)
+        ops.store(
+            k,
+            v,
+            key.view(-1, self.num_kv_heads, self.head_size),
+            value.view(-1, self.num_kv_heads, self.head_size),
+            slot_mapping,
+        )
+
     return update
 
 
@@ -167,28 +210,38 @@ def _ascend_store(original):
             raise NotImplementedError(reason)
         k, v = ops.cache_views(kv_cache, self.num_kv_heads)
         n = metadata.num_actual_tokens
-        ops.store(k, v, key.view(-1, self.num_kv_heads, self.head_size),
-                  value.view(-1, self.num_kv_heads, self.head_size), metadata.slot_mapping[:n])
+        ops.store(
+            k,
+            v,
+            key.view(-1, self.num_kv_heads, self.head_size),
+            value.view(-1, self.num_kv_heads, self.head_size),
+            metadata.slot_mapping[:n],
+        )
         self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
         from vllm_ascend.attention.attention_v1 import notify_kv_cache_written
+
         notify_kv_cache_written()
         return query, key, value, output
+
     return store
 
 
 class _KunlunOps:
     """Replace only the module-local cache call, including store-only routing."""
+
     def __init__(self, original):
         self.original = original
 
     def __getattr__(self, name):
         return getattr(self.original, name)
 
-    def reshape_and_cache_flash(self, key, value, key_cache, value_cache,
-                                slot_mapping, BLHD_LAYOUT=False):
+    def reshape_and_cache_flash(
+        self, key, value, key_cache, value_cache, slot_mapping, BLHD_LAYOUT=False
+    ):
         if _native_store("kunlun", slot_mapping.numel()):
             return self.original.reshape_and_cache_flash(
-                key, value, key_cache, value_cache, slot_mapping, BLHD_LAYOUT=BLHD_LAYOUT)
+                key, value, key_cache, value_cache, slot_mapping, BLHD_LAYOUT=BLHD_LAYOUT
+            )
         if BLHD_LAYOUT:
             key_cache, value_cache = key_cache.transpose(1, 2), value_cache.transpose(1, 2)
         return ops.store(key_cache, value_cache, key, value, slot_mapping)
@@ -202,8 +255,9 @@ def _ascend_build(original):
         # InfiniCore kernels read the model runner's persistent device buffers.
         nr = common_attn_metadata.num_reqs
         m._infinicore_seq_lens = common_attn_metadata.seq_lens[:nr]
-        m.query_start_loc = common_attn_metadata.query_start_loc[:nr + 1]
+        m.query_start_loc = common_attn_metadata.query_start_loc[: nr + 1]
         return m
+
     return build
 
 
@@ -213,6 +267,7 @@ def _ascend_graph_update(original):
         if {"PagedAttentionPrefill", "PagedAttentionDecode"}.issubset(_ACTIVE):
             return  # InfiniCore consumes device metadata, no FIA task handles.
         return original(*args, **kwargs)
+
     return staticmethod(update)
 
 
@@ -262,7 +317,7 @@ def install(name, backend):
         _BACKEND = None
         raise
     _ACTIVE.add(name)
-    return PatchInstallResult(True, f"InfiniCore {backend} {name} C API on current stream")
+    return PatchInstallResult(True, f"InfiniCore {backend} {name} on current stream")
 
 
 def uninstall(name, backend):
@@ -270,7 +325,9 @@ def uninstall(name, backend):
     if name not in _ACTIVE:
         return PatchUninstallResult(False, "attention route not installed")
     if len(_ACTIVE) == 1:
-        if any(vars(cls).get(method) is not replacement for cls, method, _, replacement in _PATCHES):
+        if any(
+            vars(cls).get(method) is not replacement for cls, method, _, replacement in _PATCHES
+        ):
             return PatchUninstallResult(False, "attention method changed by another patch")
         for cls, method, original, _ in reversed(_PATCHES):
             if original is None:

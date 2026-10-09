@@ -2,8 +2,9 @@
 
 Explicit operator lists (including ``all``) still force the selected kernels.
 The ``recommended`` profile keeps attention computation native and only
-enables auxiliary kernels supported by the measurements in docs/.
+enables a conservative subset of auxiliary kernels.
 """
+
 from __future__ import annotations
 
 import os
@@ -26,8 +27,7 @@ def recommended_routes(backend: str | None) -> tuple[str, ...]:
 
 def recommended_selected() -> bool:
     return "recommended" in {
-        token.strip().lower()
-        for token in os.environ.get("VLLM_INFINICORE_ROUTES", "").split(",")
+        token.strip().lower() for token in os.environ.get("VLLM_INFINICORE_ROUTES", "").split(",")
     }
 
 

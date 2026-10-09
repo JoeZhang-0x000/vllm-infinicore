@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 
-from . import SUPPORTED_ROUTES
+from . import SUPPORTED_ROUTES as SUPPORTED_ROUTES
 
 MODULE_NAME = "vllm_infinicore_kunlun_cpp_bridge"
 EXTRA_CFLAGS = ("-DENABLE_CUDA_API", "-DENABLE_KUNLUN_API")

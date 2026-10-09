@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
-
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
 from ..custom_ops import LINEAR_OP, LM_HEAD_OP, load_custom_ops
 
 VLLM_LINEAR_ROUTE_NAMES = ("MatMul", "LMHead")
@@ -88,10 +88,7 @@ def uninstall_vllm_unquantized_linear_route(
     if route_name == "MatMul" and _ORIGINAL_LINEAR_APPLY is not None:
         UnquantizedLinearMethod.apply = _ORIGINAL_LINEAR_APPLY
         _ORIGINAL_LINEAR_APPLY = None
-    if (
-        route_name == "LMHead"
-        and _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS is not None
-    ):
+    if route_name == "LMHead" and _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS is not None:
         LogitsProcessor._get_logits = _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS
         _ORIGINAL_LOGITS_PROCESSOR_GET_LOGITS = None
 

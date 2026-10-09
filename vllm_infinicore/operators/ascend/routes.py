@@ -8,14 +8,13 @@ choice in one place so every route makes it the same way.
 
 from __future__ import annotations
 
-from functools import wraps
 import importlib
+from functools import wraps
 
 import torch
 
 from ...routing.patching import PatchInstallResult, PatchUninstallResult
-from . import backend
-from . import graph_ops
+from . import backend, graph_ops
 
 _TARGETS = {
     "RMSNorm": ("vllm_ascend.ops.layernorm", "AscendRMSNorm", "forward_oot"),
@@ -73,7 +72,9 @@ def _dispatch(name, tensor, checks, traced, eager, native):
 def _rms_norm(original):
     @wraps(original)
     def rms(self, x, residual=None):
-        native = lambda: original(self, x, residual)
+        def native():
+            return original(self, x, residual)
+
         if residual is not None:
             return backend.fallback(
                 "fused_add_rms_norm",
@@ -92,19 +93,14 @@ def _rms_norm(original):
             x,
             [
                 (
-                    getattr(self, "variance_size_override", None)
-                    in (None, x.shape[-1]),
+                    getattr(self, "variance_size_override", None) in (None, x.shape[-1]),
                     "partial RMSNorm variance",
                 ),
                 backend.supports_tensor(x),
                 backend.supports_tensor(self.weight),
             ],
-            traced=lambda: finish(
-                graph_ops.rms_norm(x, self.weight, self.variance_epsilon)
-            ),
-            eager=lambda: finish(
-                backend.rms_norm(x, self.weight, self.variance_epsilon)
-            ),
+            traced=lambda: finish(graph_ops.rms_norm(x, self.weight, self.variance_epsilon)),
+            eager=lambda: finish(backend.rms_norm(x, self.weight, self.variance_epsilon)),
             native=native,
         )
 
@@ -114,7 +110,8 @@ def _rms_norm(original):
 def _silu_and_mul(original):
     @wraps(original)
     def silu(self, x):
-        native = lambda: original(self, x)
+        def native():
+            return original(self, x)
 
         def prefetched(launch):
             prefetch = _prefetch()
@@ -138,18 +135,14 @@ def _silu_and_mul(original):
 def _rotary_embedding(original):
     @wraps(original)
     def rope(self, positions, query, key, offsets=None, is_neox_style_override=None):
-        native = lambda: original(
-            self, positions, query, key, offsets, is_neox_style_override
-        )
+        def native():
+            return original(self, positions, query, key, offsets, is_neox_style_override)
+
         if torch.compiler.is_compiling() and key is None:
             # The operator returns two tensors, so a missing key cannot be
             # expressed in its schema and stays on the native path.
             return native()
-        neox = (
-            self.is_neox_style
-            if is_neox_style_override is None
-            else is_neox_style_override
-        )
+        neox = self.is_neox_style if is_neox_style_override is None else is_neox_style_override
         args = (
             positions,
             query,
@@ -166,9 +159,7 @@ def _rotary_embedding(original):
             ),
             backend.supports_tensor(positions),
             backend.supports_tensor(query),
-            backend.supports_rotary_embedding(
-                positions, self.head_size, self.rotary_dim
-            ),
+            backend.supports_rotary_embedding(positions, self.head_size, self.rotary_dim),
         ]
         if key is not None:
             checks.append(backend.supports_tensor(key))
@@ -187,7 +178,9 @@ def _rotary_embedding(original):
 def _embedding(original):
     @wraps(original)
     def embedding(self, layer, input_):
-        native = lambda: original(self, layer, input_)
+        def native():
+            return original(self, layer, input_)
+
         return _dispatch(
             "embedding",
             input_,
@@ -203,7 +196,9 @@ def _embedding(original):
 def _linear(original, name):
     @wraps(original)
     def linear(self, layer, x, bias=None):
-        native = lambda: original(self, layer, x, bias)
+        def native():
+            return original(self, layer, x, bias)
+
         return _dispatch(
             name,
             x,
