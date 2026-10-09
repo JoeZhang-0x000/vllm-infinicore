@@ -1,0 +1,170 @@
+From 465ff90169f59cb0345a4af427f6ff83ab1eb98a Mon Sep 17 00:00:00 2001
+From: JoeZhang-0x000 <77204052+JoeZhang-0x000@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 14:32:45 +0800
+Subject: [PATCH] perf(metax): vectorize small fused add RMSNorm rows
+
+---
+ .../metax/ops/fused_add_rms_norm/kernel.cuh   | 77 +++++++++++++++++++
+ .../metax/ops/fused_add_rms_norm/kernel.h     | 41 ++++++++++
+ tests/test_fused_add_rms_norm.py              |  5 ++
+ 3 files changed, 123 insertions(+)
+ create mode 100644 src/native/cuda/metax/ops/fused_add_rms_norm/kernel.cuh
+
+diff --git a/src/native/cuda/metax/ops/fused_add_rms_norm/kernel.cuh b/src/native/cuda/metax/ops/fused_add_rms_norm/kernel.cuh
+new file mode 100644
+index 000000000..829a81748
+--- /dev/null
++++ b/src/native/cuda/metax/ops/fused_add_rms_norm/kernel.cuh
+@@ -0,0 +1,77 @@
++#ifndef INFINI_OPS_METAX_FUSED_ADD_RMS_NORM_KERNEL_CUH_
++#define INFINI_OPS_METAX_FUSED_ADD_RMS_NORM_KERNEL_CUH_
++
++#include <cub/block/block_reduce.cuh>
++
++#include "native/cuda/metax/caster.cuh"
++
++namespace infini::ops {
++
++template <typename T>
++struct alignas(16) MetaxNormPack {
++  T values[8];
++};
++
++template <typename T>
++__global__ void MetaxFusedAddRmsNormVectorizedKernel(
++    T* input, int64_t input_stride, T* residual, int64_t residual_stride,
++    const T* weight, float epsilon) {
++  constexpr int kThreads = 256;
++  constexpr int kItems = 16;
++  constexpr auto kDevice = Device::Type::kMetax;
++  using Pack = MetaxNormPack<T>;
++  auto x = reinterpret_cast<Pack*>(input + blockIdx.x * input_stride);
++  auto r = reinterpret_cast<Pack*>(residual + blockIdx.x * residual_stride);
++  auto w = reinterpret_cast<const Pack*>(weight);
++  float values[kItems];
++  float sum_squared = 0.0f;
++
++#pragma unroll
++  for (int pack = 0; pack < 2; ++pack) {
++    const int offset = threadIdx.x * 2 + pack;
++    Pack xv = x[offset];
++    Pack rv = r[offset];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++      float merged = Caster<kDevice>::template Cast<float>(xv.values[i]) +
++                     Caster<kDevice>::template Cast<float>(rv.values[i]);
++      rv.values[i] = Caster<kDevice>::template Cast<T>(merged);
++      float rounded = Caster<kDevice>::template Cast<float>(rv.values[i]);
++      values[pack * 8 + i] = rounded;
++      sum_squared += rounded * rounded;
++    }
++    r[offset] = rv;
++  }
++
++  using Reduce = cub::BlockReduce<float, kThreads>;
++  __shared__ typename Reduce::TempStorage storage;
++  float total = Reduce(storage).Sum(sum_squared);
++  __shared__ float inverse_rms;
++  if (threadIdx.x == 0) {
++    inverse_rms = rsqrtf(total / 4096.0f + epsilon);
++  }
++  __syncthreads();
++
++#pragma unroll
++  for (int pack = 0; pack < 2; ++pack) {
++    const int offset = threadIdx.x * 2 + pack;
++    Pack out;
++    Pack gamma;
++    if (weight != nullptr) {
++      gamma = w[offset];
++    }
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++      float value = values[pack * 8 + i] * inverse_rms;
++      if (weight != nullptr) {
++        value *= Caster<kDevice>::template Cast<float>(gamma.values[i]);
++      }
++      out.values[i] = Caster<kDevice>::template Cast<T>(value);
++    }
++    x[offset] = out;
++  }
++}
++
++}  // namespace infini::ops
++
++#endif
+diff --git a/src/native/cuda/metax/ops/fused_add_rms_norm/kernel.h b/src/native/cuda/metax/ops/fused_add_rms_norm/kernel.h
+index c79d67df0..fd96fb5e0 100644
+--- a/src/native/cuda/metax/ops/fused_add_rms_norm/kernel.h
++++ b/src/native/cuda/metax/ops/fused_add_rms_norm/kernel.h
+@@ -4,6 +4,7 @@
+ #include <utility>
+ 
+ #include "native/cuda/metax/caster.cuh"
++#include "native/cuda/metax/ops/fused_add_rms_norm/kernel.cuh"
+ #include "native/cuda/metax/runtime_.h"
+ #include "native/cuda/ops/fused_add_rms_norm/kernel.h"
+ 
+@@ -14,6 +15,46 @@ class Operator<FusedAddRmsNorm, Device::Type::kMetax>
+     : public CudaFusedAddRmsNorm<Runtime<Device::Type::kMetax>> {
+  public:
+   using CudaFusedAddRmsNorm<Runtime<Device::Type::kMetax>>::CudaFusedAddRmsNorm;
++
++  void operator()(Tensor input, Tensor residual,
++                  const std::optional<Tensor> weight,
++                  float epsilon) const override {
++    if (num_tokens_ == 0) {
++      return;
++    }
++
++    if (num_tokens_ > 128 || dim_ != 4096 ||
++        input_strides_[input_strides_.size() - 2] % 8 != 0 ||
++        residual_strides_[residual_strides_.size() - 2] % 8 != 0 ||
++        reinterpret_cast<uintptr_t>(input.data()) % 16 != 0 ||
++        reinterpret_cast<uintptr_t>(residual.data()) % 16 != 0 ||
++        (weight.has_value() &&
++         reinterpret_cast<uintptr_t>(weight->data()) % 16 != 0)) {
++      CudaFusedAddRmsNorm<Runtime<Device::Type::kMetax>>::operator()(
++          input, residual, weight, epsilon);
++      return;
++    }
++
++    auto cuda_stream = static_cast<Runtime<Device::Type::kMetax>::Stream>(
++        stream_ ? stream_ : 0);
++    DispatchFunc<Device::Type::kMetax,
++                 ConcatType<List<DataType::kFloat32>, ReducedFloatTypes>>(
++        input.dtype(),
++        [&](auto tag) {
++          using T = typename decltype(tag)::type;
++          auto weight_data = weight.has_value()
++                                 ? reinterpret_cast<const T*>(weight->data())
++                                 : nullptr;
++          MetaxFusedAddRmsNormVectorizedKernel<T>
++              <<<static_cast<uint32_t>(num_tokens_), 256, 0, cuda_stream>>>(
++                  reinterpret_cast<T*>(input.data()),
++                  input_strides_[input_strides_.size() - 2],
++                  reinterpret_cast<T*>(residual.data()),
++                  residual_strides_[residual_strides_.size() - 2], weight_data,
++                  epsilon_);
++        },
++        "MetaxFusedAddRmsNorm::operator()");
++  }
+ };
+ 
+ }  // namespace infini::ops
+diff --git a/tests/test_fused_add_rms_norm.py b/tests/test_fused_add_rms_norm.py
+index 9cbd9e765..795b7dcc9 100644
+--- a/tests/test_fused_add_rms_norm.py
++++ b/tests/test_fused_add_rms_norm.py
+@@ -15,6 +15,11 @@
+     ((15, 3584), None, None),
+     ((2, 32769), None, None),
+     ((2, 3, 4, 128), (3072, 1024, 256, 1), (3840, 1280, 320, 1)),
++    ((1, 4096), None, None),
++    ((128, 4096), None, None),
++    ((129, 4096), None, None),
++    ((4, 4096), (4104, 1), (4112, 1)),
++    ((4, 4096), (4097, 1), (4099, 1)),
+ )
+ 
+ 

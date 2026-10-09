@@ -103,11 +103,8 @@ infinicore::Strides strides_from_torch(const at::Tensor &tensor) {
 
 infinicore::Tensor wrap_strided(const at::Tensor &tensor) {
     return infinicore::Tensor::strided_from_blob(
-        const_cast<void *>(tensor.data_ptr()),
-        shape_from_torch(tensor),
-        strides_from_torch(tensor),
-        dtype_from_torch(tensor),
-        device_from_torch(tensor));
+        const_cast<void *>(tensor.data_ptr()), shape_from_torch(tensor), strides_from_torch(tensor),
+        dtype_from_torch(tensor), device_from_torch(tensor));
 }
 
 int64_t flattened_rows(const at::Tensor &tensor) {
@@ -123,13 +120,10 @@ int64_t flattened_rows(const at::Tensor &tensor) {
 
 } // namespace
 
-at::Tensor linear_current_stream(at::Tensor input,
-                                 at::Tensor weight,
+at::Tensor linear_current_stream(at::Tensor input, at::Tensor weight,
                                  c10::optional<at::Tensor> bias);
 
-at::Tensor lm_head(at::Tensor input,
-                   at::Tensor weight,
-                   c10::optional<at::Tensor> bias) {
+at::Tensor lm_head(at::Tensor input, at::Tensor weight, c10::optional<at::Tensor> bias) {
     if (bias.has_value() && bias.value().defined()) {
         at::Tensor out = linear_current_stream(input, weight, c10::optional<at::Tensor>());
         out.add_(bias.value());
@@ -138,14 +132,14 @@ at::Tensor lm_head(at::Tensor input,
     return linear_current_stream(input, weight, c10::optional<at::Tensor>());
 }
 
-at::Tensor linear_current_stream(at::Tensor input,
-                                 at::Tensor weight,
+at::Tensor linear_current_stream(at::Tensor input, at::Tensor weight,
                                  c10::optional<at::Tensor> bias) {
     if (bias.has_value() && bias.value().defined()) {
         throw std::runtime_error("linear_current_stream does not support bias");
     }
     if (input.dim() < 1 || weight.dim() != 2) {
-        throw std::runtime_error("expected input [..., in_features] and weight [out_features, in_features]");
+        throw std::runtime_error(
+            "expected input [..., in_features] and weight [out_features, in_features]");
     }
     const int64_t in_features = input.size(input.dim() - 1);
     if (weight.size(1) != in_features) {
@@ -173,30 +167,20 @@ at::Tensor linear_current_stream(at::Tensor input,
 
     size_t workspace_size = 0;
     try {
-        check_infini_status(
-            infiniopGetGemmWorkspaceSize(desc, &workspace_size),
-            "infiniopGetGemmWorkspaceSize");
+        check_infini_status(infiniopGetGemmWorkspaceSize(desc, &workspace_size),
+                            "infiniopGetGemmWorkspaceSize");
         at::Tensor workspace;
         void *workspace_ptr = nullptr;
         if (workspace_size > 0) {
-            workspace = at::empty(
-                {static_cast<int64_t>(workspace_size)},
-                input.options().dtype(at::kByte));
+            workspace =
+                at::empty({static_cast<int64_t>(workspace_size)}, input.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
         void *stream = current_stream_from_torch(input);
-        check_infini_status(
-            infiniopGemm(
-                desc,
-                workspace_ptr,
-                workspace_size,
-                out_2d.data_ptr(),
-                input_2d.data_ptr(),
-                weight_t.data_ptr(),
-                1.0f,
-                0.0f,
-                stream),
-            "infiniopGemm");
+        check_infini_status(infiniopGemm(desc, workspace_ptr, workspace_size, out_2d.data_ptr(),
+                                         input_2d.data_ptr(), weight_t.data_ptr(), 1.0f, 0.0f,
+                                         stream),
+                            "infiniopGemm");
     } catch (...) {
         infiniopDestroyGemmDescriptor(desc);
         throw;
@@ -210,7 +194,8 @@ at::Tensor embedding_current_stream(at::Tensor input, at::Tensor weight) {
         throw std::runtime_error("embedding_current_stream expects a 2D weight tensor");
     }
     if (input.device() != weight.device()) {
-        throw std::runtime_error("embedding_current_stream expects input and weight on the same device");
+        throw std::runtime_error(
+            "embedding_current_stream expects input and weight on the same device");
     }
     if (input.scalar_type() != at::kInt && input.scalar_type() != at::kLong) {
         throw std::runtime_error("embedding_current_stream expects int32 or int64 input");
@@ -231,27 +216,19 @@ at::Tensor embedding_current_stream(at::Tensor input, at::Tensor weight) {
         "infiniopCreateEmbeddingDescriptor");
 
     try {
-        check_infini_status(
-            infiniopEmbedding(
-                desc,
-                out.data_ptr(),
-                input.data_ptr(),
-                weight.data_ptr(),
-                current_stream_from_torch(weight)),
-            "infiniopEmbedding");
+        check_infini_status(infiniopEmbedding(desc, out.data_ptr(), input.data_ptr(),
+                                              weight.data_ptr(), current_stream_from_torch(weight)),
+                            "infiniopEmbedding");
     } catch (...) {
         infiniopDestroyEmbeddingDescriptor(desc);
         throw;
     }
-    check_infini_status(
-        infiniopDestroyEmbeddingDescriptor(desc),
-        "infiniopDestroyEmbeddingDescriptor");
+    check_infini_status(infiniopDestroyEmbeddingDescriptor(desc),
+                        "infiniopDestroyEmbeddingDescriptor");
     return out;
 }
 
-at::Tensor rms_norm_current_stream(at::Tensor input,
-                                   at::Tensor weight,
-                                   double epsilon) {
+at::Tensor rms_norm_current_stream(at::Tensor input, at::Tensor weight, double epsilon) {
     at::Tensor out = at::empty_like(input);
     auto y = wrap_strided(out);
     auto x = wrap_strided(input);
@@ -259,40 +236,25 @@ at::Tensor rms_norm_current_stream(at::Tensor input,
 
     infiniopRMSNormDescriptor_t desc = nullptr;
     auto handle = infinicore::context::getInfiniopHandle(device_from_torch(input));
-    check_infini_status(
-        infiniopCreateRMSNormDescriptor(
-            handle,
-            &desc,
-            y->desc(),
-            x->desc(),
-            w->desc(),
-            static_cast<float>(epsilon)),
-        "infiniopCreateRMSNormDescriptor");
+    check_infini_status(infiniopCreateRMSNormDescriptor(handle, &desc, y->desc(), x->desc(),
+                                                        w->desc(), static_cast<float>(epsilon)),
+                        "infiniopCreateRMSNormDescriptor");
 
     size_t workspace_size = 0;
     try {
-        check_infini_status(
-            infiniopGetRMSNormWorkspaceSize(desc, &workspace_size),
-            "infiniopGetRMSNormWorkspaceSize");
+        check_infini_status(infiniopGetRMSNormWorkspaceSize(desc, &workspace_size),
+                            "infiniopGetRMSNormWorkspaceSize");
         at::Tensor workspace;
         void *workspace_ptr = nullptr;
         if (workspace_size > 0) {
-            workspace = at::empty(
-                {static_cast<int64_t>(workspace_size)},
-                input.options().dtype(at::kByte));
+            workspace =
+                at::empty({static_cast<int64_t>(workspace_size)}, input.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
         void *stream = current_stream_from_torch(input);
-        check_infini_status(
-            infiniopRMSNorm(
-                desc,
-                workspace_ptr,
-                workspace_size,
-                out.data_ptr(),
-                input.data_ptr(),
-                weight.data_ptr(),
-                stream),
-            "infiniopRMSNorm");
+        check_infini_status(infiniopRMSNorm(desc, workspace_ptr, workspace_size, out.data_ptr(),
+                                            input.data_ptr(), weight.data_ptr(), stream),
+                            "infiniopRMSNorm");
     } catch (...) {
         infiniopDestroyRMSNormDescriptor(desc);
         throw;
@@ -305,50 +267,38 @@ at::Tensor rms_norm_current_stream(at::Tensor input,
 // The wrapped tensors are only needed while the descriptor is created; the
 // launch passes raw data pointers, so they do not need to outlive this call.
 infiniStatus_t create_add_rms_norm_descriptor(infiniopAddRMSNormDescriptor_t *desc,
-                                              const at::Tensor &input,
-                                              const at::Tensor &residual,
-                                              const at::Tensor &weight,
-                                              double epsilon) {
+                                              const at::Tensor &input, const at::Tensor &residual,
+                                              const at::Tensor &weight, double epsilon) {
     auto y = wrap_strided(input);
     auto r_out = wrap_strided(residual);
     auto a = wrap_strided(input);
     auto b = wrap_strided(residual);
     auto w = wrap_strided(weight);
     return infiniopCreateAddRMSNormDescriptor(
-        infinicore::context::getInfiniopHandle(device_from_torch(input)),
-        desc,
-        y->desc(),
-        r_out->desc(),
-        a->desc(),
-        b->desc(),
-        w->desc(),
-        static_cast<float>(epsilon));
+        infinicore::context::getInfiniopHandle(device_from_torch(input)), desc, y->desc(),
+        r_out->desc(), a->desc(), b->desc(), w->desc(), static_cast<float>(epsilon));
 }
 
 // Capability probe for the fused add + RMSNorm. Creates and destroys the
 // descriptor only: no workspace, no launch, no extra allocation. Returns false
 // when this backend simply has no kernel for the op, and rethrows anything else
 // so a genuine failure is never mistaken for a missing capability.
-bool add_rms_norm_supported(at::Tensor input,
-                            at::Tensor residual,
-                            at::Tensor weight,
+bool add_rms_norm_supported(at::Tensor input, at::Tensor residual, at::Tensor weight,
                             double epsilon) {
     if (input.sizes() != residual.sizes()) {
         return false;
     }
     infiniopAddRMSNormDescriptor_t desc = nullptr;
-    infiniStatus_t status =
-        create_add_rms_norm_descriptor(&desc, input, residual, weight, epsilon);
+    infiniStatus_t status = create_add_rms_norm_descriptor(&desc, input, residual, weight, epsilon);
 
     if (status == INFINI_STATUS_SUCCESS) {
-        check_infini_status(
-            infiniopDestroyAddRMSNormDescriptor(desc),
-            "infiniopDestroyAddRMSNormDescriptor");
+        check_infini_status(infiniopDestroyAddRMSNormDescriptor(desc),
+                            "infiniopDestroyAddRMSNormDescriptor");
         return true;
     }
-    if (status == INFINI_STATUS_NOT_IMPLEMENTED
-        || status == INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED
-        || status == INFINI_STATUS_DEVICE_ARCHITECTURE_NOT_SUPPORTED) {
+    if (status == INFINI_STATUS_NOT_IMPLEMENTED ||
+        status == INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED ||
+        status == INFINI_STATUS_DEVICE_ARCHITECTURE_NOT_SUPPORTED) {
         return false;
     }
     check_infini_status(status, "infiniopCreateAddRMSNormDescriptor");
@@ -357,10 +307,8 @@ bool add_rms_norm_supported(at::Tensor input,
 
 // Fused residual-add + RMSNorm. Mirrors vLLM's fused_add_rms_norm contract:
 // residual_out = input + residual, y = rms_norm(residual_out) * weight.
-std::vector<at::Tensor> add_rms_norm_current_stream(at::Tensor input,
-                                                    at::Tensor residual,
-                                                    at::Tensor weight,
-                                                    double epsilon) {
+std::vector<at::Tensor> add_rms_norm_current_stream(at::Tensor input, at::Tensor residual,
+                                                    at::Tensor weight, double epsilon) {
     if (input.sizes() != residual.sizes()) {
         throw std::runtime_error(
             "add_rms_norm_current_stream expects matching input/residual shapes");
@@ -369,43 +317,31 @@ std::vector<at::Tensor> add_rms_norm_current_stream(at::Tensor input,
     at::Tensor residual_out = at::empty_like(input);
 
     infiniopAddRMSNormDescriptor_t desc = nullptr;
-    check_infini_status(
-        create_add_rms_norm_descriptor(&desc, input, residual, weight, epsilon),
-        "infiniopCreateAddRMSNormDescriptor");
+    check_infini_status(create_add_rms_norm_descriptor(&desc, input, residual, weight, epsilon),
+                        "infiniopCreateAddRMSNormDescriptor");
 
     size_t workspace_size = 0;
     try {
-        check_infini_status(
-            infiniopGetAddRMSNormWorkspaceSize(desc, &workspace_size),
-            "infiniopGetAddRMSNormWorkspaceSize");
+        check_infini_status(infiniopGetAddRMSNormWorkspaceSize(desc, &workspace_size),
+                            "infiniopGetAddRMSNormWorkspaceSize");
         at::Tensor workspace;
         void *workspace_ptr = nullptr;
         if (workspace_size > 0) {
-            workspace = at::empty(
-                {static_cast<int64_t>(workspace_size)},
-                input.options().dtype(at::kByte));
+            workspace =
+                at::empty({static_cast<int64_t>(workspace_size)}, input.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
         void *stream = current_stream_from_torch(input);
-        check_infini_status(
-            infiniopAddRMSNorm(
-                desc,
-                workspace_ptr,
-                workspace_size,
-                out.data_ptr(),
-                residual_out.data_ptr(),
-                input.data_ptr(),
-                residual.data_ptr(),
-                weight.data_ptr(),
-                stream),
-            "infiniopAddRMSNorm");
+        check_infini_status(infiniopAddRMSNorm(desc, workspace_ptr, workspace_size, out.data_ptr(),
+                                               residual_out.data_ptr(), input.data_ptr(),
+                                               residual.data_ptr(), weight.data_ptr(), stream),
+                            "infiniopAddRMSNorm");
     } catch (...) {
         infiniopDestroyAddRMSNormDescriptor(desc);
         throw;
     }
-    check_infini_status(
-        infiniopDestroyAddRMSNormDescriptor(desc),
-        "infiniopDestroyAddRMSNormDescriptor");
+    check_infini_status(infiniopDestroyAddRMSNormDescriptor(desc),
+                        "infiniopDestroyAddRMSNormDescriptor");
     return {out, residual_out};
 }
 
@@ -426,28 +362,19 @@ at::Tensor swiglu_current_stream(at::Tensor up, at::Tensor gate) {
 
     size_t workspace_size = 0;
     try {
-        check_infini_status(
-            infiniopGetSwiGLUWorkspaceSize(desc, &workspace_size),
-            "infiniopGetSwiGLUWorkspaceSize");
+        check_infini_status(infiniopGetSwiGLUWorkspaceSize(desc, &workspace_size),
+                            "infiniopGetSwiGLUWorkspaceSize");
         at::Tensor workspace;
         void *workspace_ptr = nullptr;
         if (workspace_size > 0) {
-            workspace = at::empty(
-                {static_cast<int64_t>(workspace_size)},
-                up.options().dtype(at::kByte));
+            workspace =
+                at::empty({static_cast<int64_t>(workspace_size)}, up.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
         void *stream = current_stream_from_torch(up);
-        check_infini_status(
-            infiniopSwiGLU(
-                desc,
-                workspace_ptr,
-                workspace_size,
-                out.data_ptr(),
-                up.data_ptr(),
-                gate.data_ptr(),
-                stream),
-            "infiniopSwiGLU");
+        check_infini_status(infiniopSwiGLU(desc, workspace_ptr, workspace_size, out.data_ptr(),
+                                           up.data_ptr(), gate.data_ptr(), stream),
+                            "infiniopSwiGLU");
     } catch (...) {
         infiniopDestroySwiGLUDescriptor(desc);
         throw;
@@ -458,7 +385,8 @@ at::Tensor swiglu_current_stream(at::Tensor up, at::Tensor gate) {
 
 at::Tensor silu_and_mul_current_stream(at::Tensor input) {
     if (input.dim() < 1 || input.size(input.dim() - 1) % 2 != 0) {
-        throw std::runtime_error("silu_and_mul_current_stream expects input last dimension to be even");
+        throw std::runtime_error(
+            "silu_and_mul_current_stream expects input last dimension to be even");
     }
     auto output_sizes = input.sizes().vec();
     output_sizes.back() /= 2;
@@ -469,50 +397,38 @@ at::Tensor silu_and_mul_current_stream(at::Tensor input) {
 
     infiniopSiluAndMulDescriptor_t desc = nullptr;
     auto handle = infinicore::context::getInfiniopHandle(device_from_torch(input));
-    check_infini_status(
-        infiniopCreateSiluAndMulDescriptor(handle, &desc, y->desc(), x->desc()),
-        "infiniopCreateSiluAndMulDescriptor");
+    check_infini_status(infiniopCreateSiluAndMulDescriptor(handle, &desc, y->desc(), x->desc()),
+                        "infiniopCreateSiluAndMulDescriptor");
 
     size_t workspace_size = 0;
     try {
-        check_infini_status(
-            infiniopGetSiluAndMulWorkspaceSize(desc, &workspace_size),
-            "infiniopGetSiluAndMulWorkspaceSize");
+        check_infini_status(infiniopGetSiluAndMulWorkspaceSize(desc, &workspace_size),
+                            "infiniopGetSiluAndMulWorkspaceSize");
         at::Tensor workspace;
         void *workspace_ptr = nullptr;
         if (workspace_size > 0) {
-            workspace = at::empty(
-                {static_cast<int64_t>(workspace_size)},
-                input.options().dtype(at::kByte));
+            workspace =
+                at::empty({static_cast<int64_t>(workspace_size)}, input.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
         void *stream = current_stream_from_torch(input);
-        check_infini_status(
-            infiniopSiluAndMul(
-                desc,
-                workspace_ptr,
-                workspace_size,
-                out.data_ptr(),
-                input.data_ptr(),
-                stream),
-            "infiniopSiluAndMul");
+        check_infini_status(infiniopSiluAndMul(desc, workspace_ptr, workspace_size, out.data_ptr(),
+                                               input.data_ptr(), stream),
+                            "infiniopSiluAndMul");
     } catch (...) {
         infiniopDestroySiluAndMulDescriptor(desc);
         throw;
     }
-    check_infini_status(
-        infiniopDestroySiluAndMulDescriptor(desc),
-        "infiniopDestroySiluAndMulDescriptor");
+    check_infini_status(infiniopDestroySiluAndMulDescriptor(desc),
+                        "infiniopDestroySiluAndMulDescriptor");
     return out;
 }
 
-at::Tensor rope_current_stream(at::Tensor input,
-                               at::Tensor positions,
-                               at::Tensor sin_table,
-                               at::Tensor cos_table,
-                               bool is_neox_style) {
+at::Tensor rope_current_stream(at::Tensor input, at::Tensor positions, at::Tensor sin_table,
+                               at::Tensor cos_table, bool is_neox_style) {
     if (input.dim() != 3 && input.dim() != 4) {
-        throw std::runtime_error("expected RoPE input shape [tokens, heads, dim] or [batch, tokens, heads, dim]");
+        throw std::runtime_error(
+            "expected RoPE input shape [tokens, heads, dim] or [batch, tokens, heads, dim]");
     }
     at::Tensor out = at::empty_like(input);
     auto y = wrap_strided(out);
@@ -524,44 +440,26 @@ at::Tensor rope_current_stream(at::Tensor input,
     infiniopRoPEDescriptor_t desc = nullptr;
     auto handle = infinicore::context::getInfiniopHandle(device_from_torch(input));
     auto algo = is_neox_style ? INFINIOP_ROPE_ALGO_GPT_NEOX : INFINIOP_ROPE_ALGO_GPT_J;
-    check_infini_status(
-        infiniopCreateRoPEDescriptor(
-            handle,
-            &desc,
-            y->desc(),
-            x->desc(),
-            pos->desc(),
-            sin->desc(),
-            cos->desc(),
-            algo),
-        "infiniopCreateRoPEDescriptor");
+    check_infini_status(infiniopCreateRoPEDescriptor(handle, &desc, y->desc(), x->desc(),
+                                                     pos->desc(), sin->desc(), cos->desc(), algo),
+                        "infiniopCreateRoPEDescriptor");
 
     size_t workspace_size = 0;
     try {
-        check_infini_status(
-            infiniopGetRoPEWorkspaceSize(desc, &workspace_size),
-            "infiniopGetRoPEWorkspaceSize");
+        check_infini_status(infiniopGetRoPEWorkspaceSize(desc, &workspace_size),
+                            "infiniopGetRoPEWorkspaceSize");
         at::Tensor workspace;
         void *workspace_ptr = nullptr;
         if (workspace_size > 0) {
-            workspace = at::empty(
-                {static_cast<int64_t>(workspace_size)},
-                input.options().dtype(at::kByte));
+            workspace =
+                at::empty({static_cast<int64_t>(workspace_size)}, input.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
         void *stream = current_stream_from_torch(input);
-        check_infini_status(
-            infiniopRoPE(
-                desc,
-                workspace_ptr,
-                workspace_size,
-                out.data_ptr(),
-                input.data_ptr(),
-                positions.data_ptr(),
-                sin_table.data_ptr(),
-                cos_table.data_ptr(),
-                stream),
-            "infiniopRoPE");
+        check_infini_status(infiniopRoPE(desc, workspace_ptr, workspace_size, out.data_ptr(),
+                                         input.data_ptr(), positions.data_ptr(),
+                                         sin_table.data_ptr(), cos_table.data_ptr(), stream),
+                            "infiniopRoPE");
     } catch (...) {
         infiniopDestroyRoPEDescriptor(desc);
         throw;
@@ -570,11 +468,8 @@ at::Tensor rope_current_stream(at::Tensor input,
     return out;
 }
 
-void store_kv_cache_current_stream(at::Tensor key_cache,
-                                   at::Tensor value_cache,
-                                   at::Tensor key,
-                                   at::Tensor value,
-                                   at::Tensor slot_mapping) {
+void store_kv_cache_current_stream(at::Tensor key_cache, at::Tensor value_cache, at::Tensor key,
+                                   at::Tensor value, at::Tensor slot_mapping) {
     auto flat_slots = slot_mapping.flatten();
     auto k_cache_tensor = wrap_strided(key_cache);
     auto v_cache_tensor = wrap_strided(value_cache);
@@ -584,66 +479,47 @@ void store_kv_cache_current_stream(at::Tensor key_cache,
 
     infiniopPagedCachingDescriptor_t desc = nullptr;
     auto handle = infinicore::context::getInfiniopHandle(device_from_torch(key));
-    check_infini_status(
-        infiniopCreatePagedCachingDescriptor(
-            handle,
-            &desc,
-            k_cache_tensor->desc(),
-            v_cache_tensor->desc(),
-            key_tensor->desc(),
-            value_tensor->desc(),
-            slot_tensor->desc()),
-        "infiniopCreatePagedCachingDescriptor");
+    check_infini_status(infiniopCreatePagedCachingDescriptor(
+                            handle, &desc, k_cache_tensor->desc(), v_cache_tensor->desc(),
+                            key_tensor->desc(), value_tensor->desc(), slot_tensor->desc()),
+                        "infiniopCreatePagedCachingDescriptor");
 
     size_t workspace_size = 0;
     try {
-        check_infini_status(
-            infiniopGetPagedCachingWorkspaceSize(desc, &workspace_size),
-            "infiniopGetPagedCachingWorkspaceSize");
+        check_infini_status(infiniopGetPagedCachingWorkspaceSize(desc, &workspace_size),
+                            "infiniopGetPagedCachingWorkspaceSize");
         at::Tensor workspace;
         void *workspace_ptr = nullptr;
         if (workspace_size > 0) {
-            workspace = at::empty(
-                {static_cast<int64_t>(workspace_size)},
-                key.options().dtype(at::kByte));
+            workspace =
+                at::empty({static_cast<int64_t>(workspace_size)}, key.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
         void *stream = current_stream_from_torch(key);
-        check_infini_status(
-            infiniopPagedCaching(
-                desc,
-                workspace_ptr,
-                workspace_size,
-                key_cache.data_ptr(),
-                value_cache.data_ptr(),
-                key.data_ptr(),
-                value.data_ptr(),
-                flat_slots.data_ptr(),
-                stream),
-            "infiniopPagedCaching");
+        check_infini_status(infiniopPagedCaching(desc, workspace_ptr, workspace_size,
+                                                 key_cache.data_ptr(), value_cache.data_ptr(),
+                                                 key.data_ptr(), value.data_ptr(),
+                                                 flat_slots.data_ptr(), stream),
+                            "infiniopPagedCaching");
     } catch (...) {
         infiniopDestroyPagedCachingDescriptor(desc);
         throw;
     }
-    check_infini_status(
-        infiniopDestroyPagedCachingDescriptor(desc),
-        "infiniopDestroyPagedCachingDescriptor");
+    check_infini_status(infiniopDestroyPagedCachingDescriptor(desc),
+                        "infiniopDestroyPagedCachingDescriptor");
 }
 
-void paged_attention_prefill_current_stream(at::Tensor query,
-                                            at::Tensor key_cache,
-                                            at::Tensor value_cache,
-                                            at::Tensor block_table,
-                                            at::Tensor total_kv_lens,
-                                            at::Tensor query_start_loc,
-                                            c10::optional<at::Tensor> alibi_slopes,
-                                            double scale,
+void paged_attention_prefill_current_stream(at::Tensor query, at::Tensor key_cache,
+                                            at::Tensor value_cache, at::Tensor block_table,
+                                            at::Tensor total_kv_lens, at::Tensor query_start_loc,
+                                            c10::optional<at::Tensor> alibi_slopes, double scale,
                                             at::Tensor output) {
     if (query.numel() == 0) {
         return;
     }
     if (query.dim() != 3 || output.sizes() != query.sizes()) {
-        throw std::runtime_error("paged_attention_prefill_current_stream expects query/output [tokens, heads, head_dim]");
+        throw std::runtime_error("paged_attention_prefill_current_stream expects query/output "
+                                 "[tokens, heads, head_dim]");
     }
 
     auto out_tensor = wrap_strided(output);
@@ -662,68 +538,44 @@ void paged_attention_prefill_current_stream(at::Tensor query,
     auto handle = infinicore::context::getInfiniopHandle(device_from_torch(query));
     check_infini_status(
         infiniopCreatePagedAttentionPrefillDescriptor(
-            handle,
-            &desc,
-            out_tensor->desc(),
-            q_tensor->desc(),
-            k_tensor->desc(),
-            v_tensor->desc(),
-            block_tensor->desc(),
-            len_tensor->desc(),
-            q_start_tensor->desc(),
-            alibi.has_value() ? alibi.value()->desc() : nullptr,
-            static_cast<float>(scale)),
+            handle, &desc, out_tensor->desc(), q_tensor->desc(), k_tensor->desc(), v_tensor->desc(),
+            block_tensor->desc(), len_tensor->desc(), q_start_tensor->desc(),
+            alibi.has_value() ? alibi.value()->desc() : nullptr, static_cast<float>(scale)),
         "infiniopCreatePagedAttentionPrefillDescriptor");
 
     size_t workspace_size = 0;
     try {
-        check_infini_status(
-            infiniopGetPagedAttentionPrefillWorkspaceSize(desc, &workspace_size),
-            "infiniopGetPagedAttentionPrefillWorkspaceSize");
+        check_infini_status(infiniopGetPagedAttentionPrefillWorkspaceSize(desc, &workspace_size),
+                            "infiniopGetPagedAttentionPrefillWorkspaceSize");
         at::Tensor workspace;
         void *workspace_ptr = nullptr;
         if (workspace_size > 0) {
-            workspace = at::empty(
-                {static_cast<int64_t>(workspace_size)},
-                query.options().dtype(at::kByte));
+            workspace =
+                at::empty({static_cast<int64_t>(workspace_size)}, query.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
         check_infini_status(
-            infiniopPagedAttentionPrefill(
-                desc,
-                workspace_ptr,
-                workspace_size,
-                output.data_ptr(),
-                query.data_ptr(),
-                key_cache.data_ptr(),
-                value_cache.data_ptr(),
-                block_table.data_ptr(),
-                total_kv_lens.data_ptr(),
-                query_start_loc.data_ptr(),
-                alibi_slopes.has_value() && alibi_slopes.value().defined()
-                    ? alibi_slopes.value().data_ptr()
-                    : nullptr,
-                current_stream_from_torch(query)),
+            infiniopPagedAttentionPrefill(desc, workspace_ptr, workspace_size, output.data_ptr(),
+                                          query.data_ptr(), key_cache.data_ptr(),
+                                          value_cache.data_ptr(), block_table.data_ptr(),
+                                          total_kv_lens.data_ptr(), query_start_loc.data_ptr(),
+                                          alibi_slopes.has_value() && alibi_slopes.value().defined()
+                                              ? alibi_slopes.value().data_ptr()
+                                              : nullptr,
+                                          current_stream_from_torch(query)),
             "infiniopPagedAttentionPrefill");
     } catch (...) {
         infiniopDestroyPagedAttentionPrefillDescriptor(desc);
         throw;
     }
-    check_infini_status(
-        infiniopDestroyPagedAttentionPrefillDescriptor(desc),
-        "infiniopDestroyPagedAttentionPrefillDescriptor");
+    check_infini_status(infiniopDestroyPagedAttentionPrefillDescriptor(desc),
+                        "infiniopDestroyPagedAttentionPrefillDescriptor");
 }
 
-void paged_attention_decode_out(at::Tensor query,
-                                at::Tensor key_cache,
-                                at::Tensor value_cache,
-                                at::Tensor decode_seq_lens,
-                                at::Tensor decode_block_table,
-                                c10::optional<at::Tensor> alibi_slopes,
-                                double scale,
-                                int64_t num_decode_tokens,
-                                int64_t num_decodes,
-                                at::Tensor output) {
+void paged_attention_decode_out(at::Tensor query, at::Tensor key_cache, at::Tensor value_cache,
+                                at::Tensor decode_seq_lens, at::Tensor decode_block_table,
+                                c10::optional<at::Tensor> alibi_slopes, double scale,
+                                int64_t num_decode_tokens, int64_t num_decodes, at::Tensor output) {
     if (num_decode_tokens == 0) {
         return;
     }
@@ -750,56 +602,39 @@ void paged_attention_decode_out(at::Tensor query,
 
     infiniopPagedAttentionDescriptor_t desc = nullptr;
     auto handle = infinicore::context::getInfiniopHandle(device_from_torch(query));
-    check_infini_status(
-        infiniopCreatePagedAttentionDescriptor(
-            handle,
-            &desc,
-            out_tensor->desc(),
-            q_tensor->desc(),
-            k_tensor->desc(),
-            v_tensor->desc(),
-            block_tensor->desc(),
-            len_tensor->desc(),
-            alibi.has_value() ? alibi.value()->desc() : nullptr,
-            static_cast<float>(scale)),
-        "infiniopCreatePagedAttentionDescriptor");
+    check_infini_status(infiniopCreatePagedAttentionDescriptor(
+                            handle, &desc, out_tensor->desc(), q_tensor->desc(), k_tensor->desc(),
+                            v_tensor->desc(), block_tensor->desc(), len_tensor->desc(),
+                            alibi.has_value() ? alibi.value()->desc() : nullptr,
+                            static_cast<float>(scale)),
+                        "infiniopCreatePagedAttentionDescriptor");
 
     size_t workspace_size = 0;
     try {
-        check_infini_status(
-            infiniopGetPagedAttentionWorkspaceSize(desc, &workspace_size),
-            "infiniopGetPagedAttentionWorkspaceSize");
+        check_infini_status(infiniopGetPagedAttentionWorkspaceSize(desc, &workspace_size),
+                            "infiniopGetPagedAttentionWorkspaceSize");
         at::Tensor workspace;
         void *workspace_ptr = nullptr;
         if (workspace_size > 0) {
-            workspace = at::empty(
-                {static_cast<int64_t>(workspace_size)},
-                query.options().dtype(at::kByte));
+            workspace =
+                at::empty({static_cast<int64_t>(workspace_size)}, query.options().dtype(at::kByte));
             workspace_ptr = workspace.data_ptr();
         }
         check_infini_status(
-            infiniopPagedAttention(
-                desc,
-                workspace_ptr,
-                workspace_size,
-                out.data_ptr(),
-                q.data_ptr(),
-                key_cache.data_ptr(),
-                value_cache.data_ptr(),
-                decode_block_table.data_ptr(),
-                decode_seq_lens.data_ptr(),
-                alibi_slopes.has_value() && alibi_slopes.value().defined()
-                    ? alibi_slopes.value().data_ptr()
-                    : nullptr,
-                current_stream_from_torch(query)),
+            infiniopPagedAttention(desc, workspace_ptr, workspace_size, out.data_ptr(),
+                                   q.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
+                                   decode_block_table.data_ptr(), decode_seq_lens.data_ptr(),
+                                   alibi_slopes.has_value() && alibi_slopes.value().defined()
+                                       ? alibi_slopes.value().data_ptr()
+                                       : nullptr,
+                                   current_stream_from_torch(query)),
             "infiniopPagedAttention");
     } catch (...) {
         infiniopDestroyPagedAttentionDescriptor(desc);
         throw;
     }
-    check_infini_status(
-        infiniopDestroyPagedAttentionDescriptor(desc),
-        "infiniopDestroyPagedAttentionDescriptor");
+    check_infini_status(infiniopDestroyPagedAttentionDescriptor(desc),
+                        "infiniopDestroyPagedAttentionDescriptor");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

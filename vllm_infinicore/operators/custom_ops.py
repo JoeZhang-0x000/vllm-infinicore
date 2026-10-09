@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from .selection import selected_backend
@@ -11,11 +11,13 @@ from .selection import selected_backend
 CUSTOM_OP_ENABLE_ENV = "VLLM_INFINICORE_ENABLE_CUSTOM_OPS"
 RMS_NORM_OP = "vllm_infinicore::rms_norm"
 FUSED_ADD_RMS_NORM_OP = "vllm_infinicore::fused_add_rms_norm"
+FUSED_ADD_RMS_NORM_INPLACE_OP = "vllm_infinicore::fused_add_rms_norm_"
 SILU_AND_MUL_OP = "vllm_infinicore::silu_and_mul"
 LINEAR_OP = "vllm_infinicore::linear"
 LM_HEAD_OP = "vllm_infinicore::lm_head"
 EMBEDDING_OP = "vllm_infinicore::embedding"
 ROTARY_EMBEDDING_OP = "vllm_infinicore::rotary_embedding"
+ROTARY_EMBEDDING_INPLACE_OP = "vllm_infinicore::rotary_embedding_"
 
 ALL_CUSTOM_OPS = (
     RMS_NORM_OP,
@@ -25,6 +27,8 @@ ALL_CUSTOM_OPS = (
     LM_HEAD_OP,
     EMBEDDING_OP,
     ROTARY_EMBEDDING_OP,
+    FUSED_ADD_RMS_NORM_INPLACE_OP,
+    ROTARY_EMBEDDING_INPLACE_OP,
 )
 
 _TORCH_LIBRARY: Any | None = None
@@ -43,7 +47,7 @@ def load_custom_ops(
     force: bool = False,
     required_ops: tuple[str, ...] | None = None,
 ) -> CustomOpStatus:
-    """Register custom op prototypes only when explicitly requested.
+    """Register custom ops only when explicitly requested.
 
     The default path intentionally avoids importing torch so dry plugin
     registration remains cheap and graph-conservative.
@@ -79,7 +83,7 @@ def load_custom_ops(
     if all(op in _REGISTERED_OPS for op in requested_ops):
         return CustomOpStatus(
             available=True,
-            reason="requested custom op prototypes already registered",
+            reason="requested custom ops already registered",
             registered_ops=_REGISTERED_OPS,
         )
 
@@ -132,9 +136,7 @@ def fused_add_rms_norm(
     _ensure_direct_api_enabled((FUSED_ADD_RMS_NORM_OP,))
     import torch
 
-    return torch.ops.vllm_infinicore.fused_add_rms_norm(
-        input_tensor, residual, weight, float(eps)
-    )
+    return torch.ops.vllm_infinicore.fused_add_rms_norm(input_tensor, residual, weight, float(eps))
 
 
 def silu_and_mul(input_tensor: Any) -> Any:
@@ -238,16 +240,14 @@ def _register_fused_add_rms_norm(torch: Any) -> None:
     ) -> Any:
         from . import backend as infinicore_backend
 
-        return infinicore_backend.fused_add_rms_norm(
-            input_tensor, residual, weight, float(eps)
-        )
+        return infinicore_backend.fused_add_rms_norm(input_tensor, residual, weight, float(eps))
 
+    library.impl("fused_add_rms_norm", _fused_add_rms_norm_impl, "CompositeExplicitAutograd")
     library.impl(
-        "fused_add_rms_norm", _fused_add_rms_norm_impl, "CompositeExplicitAutograd"
+        "fused_add_rms_norm",
+        lambda x, residual, weight, eps: (torch.empty_like(x), torch.empty_like(residual)),
+        "Meta",
     )
-    library.impl("fused_add_rms_norm",
-                 lambda x, residual, weight, eps: (torch.empty_like(x), torch.empty_like(residual)),
-                 "Meta")
 
     _REGISTERED_OPS = (*_REGISTERED_OPS, FUSED_ADD_RMS_NORM_OP)
 
@@ -268,6 +268,49 @@ def _register_silu_and_mul(torch: Any) -> None:
 
     library.impl("silu_and_mul", _silu_and_mul_impl, "CompositeExplicitAutograd")
     _REGISTERED_OPS = (*_REGISTERED_OPS, SILU_AND_MUL_OP)
+
+
+def _register_fused_add_rms_norm_inplace(torch: Any) -> None:
+    global _REGISTERED_OPS
+    if FUSED_ADD_RMS_NORM_INPLACE_OP in _REGISTERED_OPS:
+        return
+    library = _library(torch)
+    library.define(
+        "fused_add_rms_norm_(Tensor(a!) input, Tensor(b!) residual, Tensor weight, float eps) -> ()"
+    )
+
+    def impl(x, residual, weight, eps):
+        from . import backend
+
+        backend.fused_add_rms_norm_inplace(x, residual, weight, float(eps))
+
+    library.impl("fused_add_rms_norm_", impl, "CompositeExplicitAutograd")
+    library.impl("fused_add_rms_norm_", lambda x, residual, weight, eps: None, "Meta")
+    _REGISTERED_OPS = (*_REGISTERED_OPS, FUSED_ADD_RMS_NORM_INPLACE_OP)
+
+
+def _register_rotary_embedding_inplace(torch: Any) -> None:
+    global _REGISTERED_OPS
+    if ROTARY_EMBEDDING_INPLACE_OP in _REGISTERED_OPS:
+        return
+    library = _library(torch)
+    library.define(
+        "rotary_embedding_(Tensor positions, Tensor(a!) query, Tensor(b!)? key, "
+        "int head_size, int rotary_dim, Tensor cos_sin_cache, bool is_neox_style) -> ()"
+    )
+
+    def impl(positions, query, key, head_size, rotary_dim, cache, neox):
+        from . import backend
+
+        backend.rotary_embedding_inplace(positions, query, key, head_size, rotary_dim, cache, neox)
+
+    library.impl("rotary_embedding_", impl, "CompositeExplicitAutograd")
+    library.impl(
+        "rotary_embedding_",
+        lambda positions, query, key, head_size, rotary_dim, cache, neox: None,
+        "Meta",
+    )
+    _REGISTERED_OPS = (*_REGISTERED_OPS, ROTARY_EMBEDDING_INPLACE_OP)
 
 
 def _register_linear(torch: Any) -> None:
@@ -376,9 +419,7 @@ def _library(torch: Any) -> Any:
 
 def _ensure_direct_api_enabled(required_ops: tuple[str, ...]) -> None:
     if not _env_truthy(CUSTOM_OP_ENABLE_ENV):
-        raise RuntimeError(
-            f"{CUSTOM_OP_ENABLE_ENV} is unset or false; custom ops disabled"
-        )
+        raise RuntimeError(f"{CUSTOM_OP_ENABLE_ENV} is unset or false; custom ops disabled")
 
     status = load_custom_ops(required_ops=required_ops)
     if not status.available:
@@ -398,4 +439,6 @@ _REGISTERERS = {
     LM_HEAD_OP: _register_lm_head,
     EMBEDDING_OP: _register_embedding,
     ROTARY_EMBEDDING_OP: _register_rotary_embedding,
+    FUSED_ADD_RMS_NORM_INPLACE_OP: _register_fused_add_rms_norm_inplace,
+    ROTARY_EMBEDDING_INPLACE_OP: _register_rotary_embedding_inplace,
 }

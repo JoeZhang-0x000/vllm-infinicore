@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from importlib import import_module
+import hashlib
 import os
+from functools import lru_cache
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -45,10 +47,10 @@ NATIVE_ATTENTION_ROUTES = frozenset(
     {DECODE_ROUTE, FLASH_DECODE_ROUTE, STORE_KV_CACHE_ROUTE, PREFILL_ROUTE}
 )
 
-_MODULES: dict[str, Any] = {}
-_LOAD_ERRORS: dict[str, str] = {}
+_MODULES: dict[tuple[Any, ...], Any] = {}
+_LOAD_ERRORS: dict[tuple[Any, ...], str] = {}
 _CALL_COUNTS: dict[str, int] = {}
-_ROUTES_CACHE_KEY: tuple[str | None, str | None, str | None, str | None] | None = None
+_ROUTES_CACHE_KEY: tuple[str | None, ...] | None = None
 _ROUTES_CACHE: tuple[str, ...] | None = None
 _ROUTES_SET_CACHE: frozenset[str] | None = None
 
@@ -60,14 +62,38 @@ class CppBridgeError(RuntimeError):
 def bridge_target() -> str:
     target = selected_backend()
     if target not in CPP_BRIDGE_TARGETS:
-        raise CppBridgeError(
-            f"C++ bridge requires {OPERATOR_BACKEND_ENV}=cuda, metax, or kunlun"
-        )
+        raise CppBridgeError(f"C++ bridge requires {OPERATOR_BACKEND_ENV}=cuda, metax, or kunlun")
     return target
 
 
 def _backend_config() -> Any:
     return import_module(f".{bridge_target()}.bridge", __package__)
+
+
+def _infini_root() -> Path:
+    return Path(os.environ.get("INFINI_ROOT", str(Path.home() / ".infini")))
+
+
+def _ops_root() -> Path:
+    return Path(os.environ.get("INFINI_OPS_ROOT", str(_infini_root())))
+
+
+@lru_cache(maxsize=8)
+def _has_modular_headers(root: str) -> bool:
+    return (Path(root) / "include" / "infini" / "ops.h").is_file()
+
+
+def uses_modular_api() -> bool:
+    """Detect the installed public API, without importing either Python stack."""
+    return _has_modular_headers(str(_ops_root()))
+
+
+def require_legacy_python_api(route: str) -> None:
+    if uses_modular_api():
+        raise CppBridgeError(
+            f"Modular InfiniCore requires the C++ bridge for {route}; enable "
+            f"{CPP_BRIDGE_ENABLE_ENV} and include {route} in {CPP_BRIDGE_ROUTES_ENV}"
+        )
 
 
 def enabled_for(route_name: str) -> bool:
@@ -92,6 +118,8 @@ def _cached_routes() -> tuple[tuple[str, ...], frozenset[str]]:
         os.environ.get(CPP_BRIDGE_ENABLE_ENV),
         os.environ.get(CPP_BRIDGE_ROUTES_ENV),
         os.environ.get(OPERATOR_BACKEND_ENV),
+        os.environ.get("INFINI_ROOT"),
+        os.environ.get("INFINI_OPS_ROOT"),
     )
     if (
         cache_key == _ROUTES_CACHE_KEY
@@ -115,20 +143,28 @@ def _parse_selected_routes() -> tuple[str, ...]:
     config = _backend_config()
     raw = os.environ.get(CPP_BRIDGE_ROUTES_ENV)
     if raw is None or not raw.strip():
+        if uses_modular_api():
+            return tuple(sorted(config.SUPPORTED_ROUTES))
         return config.DEFAULT_ROUTES
 
     routes = tuple(route.strip() for route in raw.split(",") if route.strip())
     if "recommended" in routes:
         from ..routing.policy import recommended_routes
-        routes = tuple(dict.fromkeys(
-            item for route in routes
-            for item in (recommended_routes(bridge_target())
-                         if route == "recommended" else (route,))
-        ))
+
+        routes = tuple(
+            dict.fromkeys(
+                item
+                for route in routes
+                for item in (
+                    recommended_routes(bridge_target()) if route == "recommended" else (route,)
+                )
+            )
+        )
     if routes == ("all",):
         return tuple(sorted(config.SUPPORTED_ROUTES))
     unknown = tuple(
-        route for route in routes
+        route
+        for route in routes
         if route not in SUPPORTED_ROUTES and route not in NATIVE_ATTENTION_ROUTES
     )
     if unknown:
@@ -137,8 +173,7 @@ def _parse_selected_routes() -> tuple[str, ...]:
     unsupported = tuple(route for route in routes if route not in config.SUPPORTED_ROUTES)
     if unsupported:
         raise CppBridgeError(
-            f"unsupported {bridge_target()} C++ bridge route(s): "
-            + ", ".join(unsupported)
+            f"unsupported {bridge_target()} C++ bridge route(s): " + ", ".join(unsupported)
         )
     return routes
 
@@ -150,18 +185,33 @@ def module() -> Any:
             f"C++ bridge is disabled; unset {CPP_BRIDGE_DISABLE_ENV} and avoid "
             f"setting {CPP_BRIDGE_ENABLE_ENV}=0"
         )
-    if target in _MODULES:
-        return _MODULES[target]
-    if target in _LOAD_ERRORS:
-        raise CppBridgeError(_LOAD_ERRORS[target])
+    # Read raw environment values before constructing Paths. LMHead is outside
+    # the model graph and enters this cache on every generated token.
+    key = (
+        target,
+        *(
+            os.environ.get(name)
+            for name in (
+                "INFINI_ROOT",
+                "INFINI_OPS_ROOT",
+                "INFINI_RT_ROOT",
+                "INFINI_LIB_DIR",
+                "HOME",
+            )
+        ),
+    )
+    if key in _MODULES:
+        return _MODULES[key]
+    if key in _LOAD_ERRORS:
+        raise CppBridgeError(_LOAD_ERRORS[key])
 
     try:
         loaded = _compile_bridge()
     except Exception as exc:
         message = f"{target} C++ bridge load failed: {exc}"
-        _LOAD_ERRORS[target] = message
+        _LOAD_ERRORS[key] = message
         raise CppBridgeError(message) from exc
-    _MODULES[target] = loaded
+    _MODULES[key] = loaded
     return loaded
 
 
@@ -193,10 +243,52 @@ def _compile_bridge() -> Any:
 
 def _bridge_build_config() -> dict[str, Any]:
     source = Path(__file__).resolve().parent / "csrc" / "infinicore_bridge.cpp"
-    infini_root = Path(os.environ.get("INFINI_ROOT", str(Path.home() / ".infini")))
+    infini_root = _infini_root()
     infini_lib_dir = Path(os.environ.get("INFINI_LIB_DIR", str(infini_root / "lib")))
     target = bridge_target()
     adapter = _backend_config()
+
+    if uses_modular_api():
+        if target == KUNLUN_TARGET:
+            raise CppBridgeError(
+                "The modular InfiniCore stack has no Kunlun backend; use its legacy installation"
+            )
+        ops_root = _ops_root()
+        rt_root = Path(os.environ.get("INFINI_RT_ROOT", str(infini_root)))
+        ops_lib = Path(os.environ.get("INFINI_LIB_DIR", str(ops_root / "lib")))
+        rt_lib = rt_root / "lib"
+        identity = hashlib.sha256(
+            f"{ops_root.resolve()}:{rt_root.resolve()}:{ops_lib.resolve()}".encode()
+        ).hexdigest()[:12]
+        return {
+            "name": f"{adapter.MODULE_NAME}_infiniops_{identity}",
+            "sources": [str(source.with_name("infiniops_bridge.cpp"))],
+            "extra_include_paths": _dedupe(
+                [
+                    str(ops_root / "include"),
+                    str(rt_root / "include"),
+                    *adapter.extra_include_paths(),
+                ]
+            ),
+            "extra_cflags": [
+                "-O3",
+                "-std=c++17",
+                "-Wno-deprecated-declarations",
+                *adapter.EXTRA_CFLAGS,
+            ],
+            "extra_ldflags": _dedupe(
+                [
+                    f"-L{ops_lib}",
+                    f"-L{rt_lib}",
+                    f"-Wl,-rpath,{ops_lib}",
+                    f"-Wl,-rpath,{rt_lib}",
+                    "-linfiniops",
+                    "-linfinirt",
+                ]
+            ),
+            "target": target,
+            "api": "infiniops",
+        }
 
     include_paths = [str(infini_root / "include"), *adapter.extra_include_paths()]
     cflags = [
@@ -219,6 +311,7 @@ def _bridge_build_config() -> dict[str, Any]:
         "extra_cflags": _dedupe(cflags),
         "extra_ldflags": _dedupe(ldflags),
         "target": target,
+        "api": "legacy",
     }
 
 

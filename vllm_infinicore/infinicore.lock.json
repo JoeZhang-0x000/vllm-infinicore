@@ -1,7 +1,28 @@
 {
   "repository": "https://github.com/InfiniTensor/InfiniCore.git",
   "ref": "main",
-  "revision": "d3551f37538896056e164abf91b120e38c27007b",
-  "resolved_at": "2026-09-07",
-  "ascend_bridge_abi": 1
+  "revision": "8254d3b29ba3f052e9f7c1f084fb0a324dd7a817",
+  "resolved_at": "2026-10-08",
+  "api": "infiniops",
+  "components": {
+    "InfiniRT": {
+      "repository": "https://github.com/InfiniTensor/InfiniRT.git",
+      "revision": "6b256e0ab0853d9e2a7ef059bac22c847bd02251"
+    },
+    "InfiniOps": {
+      "repository": "https://github.com/InfiniTensor/InfiniOps.git",
+      "revision": "8c2f70a2eebcdeb2f63b2184d1d2d3b087a8db02"
+    },
+    "InfiniCCL": {
+      "repository": "https://github.com/InfiniTensor/InfiniCCL.git",
+      "revision": "e8ccc0cb23ca5b1b1d63be29ba61ea031de72807"
+    }
+  },
+  "legacy_ascend": {
+    "repository": "https://github.com/InfiniTensor/InfiniCore.git",
+    "ref": "main",
+    "revision": "d3551f37538896056e164abf91b120e38c27007b",
+    "resolved_at": "2026-09-07",
+    "ascend_bridge_abi": 1
+  }
 }

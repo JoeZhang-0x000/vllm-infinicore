@@ -24,12 +24,17 @@ def _record(name):
 def initialize():
     if selected_backend() == "ascend":
         from .ascend.backend import attention_library
+
         attention_library()
     else:
         from .cpp_bridge import module
+
         bridge = module()
-        for name in ("store_kv_cache_current_stream",
-                     "paged_attention_prefill_current_stream", "paged_attention_decode_out"):
+        for name in (
+            "store_kv_cache_current_stream",
+            "paged_attention_prefill_current_stream",
+            "paged_attention_decode_out",
+        ):
             getattr(bridge, name)
 
 
@@ -54,9 +59,11 @@ def store(k, v, key, value, slots):
         return
     if selected_backend() == "ascend":
         from .ascend.backend import launch
+
         launch("PagedCaching", (k, v, key, value, slots))
     else:
         from .cpp_bridge import module
+
         module().store_kv_cache_current_stream(k, v, key, value, slots)
     _record("StoreKVCache")
 
@@ -69,17 +76,25 @@ def compute(query, k, v, blocks, lengths, starts, scale, output, *, decode):
     starts = starts.to(dtype=torch.int32) if starts is not None else None
     if selected_backend() == "ascend":
         from .ascend.backend import launch
+
         if decode:
             launch("PagedAttention", (output, query, k, v, blocks, lengths, None), (scale,))
         else:
-            launch("PagedAttentionPrefill", (output, query, k, v, blocks, lengths, starts, None), (scale,))
+            launch(
+                "PagedAttentionPrefill",
+                (output, query, k, v, blocks, lengths, starts, None),
+                (scale,),
+            )
     else:
         from .cpp_bridge import module
+
         if decode:
             n = query.shape[0]
-            module().paged_attention_decode_out(query, k, v, lengths, blocks,
-                                                None, scale, n, n, output)
+            module().paged_attention_decode_out(
+                query, k, v, lengths, blocks, None, scale, n, n, output
+            )
         else:
             module().paged_attention_prefill_current_stream(
-                query, k, v, blocks, lengths, starts, None, scale, output)
+                query, k, v, blocks, lengths, starts, None, scale, output
+            )
     _record("PagedAttentionDecode" if decode else "PagedAttentionPrefill")

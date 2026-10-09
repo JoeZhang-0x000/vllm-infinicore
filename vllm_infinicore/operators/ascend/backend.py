@@ -11,13 +11,13 @@ communication or KV-cache runtime is implemented here.
 
 from __future__ import annotations
 
-from collections import OrderedDict
 import ctypes as C
-from functools import lru_cache
 import json
 import os
-from pathlib import Path
 import threading
+from collections import OrderedDict
+from functools import lru_cache
+from pathlib import Path
 
 import torch
 
@@ -51,28 +51,25 @@ def library():
     if not path:
         raise Unsupported(f"{LIBRARY_ENV} is unset")
     lib = C.CDLL(path)
-    lock = json.loads(_LOCK.read_text())
+    lock = json.loads(_LOCK.read_text())["legacy_ascend"]
     lib.vllmInfinicoreRevision.restype = C.c_char_p
     lib.vllmInfinicoreBridgeABI.restype = C.c_int
     revision = lib.vllmInfinicoreRevision().decode()
-    if (
-        revision != lock["revision"]
-        or lib.vllmInfinicoreBridgeABI() != lock["ascend_bridge_abi"]
-    ):
+    if revision != lock["revision"] or lib.vllmInfinicoreBridgeABI() != lock["ascend_bridge_abi"]:
         raise RuntimeError(f"InfiniCore Ascend library does not match lock: {revision}")
-    P, S, I = C.c_void_p, C.c_size_t, C.c_int
+    pointer_type, size_type, int_type = C.c_void_p, C.c_size_t, C.c_int
     signatures = {
-        "vllmInfinicoreCreateAscendHandle": [C.POINTER(P), I],
-        "vllmInfinicoreDestroyAscendHandle": [P],
-        "vllmInfinicoreDestroyEmbeddingDescriptor": [P],
+        "vllmInfinicoreCreateAscendHandle": [C.POINTER(pointer_type), int_type],
+        "vllmInfinicoreDestroyAscendHandle": [pointer_type],
+        "vllmInfinicoreDestroyEmbeddingDescriptor": [pointer_type],
         "infiniopCreateTensorDescriptor": [
-            C.POINTER(P),
-            S,
-            C.POINTER(S),
+            C.POINTER(pointer_type),
+            size_type,
+            C.POINTER(size_type),
             C.POINTER(C.c_ssize_t),
-            I,
+            int_type,
         ],
-        "infiniopDestroyTensorDescriptor": [P],
+        "infiniopDestroyTensorDescriptor": [pointer_type],
     }
     for op, count in (
         ("RMSNorm", 3),
@@ -81,24 +78,24 @@ def library():
         ("Embedding", 3),
         ("RoPE", 5),
     ):
-        extra = [C.c_float] if op == "RMSNorm" else [I] if op == "RoPE" else []
+        extra = [C.c_float] if op == "RMSNorm" else [int_type] if op == "RoPE" else []
         signatures[f"infiniopCreate{op}Descriptor"] = (
-            [P, C.POINTER(P)] + [P] * count + extra
+            [pointer_type, C.POINTER(pointer_type)] + [pointer_type] * count + extra
         )
-        signatures[f"infiniopDestroy{op}Descriptor"] = [P]
+        signatures[f"infiniopDestroy{op}Descriptor"] = [pointer_type]
         if op != "Embedding":
-            signatures[f"infiniopGet{op}WorkspaceSize"] = [P, C.POINTER(S)]
+            signatures[f"infiniopGet{op}WorkspaceSize"] = [pointer_type, C.POINTER(size_type)]
         signatures[f"infiniop{op}"] = (
-            [P]
-            + ([] if op == "Embedding" else [P, S])
-            + [P] * count
+            [pointer_type]
+            + ([] if op == "Embedding" else [pointer_type, size_type])
+            + [pointer_type] * count
             + ([C.c_float, C.c_float] if op == "Gemm" else [])
-            + [P]
+            + [pointer_type]
         )
     for name, args in signatures.items():
         fn = getattr(lib, name)
         fn.argtypes = args
-        fn.restype = None if name == "vllmInfinicoreDestroyAscendHandle" else I
+        fn.restype = None if name == "vllmInfinicoreDestroyAscendHandle" else int_type
     return lib
 
 
@@ -106,19 +103,21 @@ def library():
 def attention_library():
     """Require the additive PA/KV API only when attention is requested."""
     lib = library()
-    P, S, I = C.c_void_p, C.c_size_t, C.c_int
-    for op, count in (("PagedCaching", 5), ("PagedAttention", 7),
-                      ("PagedAttentionPrefill", 8)):
+    pointer_type, size_type, int_type = C.c_void_p, C.c_size_t, C.c_int
+    for op, count in (("PagedCaching", 5), ("PagedAttention", 7), ("PagedAttentionPrefill", 8)):
         signatures = {
-            f"infiniopCreate{op}Descriptor": [P, C.POINTER(P)] + [P] * count
-                + ([] if op == "PagedCaching" else [C.c_float]),
-            f"infiniopGet{op}WorkspaceSize": [P, C.POINTER(S)],
-            f"infiniop{op}": [P, P, S] + [P] * count + [P],
-            f"infiniopDestroy{op}Descriptor": [P],
+            f"infiniopCreate{op}Descriptor": [pointer_type, C.POINTER(pointer_type)]
+            + [pointer_type] * count
+            + ([] if op == "PagedCaching" else [C.c_float]),
+            f"infiniopGet{op}WorkspaceSize": [pointer_type, C.POINTER(size_type)],
+            f"infiniop{op}": [pointer_type, pointer_type, size_type]
+            + [pointer_type] * count
+            + [pointer_type],
+            f"infiniopDestroy{op}Descriptor": [pointer_type],
         }
         for name, args in signatures.items():
             fn = getattr(lib, name)
-            fn.argtypes, fn.restype = args, I
+            fn.argtypes, fn.restype = args, int_type
     return lib
 
 
@@ -159,7 +158,7 @@ def execute(name, tensor, operation, native):
             result = operation()
     except Unsupported as exc:
         return fallback(name, str(exc), native)
-    # Never retry a failed device launch: a runtime failure is not a capability miss.
+        # Never retry a failed device launch: a runtime failure is not a capability miss.
     from .. import backend as counters
 
     counters._CALL_COUNTS[name] = counters._CALL_COUNTS.get(name, 0) + 1
@@ -204,9 +203,7 @@ class _Descriptor:
         self.workspace_size = C.c_size_t()
         self._workspace = None
         _check(
-            lib.vllmInfinicoreCreateAscendHandle(
-                C.byref(self.handle), tensors[0].device.index
-            ),
+            lib.vllmInfinicoreCreateAscendHandle(C.byref(self.handle), tensors[0].device.index),
             "handle",
         )
         descs = []
@@ -296,11 +293,11 @@ class _Descriptor:
                 self.lib.vllmInfinicoreDestroyAscendHandle(self.handle)
                 self.handle = C.c_void_p()
 
+                # The descriptor key includes the token count, so chunked prefill and every
+                # decode batch width add entries. Evicting one costs a stream synchronize, so
+                # the limit sits well above the working set a run actually reaches (~90).
 
 
-# The descriptor key includes the token count, so chunked prefill and every
-# decode batch width add entries. Evicting one costs a stream synchronize, so
-# the limit sits well above the working set a run actually reaches (~90).
 _DESCRIPTOR_CACHE_LIMIT = 4096
 
 
@@ -358,15 +355,15 @@ def launch(op, tensors, scalar=()):
         # The descriptor owns this buffer for its whole lifetime, so it needs no
         # record_stream and its address is stable across a graph replay.
         args += [desc.workspace(capturing).data_ptr(), desc.workspace_size.value]
-    # No record_stream here. Every launch goes on the tensors' own current
-    # stream, which the caching allocator already orders allocations against, so
-    # it would protect nothing. It is far from free: it defers block reuse until
-    # the allocator observes a stream event, so with a fresh output allocated per
-    # call and little spare memory each allocation blocks on device progress
-    # instead of pipelining. Removing it cut a 4-sequence prefill from 12.1 s to
-    # 2.0 s against native's 1.8 s, and removed a 16x spread in allocation cost
-    # between ranks. Reintroduce it only alongside a launch on some other stream,
-    # and never during capture, where the graph pool owns the addresses.
+        # No record_stream here. Every launch goes on the tensors' own current
+        # stream, which the caching allocator already orders allocations against, so
+        # it would protect nothing. It is far from free: it defers block reuse until
+        # the allocator observes a stream event, so with a fresh output allocated per
+        # call and little spare memory each allocation blocks on device progress
+        # instead of pipelining. Removing it cut a 4-sequence prefill from 12.1 s to
+        # 2.0 s against native's 1.8 s, and removed a 16x spread in allocation cost
+        # between ranks. Reintroduce it only alongside a launch on some other stream,
+        # and never during capture, where the graph pool owns the addresses.
     args += [t.data_ptr() if t is not None else None for t in tensors]
     if op == "Gemm":
         args += [1.0, 0.0]
@@ -424,9 +421,7 @@ def linear(x, weight, bias=None):
         raise Unsupported(reason)
     x, weight = nd(x).contiguous(), nd(weight).contiguous()
     shape = x.shape[:-1] + (weight.shape[0],)
-    out = torch.empty(
-        (x.numel() // x.shape[-1], weight.shape[0]), dtype=x.dtype, device=x.device
-    )
+    out = torch.empty((x.numel() // x.shape[-1], weight.shape[0]), dtype=x.dtype, device=x.device)
     launch("Gemm", [out, x.reshape(-1, x.shape[-1]), weight.t()])
     out = out.reshape(shape)
     return out if bias is None else out + bias
@@ -434,9 +429,7 @@ def linear(x, weight, bias=None):
 
 def embedding(ids, weight):
     ids, weight = nd(ids).contiguous(), nd(weight).contiguous()
-    out = torch.empty(
-        (*ids.shape, weight.shape[1]), device=weight.device, dtype=weight.dtype
-    )
+    out = torch.empty((*ids.shape, weight.shape[1]), device=weight.device, dtype=weight.dtype)
     return launch("Embedding", [out, ids, weight])
 
 

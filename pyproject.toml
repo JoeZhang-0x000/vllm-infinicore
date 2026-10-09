@@ -6,16 +6,28 @@ build-backend = "hatchling.build"
 name = "vllm-infinicore"
 version = "0.1.0"
 description = "InfiniCore operator forwarding for vLLM"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
+
+[project.optional-dependencies]
+gsm8k = ["modelscope>=1.40.1,<2", "pyarrow>=14"]
+
+[project.scripts]
+vllm-infinicore-gsm8k = "vllm_infinicore.benchmarks.gsm8k:main"
 
 [project.entry-points."vllm.general_plugins"]
 vllm_infinicore = "vllm_infinicore:register"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vllm_infinicore"]
-include = [
-    "vllm_infinicore/operators/csrc/*.cpp",
-    "vllm_infinicore/operators/ascend/csrc/*",
-    "vllm_infinicore/infinicore.lock.json",
-]
+
+[tool.hatch.build.targets.sdist]
+include = ["vllm_infinicore", "scripts", "docs", "README.md", "pyproject.toml", ".clang-format"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
-
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
@@ -16,6 +15,7 @@ from ..custom_ops import EMBEDDING_OP, load_custom_ops
 VLLM_EMBEDDING_ROUTE_NAME = "Embedding"
 
 _INSTALLED = False
+_TP_LOOKUP_SUPPORTED = False
 _ORIGINAL_EMBEDDING: Callable[..., torch.Tensor] | None = None
 
 
@@ -43,13 +43,18 @@ def install_vllm_unquantized_embedding_route() -> VllmEmbeddingInstallStatus:
             reason=custom_op_status.reason,
         )
 
-    global _INSTALLED, _ORIGINAL_EMBEDDING
+    global _INSTALLED, _ORIGINAL_EMBEDDING, _TP_LOOKUP_SUPPORTED
     if _INSTALLED:
         return VllmEmbeddingInstallStatus(
             installed=True,
             reason="InfiniCore unquantized embedding patch already active",
         )
 
+    from ..cpp_bridge import uses_modular_api
+
+    # Resolve the API once, before Dynamo traces the model. Filesystem queries
+    # in forward would break vLLM's full-graph compilation on TP workers.
+    _TP_LOOKUP_SUPPORTED = uses_modular_api()
     _ORIGINAL_EMBEDDING = UnquantizedEmbeddingMethod.embedding
     UnquantizedEmbeddingMethod.embedding = _patched_embedding
     _INSTALLED = True
@@ -62,7 +67,7 @@ def install_vllm_unquantized_embedding_route() -> VllmEmbeddingInstallStatus:
 def uninstall_vllm_unquantized_embedding_route() -> VllmEmbeddingUninstallStatus:
     """Restore vLLM's unquantized embedding lookup method."""
 
-    global _INSTALLED, _ORIGINAL_EMBEDDING
+    global _INSTALLED, _ORIGINAL_EMBEDDING, _TP_LOOKUP_SUPPORTED
     if not _INSTALLED:
         return VllmEmbeddingUninstallStatus(
             uninstalled=False,
@@ -73,6 +78,7 @@ def uninstall_vllm_unquantized_embedding_route() -> VllmEmbeddingUninstallStatus
         UnquantizedEmbeddingMethod.embedding = _ORIGINAL_EMBEDDING
     _ORIGINAL_EMBEDDING = None
     _INSTALLED = False
+    _TP_LOOKUP_SUPPORTED = False
     return VllmEmbeddingUninstallStatus(
         uninstalled=True,
         reason="InfiniCore unquantized embedding route uninstalled",
@@ -101,7 +107,11 @@ def _patched_embedding(
 
 
 def _should_use_native_embedding(layer: torch.nn.Module) -> bool:
-    return int(getattr(layer, "tp_size", 1) or 1) > 1
+    # VocabParallelEmbedding.forward has already converted global token IDs
+    # to local shard indices. It also owns output masking and all-reduce;
+    # the lookup receives exactly the same contract as a non-TP embedding.
+    # Keep the historical TP restriction only for the legacy Python API.
+    return int(getattr(layer, "tp_size", 1) or 1) > 1 and not _TP_LOOKUP_SUPPORTED
 
 
 __all__ = [

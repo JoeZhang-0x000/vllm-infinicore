@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-
 from vllm.model_executor.custom_op import CustomOp
 
 try:
@@ -146,9 +145,7 @@ def install_vllm_rotary_embedding_oot() -> VllmRotaryEmbeddingInstallStatus:
             ),
         )
 
-    CustomOp.register_oot(name=VLLM_ROTARY_EMBEDDING_CLASS)(
-        InfiniCoreRotaryEmbedding
-    )
+    CustomOp.register_oot(name=VLLM_ROTARY_EMBEDDING_CLASS)(InfiniCoreRotaryEmbedding)
     return VllmRotaryEmbeddingInstallStatus(
         installed=True,
         reason="InfiniCore RoPE OOT route registered",

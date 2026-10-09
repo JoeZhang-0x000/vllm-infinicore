@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-
 from vllm.model_executor.custom_op import CustomOp
 
 try:
