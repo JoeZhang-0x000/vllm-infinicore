@@ -8,6 +8,7 @@ from __future__ import annotations
 import ctypes
 from collections import OrderedDict
 from collections.abc import Callable
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -406,6 +407,12 @@ def fused_add_rms_norm(
     return out, residual_out
 
 
+@lru_cache(maxsize=8)
+def _native_rope_positions_supported(module: Any) -> bool:
+    capability = getattr(module, "rope_supports_native_positions", None)
+    return capability is not None and bool(capability())
+
+
 def rotary_embedding_cpp_bridge(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -418,11 +425,18 @@ def rotary_embedding_cpp_bridge(
 
     module = cpp_bridge.module()
     cos, sin = cos_sin_cache.chunk(2, dim=-1)
-    positions = positions.flatten().to(torch.int32)
-    max_position = int(cos_sin_cache.shape[0]) - 1
-    if max_position >= 0:
-        positions = positions.clamp(0, max_position)
-    if cpp_bridge.bridge_target() == cpp_bridge.KUNLUN_TARGET:
+    kunlun = cpp_bridge.bridge_target() == cpp_bridge.KUNLUN_TARGET
+    positions = positions.flatten()
+    if not (
+        kunlun
+        and positions.dtype in (torch.int32, torch.int64)
+        and _native_rope_positions_supported(module)
+    ):
+        positions = positions.to(torch.int32)
+        max_position = int(cos_sin_cache.shape[0]) - 1
+        if max_position >= 0:
+            positions = positions.clamp(0, max_position)
+    if kunlun:
         sin = _contiguous_rope_table_cached(sin)
         cos = _contiguous_rope_table_cached(cos)
     else:

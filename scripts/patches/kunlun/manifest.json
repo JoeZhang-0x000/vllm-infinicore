@@ -1,0 +1,23 @@
+{
+  "repository": "https://github.com/InfiniTensor/InfiniCore",
+  "base_revision": "a81b18fe6d88f835b35e34801300966741ff423f",
+  "patches": [
+    {
+      "name": "kunlun-legacy-runtime",
+      "file": "kunlun-legacy-runtime.patch",
+      "sha256": "e85faac346279cc383f9737f020ee94e1698138f08692138a09834a7602f608e"
+    },
+    {
+      "name": "kunlun-rope-clusters-positions",
+      "file": "kunlun-rope-clusters-positions.patch",
+      "sha256": "3572b1ce063157208d7eb4fe6cfacc76f24c5c05d9811d47bd39fe203b4b7277"
+    }
+  ],
+  "files": {
+    "xmake.lua": "cda315c2a6f376423aa4fa081e482f0c2e24313e1ad723e665e5013a30a51316",
+    "src/infinicore/context/context_impl.cc": "7405aa7cf77add0cfb988b1cd6b6b336dfb16ff1aca985363b7d1dfb86488824",
+    "xmake/kunlun.lua": "95f97722c96772b7a59495d9d1ab3dd6215a2c7fc1e72c66e09d66fe5cafddea",
+    "infinicore-symbols.map": "9cd83ae4ec8b75fd968f3891fb5c655c075316fef9a5e7faeb277d35e2bc3d43",
+    "src/infiniop/ops/rope/kunlun/rope_kunlun.xpu": "e0234a5bf1a14b4d105374dd69466897a61ee5647622bf36dfbecfb8633615a0"
+  }
+}

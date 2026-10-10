@@ -6,6 +6,7 @@
 | --- | --- | --- | --- |
 | [MetaX](metax/README.md) | 模块化 InfiniCore 的 InfiniOps 子模块 | [manifest.json](metax/manifest.json) | 固定上游提交或本地离线副本 |
 | [Ascend](ascend/README.md) | legacy InfiniCore | [manifest.json](ascend/manifest.json) | 本地补丁 |
+| [Kunlun](kunlun/README.md) | legacy InfiniCore | [manifest.json](kunlun/manifest.json) | 本地补丁 |
 
 CUDA 构建目前没有专用补丁，不复用 MetaX 补丁。各清单的 `base_revision` 必须与 [版本锁](../../vllm_infinicore/infinicore.lock.json) 对应组件一致；`patches` 数组定义应用顺序，`files` 记录应用后源码的 SHA256。
 

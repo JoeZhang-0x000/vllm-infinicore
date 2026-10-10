@@ -50,11 +50,13 @@ def install_vllm_unquantized_embedding_route() -> VllmEmbeddingInstallStatus:
             reason="InfiniCore unquantized embedding patch already active",
         )
 
-    from ...operators.common.cpp_bridge import uses_modular_api
+    from ...operators.common import cpp_bridge
 
     # Resolve the API once, before Dynamo traces the model. Filesystem queries
     # in forward would break vLLM's full-graph compilation on TP workers.
-    _TP_LOOKUP_SUPPORTED = uses_modular_api()
+    _TP_LOOKUP_SUPPORTED = cpp_bridge.uses_modular_api() or cpp_bridge.enabled_for(
+        cpp_bridge.EMBEDDING_ROUTE
+    )
     _ORIGINAL_EMBEDDING = UnquantizedEmbeddingMethod.embedding
     UnquantizedEmbeddingMethod.embedding = _patched_embedding
     _INSTALLED = True

@@ -65,7 +65,7 @@ CUDA_VISIBLE_DEVICES=7 vllm-infinicore-gsm8k \
   --model /path/to/Qwen3-8B --mode both --output-dir results/gsm8k
 ```
 
-从 ModelScope 的 `AI-ModelScope/gsm8k` 下载 `main/test` 全量 1319 题，在独立进程中分别关闭、开启插件。评测入口默认启用全部九条路由，采用 0-shot、非 thinking、贪心解码，按显式 `####` 或 `\boxed{}` 最终答案计算数值精确匹配。输出逐题预测、得分和 `comparison.json`。
+从 ModelScope 的 `AI-ModelScope/gsm8k` 下载 `main/test` 全量 1319 题，在独立进程中分别关闭、开启插件。MetaX / Ascend 默认启用全部九条路由；Kunlun 默认启用平台支持的五条非 Attention 计算路由，也可用 `--routes` 显式指定。采用 0-shot、非 thinking、贪心解码，按显式 `####` 或 `\boxed{}` 最终答案计算数值精确匹配。输出逐题预测、得分和 `comparison.json`，其中精度验收按得分差的绝对值判断是否小于 1pp。
 
 `--prepare-only` 仅下载数据；`--dataset-file` 复用冻结数据；`--limit` 指定样本数；`--rescore-only` 离线重评分。也可执行 `python -m vllm_infinicore.benchmarks.gsm8k`，完整参数见 `--help`。Ascend 使用 `--platform ascend` 和 `ASCEND_RT_VISIBLE_DEVICES`。
 
@@ -83,11 +83,40 @@ Ascend 使用锁文件的 legacy_ascend 提交和 ABI 1。默认在独立源码�
 
 插件通过动态库能力位选择直接读取 cos/sin cache 视图，并让 Q/K RMSNorm 保留 packed QKV stride；旧动态库使用连续输入和连续表兼容路径。Attention、集合通信与请求调度由 vllm-ascend 提供，融合 Add+RMSNorm 及不支持尺寸的 SwiGLU 保留 native。算子与插件的消融结果见 [NPU 优化记录](docs/ascend/optimization-summary.md)。
 
+## Kunlun 构建与标定
+
+Kunlun 使用 `legacy_kunlun` 锁定的 InfiniCore，Python / C++ ABI 需与 xpytorch 一致。SDK 必须含厂商 XRE、XDNN、XBLAS 和 XTDK；XBLAS 的 `cublas*.h` 将接口映射到 `xblas*`，不能用 NVIDIA 头文件替代。
+
+```sh
+python scripts/build_kunlun.py --source /path/to/locked-InfiniCore \
+  --build-dir /path/to/kunlun-build --sdk "$KUNLUN_HOME" --cxx11-abi 0
+python -m pip install -e '.[gsm8k]'
+export INFINI_ROOT=/path/to/kunlun-build/install
+export LD_LIBRARY_PATH="$INFINI_ROOT/lib:$LD_LIBRARY_PATH"
+export VLLM_PLUGINS=kunlun,kunlun_model
+export VLLM_INFINICORE_OPERATOR_BACKEND=kunlun
+export XPU_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0
+python -m vllm_infinicore.benchmarks.gsm8k --platform kunlun \
+  --model /path/to/Qwen3-0.6B --mode both --output-dir results/kunlun-gsm8k \
+  --batch-size 16 --max-tokens 2048 --max-model-len 4096 \
+  --max-num-batched-tokens 8192 --memory 0.30 --enforce-eager
+```
+
+默认五条路由为 Embedding、MatMul、RoPE、LMHead、StoreKVCache；RMSNorm、SiluAndMul 与 Attention 计算沿用厂商实现。构建在独立副本中应用 [兼容补丁](scripts/patches/kunlun/README.md)，输出 `install/manifest.json`，记录源码、补丁及动态库 SHA256。
+
+RoPE 按设备 cluster 数并行（上限 12），并在内核中处理位置边界，省略逐层 cast / clamp。插件通过能力位识别新版库，旧库保留原有预处理。TP Embedding 复用 vLLM 的本地分片、mask 和 all-reduce。
+
+实验发现 `kunlun_ops 0.1.58+ee39020a` 的 Flash BHLD V-cache 多 token 写入错误。可在独立环境执行 `python scripts/fix_kunlun_vendor_cache.py --apply`，切换至同一厂商包的 `store_paged_kv_cache` 并保留原文件备份。该工具只接受已校验的源码指纹；原生与插件必须共用相同修复，结果应注明基线包含此修复。
+
+Qwen3-8B 静态吞吐入口为 `python -m vllm_infinicore.benchmarks.kunlun_static --help`。默认长度为 128→128、2048→512，batch 为 1/4/16/32/64；预热一次，计时三次并取完整 generate 的输出 TPS 中位数。分别运行 `--mode native` / `--mode infinicore`，使用相同的 `--tp`、`--devices` 和模型；再用 `--compare-native` / `--compare-infinicore` 生成逐配置比例。验收检查每个 rank 的实际路由、Graph capture/replay 和零 Attention 计算调用。
+
+P800 实验中，Qwen3-0.6B / TP1 的 GSM8K 得分差为 0pp；Qwen3-8B 的 40 个静态吞吐配置全部超过 90%，TP1/2/4/8 的最低比例为 111.12% / 104.65% / 98.47% / 90.17%。参数、厂商 cache 修复、基线复用指纹及完整矩阵见 [Kunlun 实验报告](docs/kunlun/optimization-summary.md)。
+
 ## 其他入口与兼容范围
 
 - [scripts/run-vllm-metax.sh](scripts/run-vllm-metax.sh)：加载 `metax-1` 的 `/opt/conda`、MACA 3.8.0 环境并启动原生 vLLM；`--chat` 进入聊天。支持 `METAX_GPU`、`METAX_PORT`、`METAX_HOST` 和 `METAX_MODEL`。
 - Ascend 使用锁文件的 `legacy_ascend` C API / ABI，通过 [scripts/build_ascend.py](scripts/build_ascend.py) 构建并设置 `VLLM_INFINICORE_ASCEND_LIBRARY`；融合 Add+RMSNorm 及不支持尺寸的 SiLU 保留原生实现。
-- CUDA 复用新版桥接，尚未在 NVIDIA 硬件验证；Kunlun 保留旧版接口。
+- CUDA 复用新版桥接，尚未在 NVIDIA 硬件验证；Kunlun 使用锁定的 legacy 接口。
 
 ## 项目结构
 
@@ -95,8 +124,9 @@ Ascend 使用锁文件的 legacy_ascend 提交和 ABI 1。默认在独立源码�
 - `vllm_infinicore/operators/`：统一调用入口、custom ops 和 Attention/KV 调用。
 - `vllm_infinicore/operators/common/`：共享执行逻辑、C++ 桥接及 `csrc/`；`legacy.py` 集中旧版 Python API 兼容逻辑，`torch_ops.py` 集中原生回退实现。
 - `vllm_infinicore/operators/platforms/`：`ascend/`、`cuda/`、`kunlun/`、`metax/` 的能力声明、桥接配置与平台专用路由。
-- `vllm_infinicore/benchmarks/`：可安装的 GSM8K 评测入口与评分逻辑。
+- `vllm_infinicore/benchmarks/`：`gsm8k.py` 负责精度评测，`kunlun_static.py` 负责静态吞吐；`common.py` 共享环境配置、worker 路由与 Graph 校验、结果文件写入，`gsm8k_grading.py` 负责答案评分。
 - `scripts/`：保留现有组件构建和启动入口；`infinicore_build/` 分离共享源码校验、补丁应用与平台策略，`patches/<平台>/` 各自保存补丁和清单。用法见 [脚本说明](scripts/README.md)。
-- `docs/ascend/`、`docs/metax/`：各平台性能记录；目录边界与维护规则见 [文档索引](docs/README.md)。
+- `docs/ascend/`、`docs/kunlun/`、`docs/metax/`：各平台实验与性能记录；目录边界与维护规则见 [文档索引](docs/README.md)。
+- `tests/`：无需设备的回归测试与手动设备检查，运行方式见 [测试说明](tests/README.md)。
 
 实验临时脚本和历史测试不属于发布包；构建缓存、库文件与评测结果均由 `.gitignore` 排除。Python 源码格式与检查使用 `ruff format vllm_infinicore scripts tests` 和 `ruff check vllm_infinicore scripts tests`，C++ 桥接使用项目的 `.clang-format`。不依赖厂商 SDK 的补丁准备与延迟注册回归测试使用 `python -m unittest discover -s tests -v`。
