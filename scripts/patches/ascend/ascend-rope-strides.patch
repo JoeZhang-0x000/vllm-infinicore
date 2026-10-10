@@ -1,0 +1,251 @@
+--- a/src/infiniop/ops/rope/rope.h
++++ b/src/infiniop/ops/rope/rope.h
+@@ -70,6 +70,7 @@
+     bool has_batch_dim;     // Whether tensors have batch dimension
+     bool pos_has_batch_dim; // Whether position IDs have batch dimension
+     infiniopRoPEAlgo_t algo;
++    ptrdiff_t sin_stride, cos_stride;
+ 
+     static utils::Result<RoPEInfo>
+     createRoPEInfo(
+@@ -78,7 +79,8 @@
+         infiniopTensorDescriptor_t pos_desc,
+         infiniopTensorDescriptor_t sin_desc,
+         infiniopTensorDescriptor_t cos_desc,
+-        infiniopRoPEAlgo_t algo) {
++        infiniopRoPEAlgo_t algo,
++        bool strided_tables = false) {
+         CHECK_OR_RETURN(
+             y_desc != nullptr && pos_desc != nullptr && sin_desc != nullptr && cos_desc != nullptr && algo < infiniopRoPEAlgo_t::INFINIOP_ROPE_ALGO_COUNT,
+             INFINI_STATUS_NULL_POINTER);
+@@ -155,7 +157,11 @@
+         }
+ 
+         // sin table and cos table must be totally contiguous
+-        CHECK_OR_RETURN(sin_desc->isContiguous() && cos_desc->isContiguous(),
++        CHECK_OR_RETURN(strided_tables
++                            ? sin_desc->stride(1) == 1 && cos_desc->stride(1) == 1
++                              && sin_desc->stride(0) >= static_cast<ptrdiff_t>(table_dim)
++                              && cos_desc->stride(0) >= static_cast<ptrdiff_t>(table_dim)
++                            : sin_desc->isContiguous() && cos_desc->isContiguous(),
+                         INFINI_STATUS_BAD_TENSOR_STRIDES);
+ 
+         // Set strides based on tensor dimensions
+@@ -199,6 +205,8 @@
+             y_has_batch,   // has_batch_dim
+             pos_has_batch, // pos_has_batch_dim
+             algo,
++            sin_desc->stride(0),
++            cos_desc->stride(0),
+         });
+     }
+ };
+--- a/src/infiniop/ops/rope/ascend/rope_ascend.h
++++ b/src/infiniop/ops/rope/ascend/rope_ascend.h
+@@ -21,6 +21,8 @@
+     ptrdiff_t x_stride_seqlen,
+     ptrdiff_t x_stride_nhead,
+     ptrdiff_t x_stride_batch,
++    ptrdiff_t sin_stride,
++    ptrdiff_t cos_stride,
+     void *stream);
+ 
+ extern "C" infiniStatus_t rope_kernel_neox_launch(
+@@ -41,6 +43,8 @@
+     ptrdiff_t x_stride_seqlen,
+     ptrdiff_t x_stride_nhead,
+     ptrdiff_t x_stride_batch,
++    ptrdiff_t sin_stride,
++    ptrdiff_t cos_stride,
+     void *stream);
+ 
+ DESCRIPTOR(ascend)
+--- a/src/infiniop/ops/rope/ascend/rope_ascend.cc
++++ b/src/infiniop/ops/rope/ascend/rope_ascend.cc
+@@ -16,7 +16,7 @@
+     infiniopTensorDescriptor_t cos_desc,
+     infiniopRoPEAlgo_t algo) {
+     auto handle_ascned = reinterpret_cast<device::ascend::Handle *>(handle);
+-    auto result = RoPEInfo::createRoPEInfo(y_desc, x_desc, pos_desc, sin_desc, cos_desc, algo);
++    auto result = RoPEInfo::createRoPEInfo(y_desc, x_desc, pos_desc, sin_desc, cos_desc, algo, true);
+     CHECK_RESULT(result);
+ 
+     if (algo != INFINIOP_ROPE_ALGO_GPT_J && algo != INFINIOP_ROPE_ALGO_GPT_NEOX) {
+@@ -55,9 +55,9 @@
+     auto x_stride_batch = _info.x_stride_batch;
+ 
+     if (algo == INFINIOP_ROPE_ALGO_GPT_J) {
+-        return rope_kernel_launch(y, (void *)x, (void *)pos_ids, (void *)sin_table, (void *)cos_table, seq_len, nhead, dhead, batch, data_type, pos_type, y_stride_seqlen, y_stride_nhead, y_stride_batch, x_stride_seqlen, x_stride_nhead, x_stride_batch, stream);
++        return rope_kernel_launch(y, (void *)x, (void *)pos_ids, (void *)sin_table, (void *)cos_table, seq_len, nhead, dhead, batch, data_type, pos_type, y_stride_seqlen, y_stride_nhead, y_stride_batch, x_stride_seqlen, x_stride_nhead, x_stride_batch, _info.sin_stride, _info.cos_stride, stream);
+     } else {
+-        return rope_kernel_neox_launch(y, (void *)x, (void *)pos_ids, (void *)sin_table, (void *)cos_table, seq_len, nhead, dhead, batch, data_type, pos_type, y_stride_seqlen, y_stride_nhead, y_stride_batch, x_stride_seqlen, x_stride_nhead, x_stride_batch, stream);
++        return rope_kernel_neox_launch(y, (void *)x, (void *)pos_ids, (void *)sin_table, (void *)cos_table, seq_len, nhead, dhead, batch, data_type, pos_type, y_stride_seqlen, y_stride_nhead, y_stride_batch, x_stride_seqlen, x_stride_nhead, x_stride_batch, _info.sin_stride, _info.cos_stride, stream);
+     }
+ }
+ } // namespace op::rope::ascend
+--- a/src/infiniop/ops/rope/ascend/rope_ascend_kernel.cpp
++++ b/src/infiniop/ops/rope/ascend/rope_ascend_kernel.cpp
+@@ -20,7 +20,7 @@
+                                 ptrdiff_t st_ynbatch,
+                                 ptrdiff_t st_xnt,
+                                 ptrdiff_t st_xnh,
+-                                ptrdiff_t st_xbatch);
++                                ptrdiff_t st_xbatch, ptrdiff_t sin_stride, ptrdiff_t cos_stride);
+     __aicore__ inline void process(size_t seq_len);
+ 
+ private:
+@@ -62,6 +62,7 @@
+     ptrdiff_t _st_xnt;
+     ptrdiff_t _st_xnh;
+     ptrdiff_t _st_xbatch;
++    ptrdiff_t _sin_stride, _cos_stride;
+ };
+ 
+ template <typename T, typename U>
+@@ -78,7 +79,7 @@
+                                               ptrdiff_t st_ynbatch,
+                                               ptrdiff_t st_xnt,
+                                               ptrdiff_t st_xnh,
+-                                              ptrdiff_t st_xbatch) {
++                                              ptrdiff_t st_xbatch, ptrdiff_t sin_stride, ptrdiff_t cos_stride) {
+     this->_tile_len = dh;
+     this->_nhead = nhead;
+     this->_batch = batch;
+@@ -88,6 +89,8 @@
+     this->_st_xnt = st_xnt;
+     this->_st_xnh = st_xnh;
+     this->_st_xbatch = st_xbatch;
++    _sin_stride = sin_stride;
++    _cos_stride = cos_stride;
+     _copy_len = alignTileLen<T>(dh, BYTE_ALIGN);
+     _half_copy_len = alignTileLen<T>(dh / 2, BYTE_ALIGN);
+ 
+@@ -143,8 +146,8 @@
+     auto idx = batch_idx * _st_xbatch + i * _st_xnt + head_idx * _st_xnh;
+     DataCopy(input_ub, _x_gm[idx], _copy_len);
+     auto pos_idx = _p_gm(i);
+-    DataCopy(sin_ub, _sin_gm[pos_idx * _tile_len / 2], _half_copy_len);
+-    DataCopy(cos_ub, _cos_gm[pos_idx * _tile_len / 2], _half_copy_len);
++    DataCopy(sin_ub, _sin_gm[pos_idx * _sin_stride], _half_copy_len);
++    DataCopy(cos_ub, _cos_gm[pos_idx * _cos_stride], _half_copy_len);
+     _in_que.EnQue(input_ub);
+     _sin_que.EnQue(sin_ub);
+     _cos_que.EnQue(cos_ub);
+@@ -332,7 +335,7 @@
+                                 ptrdiff_t st_ynbatch,
+                                 ptrdiff_t st_xnt,
+                                 ptrdiff_t st_xnh,
+-                                ptrdiff_t st_xbatch);
++                                ptrdiff_t st_xbatch, ptrdiff_t sin_stride, ptrdiff_t cos_stride);
+     __aicore__ inline void process(size_t seq_len);
+ 
+ private:
+@@ -375,6 +378,7 @@
+     ptrdiff_t _st_xnt;
+     ptrdiff_t _st_xnh;
+     ptrdiff_t _st_xbatch;
++    ptrdiff_t _sin_stride, _cos_stride;
+ };
+ 
+ template <typename T, typename U>
+@@ -391,7 +395,7 @@
+                                                   ptrdiff_t st_ynbatch,
+                                                   ptrdiff_t st_xnt,
+                                                   ptrdiff_t st_xnh,
+-                                                  ptrdiff_t st_xbatch) {
++                                                  ptrdiff_t st_xbatch, ptrdiff_t sin_stride, ptrdiff_t cos_stride) {
+     this->_tile_len = dh;
+     this->_half_len = dh / 2;
+     this->_nhead = nhead;
+@@ -402,6 +406,8 @@
+     this->_st_xnt = st_xnt;
+     this->_st_xnh = st_xnh;
+     this->_st_xbatch = st_xbatch;
++    _sin_stride = sin_stride;
++    _cos_stride = cos_stride;
+     _copy_len = alignTileLen<T>(dh, BYTE_ALIGN);
+     _half_copy_len = alignTileLen<T>(_half_len, BYTE_ALIGN);
+ 
+@@ -454,8 +460,8 @@
+     auto pos_idx = _p_gm(i);
+     DataCopyExtParams halfCopyParams = {1, static_cast<uint32_t>(_half_len * sizeof(T)), 0, 0, 0};
+     DataCopyPadExtParams<T> halfPadParams{true, 0, 0, 0};
+-    DataCopyPad(sin_ub, _sin_gm[pos_idx * _half_len], halfCopyParams, halfPadParams);
+-    DataCopyPad(cos_ub, _cos_gm[pos_idx * _half_len], halfCopyParams, halfPadParams);
++    DataCopyPad(sin_ub, _sin_gm[pos_idx * _sin_stride], halfCopyParams, halfPadParams);
++    DataCopyPad(cos_ub, _cos_gm[pos_idx * _cos_stride], halfCopyParams, halfPadParams);
+     _in_que.EnQue(input_ub);
+     _sin_que.EnQue(sin_ub);
+     _cos_que.EnQue(cos_ub);
+@@ -602,7 +608,7 @@
+ 
+ #define ROPE_KERNEL_INIT_ARGS y, x, pos, sin, cos, dhead, nhead, batch,        \
+                               y_stride_seqlen, y_stride_nhead, y_stride_batch, \
+-                              x_stride_seqlen, x_stride_nhead, x_stride_batch
++                              x_stride_seqlen, x_stride_nhead, x_stride_batch, sin_stride, cos_stride
+ 
+ #define CASE_POSTYPE(POS_TYPE_ENUM, TYPE, POS_T) \
+     case POS_TYPE_ENUM: {                        \
+@@ -642,6 +648,8 @@
+                                            ptrdiff_t x_stride_seqlen, \
+                                            ptrdiff_t x_stride_nhead,  \
+                                            ptrdiff_t x_stride_batch,  \
++                                           ptrdiff_t sin_stride,      \
++                                           ptrdiff_t cos_stride,      \
+                                            int32_t pos_type) {        \
+         ROPE_KERNEL(TYPE, pos_type)                                   \
+     }
+@@ -659,7 +667,7 @@
+ 
+ #define ROPE_NEOX_KERNEL_INIT_ARGS y, x, pos, sin, cos, dhead, nhead, batch,        \
+                                    y_stride_seqlen, y_stride_nhead, y_stride_batch, \
+-                                   x_stride_seqlen, x_stride_nhead, x_stride_batch
++                                   x_stride_seqlen, x_stride_nhead, x_stride_batch, sin_stride, cos_stride
+ 
+ #define CASE_NEOX_POSTYPE(POS_TYPE_ENUM, TYPE, POS_T) \
+     case POS_TYPE_ENUM: {                             \
+@@ -699,6 +707,8 @@
+                                            ptrdiff_t x_stride_seqlen, \
+                                            ptrdiff_t x_stride_nhead,  \
+                                            ptrdiff_t x_stride_batch,  \
++                                           ptrdiff_t sin_stride,      \
++                                           ptrdiff_t cos_stride,      \
+                                            int32_t pos_type) {        \
+         ROPE_NEOX_KERNEL(TYPE, pos_type)                              \
+     }
+@@ -732,6 +742,8 @@
+     ptrdiff_t x_stride_seqlen,
+     ptrdiff_t x_stride_nhead,
+     ptrdiff_t x_stride_batch,
++    ptrdiff_t sin_stride,
++    ptrdiff_t cos_stride,
+     void *stream) {
+     const size_t work = batch * nhead * seq_len;
+     const size_t block_dim = work < 64 ? work : 64;
+@@ -750,6 +762,8 @@
+                                                         x_stride_seqlen,     \
+                                                         x_stride_nhead,      \
+                                                         x_stride_batch,      \
++                                                        sin_stride,          \
++                                                        cos_stride,          \
+                                                         pos_type);           \
+         return INFINI_STATUS_SUCCESS;
+ 
+@@ -780,6 +794,8 @@
+     ptrdiff_t x_stride_seqlen,
+     ptrdiff_t x_stride_nhead,
+     ptrdiff_t x_stride_batch,
++    ptrdiff_t sin_stride,
++    ptrdiff_t cos_stride,
+     void *stream) {
+     const size_t work = batch * nhead * seq_len;
+     const size_t block_dim = work < 64 ? work : 64;
+@@ -798,6 +814,8 @@
+                                                         x_stride_seqlen,     \
+                                                         x_stride_nhead,      \
+                                                         x_stride_batch,      \
++                                                        sin_stride,          \
++                                                        cos_stride,          \
+                                                         pos_type);           \
+         return INFINI_STATUS_SUCCESS;
+ 

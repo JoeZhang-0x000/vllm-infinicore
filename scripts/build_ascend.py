@@ -15,6 +15,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from infinicore_build.patches import prepare_ascend_source
+
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / "vllm_infinicore/infinicore.lock.json"
 
@@ -40,6 +42,7 @@ def main() -> None:
     parser.add_argument("--soc", required=True, help="e.g. Ascend910B4; must match the target NPU")
     parser.add_argument("--cann", default=os.getenv("ASCEND_TOOLKIT_HOME"))
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--ascend-patches", choices=("local", "none"), default="local")
     args = parser.parse_args()
     lock = json.loads(LOCK.read_text())["legacy_ascend"]
     build = args.build_dir.resolve()
@@ -61,6 +64,9 @@ def main() -> None:
         )
         subprocess.run(["git", "-C", str(source), "checkout", "--detach", "FETCH_HEAD"], check=True)
     verify_source(source, lock["revision"])
+    operator_source, patches = prepare_ascend_source(
+        source, build, ROOT / "scripts/patches/ascend", lock["revision"], args.ascend_patches
+    )
     if not args.cann or not Path(args.cann).is_dir():
         parser.error("--cann or ASCEND_TOOLKIT_HOME must point to the CANN toolkit")
     cmake_dir = Path(tempfile.mkdtemp(prefix="cmake-", dir=build))
@@ -71,10 +77,11 @@ def main() -> None:
             str(ROOT / "vllm_infinicore/operators/ascend/csrc"),
             "-B",
             str(cmake_dir),
-            f"-DINFINICORE_SOURCE={source}",
+            f"-DINFINICORE_SOURCE={operator_source}",
             f"-DINFINICORE_REVISION={lock['revision']}",
             f"-DASCEND_CANN_PACKAGE_PATH={args.cann}",
             f"-DSOC_VERSION={args.soc}",
+            f"-DVLLM_INFINICORE_ASCEND_STRIDED_ROPE={'ON' if patches else 'OFF'}",
             "-DCMAKE_BUILD_TYPE=Release",
         ],
         check=True,
@@ -91,6 +98,9 @@ def main() -> None:
         build_tree=str(cmake_dir),
         cann=str(Path(args.cann).resolve()),
         library=str(library),
+        source=str(source),
+        operator_source=str(operator_source),
+        ascend_patches=patches,
         sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
     )
     (build / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

@@ -5,6 +5,13 @@
 
 extern "C" const char *vllmInfinicoreRevision() { return INFINICORE_REVISION; }
 extern "C" int vllmInfinicoreBridgeABI() { return 1; }
+extern "C" int vllmInfinicoreAscendFeatures() {
+#ifdef VLLM_INFINICORE_ASCEND_STRIDED_ROPE
+    return 3;
+#else
+    return 0;
+#endif
+}
 extern "C" int vllmInfinicoreCreateAscendHandle(InfiniopHandle **handle, int device) {
     if (!handle)
         return INFINI_STATUS_NULL_POINTER;

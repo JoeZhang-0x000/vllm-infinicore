@@ -1,0 +1,137 @@
+--- a/src/infiniop/ops/rope/ascend/rope_ascend_kernel.cpp
++++ b/src/infiniop/ops/rope/ascend/rope_ascend_kernel.cpp
+@@ -89,7 +89,7 @@
+     this->_st_xnh = st_xnh;
+     this->_st_xbatch = st_xbatch;
+     _copy_len = alignTileLen<T>(dh, BYTE_ALIGN);
+-    _half_copy_len = alignTileLen<T>(dh, BYTE_ALIGN);
++    _half_copy_len = alignTileLen<T>(dh / 2, BYTE_ALIGN);
+ 
+     _block_idx = GetBlockIdx();
+ 
+@@ -303,7 +303,10 @@
+ 
+ template <typename T, typename U>
+ __aicore__ inline void RoPEKernel<T, U>::process(size_t seq_len) {
+-    for (size_t i = 0; i < seq_len; ++i) {
++    const size_t heads = _batch * _nhead;
++    for (size_t work = GetBlockIdx(); work < seq_len * heads; work += GetBlockNum()) {
++        _block_idx = work % heads;
++        const size_t i = work / heads;
+         copyIn(i);
+         compute(i);
+         copyOut(i);
+@@ -481,6 +484,10 @@
+         Cast(sin_f, sin_ub, AscendC::RoundMode::CAST_NONE, half_float_copy_len);
+         Cast(cos_f, cos_ub, AscendC::RoundMode::CAST_NONE, half_float_copy_len);
+ 
++        if (_half_len * sizeof(float) % BYTE_ALIGN == 0) {
++            Adds(first_half_f, input_f, 0.0f, _half_len);
++            Adds(second_half_f, input_f[_half_len], 0.0f, _half_len);
++        } else {
+         for (size_t j = 0; j < half_float_copy_len; j++) {
+             if (j < _half_len) {
+                 first_half_f(j) = input_f(j);
+@@ -490,6 +497,7 @@
+                 second_half_f(j) = 0.0f;
+             }
+         }
++        }
+         PipeBarrier<PIPE_V>();
+ 
+         Mul<float>(result1_f, first_half_f, cos_f, half_float_copy_len);
+@@ -503,10 +511,16 @@
+         Add<float>(result4_f, result1_f, result2_f, half_float_copy_len);
+ 
+         LocalTensor<float> output_f = _tmp_float_output.Get<float>();
++        if (_half_len * sizeof(float) % BYTE_ALIGN == 0) {
++            Adds(output_f, result3_f, 0.0f, _half_len);
++            Adds(output_f[_half_len], result4_f, 0.0f, _half_len);
++        } else {
+         for (size_t j = 0; j < _half_len; j++) {
+             output_f(j) = result3_f(j);
+             output_f(_half_len + j) = result4_f(j);
+         }
++        }
++        PipeBarrier<PIPE_V>();
+ 
+         Cast(output_ub, output_f, AscendC::RoundMode::CAST_RINT, _tile_len);
+ 
+@@ -518,6 +532,10 @@
+         LocalTensor<T> result3 = _tmp_result3.Get<T>();
+         LocalTensor<T> result4 = _tmp_result4.Get<T>();
+ 
++        if (_half_len * sizeof(T) % BYTE_ALIGN == 0) {
++            Adds(first_half, input_ub, static_cast<T>(0), _half_len);
++            Adds(second_half, input_ub[_half_len], static_cast<T>(0), _half_len);
++        } else {
+         for (size_t j = 0; j < _half_copy_len; j++) {
+             if (j < _half_len) {
+                 first_half(j) = input_ub(j);
+@@ -527,6 +545,7 @@
+                 second_half(j) = static_cast<T>(0);
+             }
+         }
++        }
+         PipeBarrier<PIPE_V>();
+ 
+         Mul<T>(result1, first_half, cos_ub, _half_copy_len);
+@@ -539,10 +558,15 @@
+         PipeBarrier<PIPE_V>();
+         Add<T>(result4, result1, result2, _half_copy_len);
+ 
++        if (_half_len * sizeof(T) % BYTE_ALIGN == 0) {
++            Adds(output_ub, result3, static_cast<T>(0), _half_len);
++            Adds(output_ub[_half_len], result4, static_cast<T>(0), _half_len);
++        } else {
+         for (size_t j = 0; j < _half_len; j++) {
+             output_ub(j) = result3(j);
+             output_ub(_half_len + j) = result4(j);
+-        }
++        }        }
++        PipeBarrier<PIPE_V>();
+     }
+     // DumpTensor(output_ub, 5, _tile_len);
+     _out_que.EnQue<T>(output_ub);
+@@ -564,7 +588,10 @@
+ 
+ template <typename T, typename U>
+ __aicore__ inline void RoPEKernelNeox<T, U>::process(size_t seq_len) {
+-    for (size_t i = 0; i < seq_len; ++i) {
++    const size_t heads = _batch * _nhead;
++    for (size_t work = GetBlockIdx(); work < seq_len * heads; work += GetBlockNum()) {
++        _block_idx = work % heads;
++        const size_t i = work / heads;
+         copyIn(i);
+         compute(i);
+         copyOut(i);
+@@ -706,10 +733,13 @@
+     ptrdiff_t x_stride_nhead,
+     ptrdiff_t x_stride_batch,
+     void *stream) {
++    const size_t work = batch * nhead * seq_len;
++    const size_t block_dim = work < 64 ? work : 64;
++    if (work == 0) return INFINI_STATUS_SUCCESS;
+ 
+ #define LAUNCH_ROPE_KERNEL(DTYPE_ENUM, KERNEL_NAME)                          \
+     case DTYPE_ENUM:                                                         \
+-        KERNEL_NAME<<<batch * nhead, nullptr, stream>>>(y, x, pos, sin, cos, \
++        KERNEL_NAME<<<block_dim, nullptr, stream>>>(y, x, pos, sin, cos, \
+                                                         seq_len,             \
+                                                         dhead,               \
+                                                         nhead,               \
+@@ -751,10 +781,13 @@
+     ptrdiff_t x_stride_nhead,
+     ptrdiff_t x_stride_batch,
+     void *stream) {
++    const size_t work = batch * nhead * seq_len;
++    const size_t block_dim = work < 64 ? work : 64;
++    if (work == 0) return INFINI_STATUS_SUCCESS;
+ 
+ #define LAUNCH_ROPE_NEOX_KERNEL(DTYPE_ENUM, KERNEL_NAME)                     \
+     case DTYPE_ENUM:                                                         \
+-        KERNEL_NAME<<<batch * nhead, nullptr, stream>>>(y, x, pos, sin, cos, \
++        KERNEL_NAME<<<block_dim, nullptr, stream>>>(y, x, pos, sin, cos, \
+                                                         seq_len,             \
+                                                         dhead,               \
+                                                         nhead,               \

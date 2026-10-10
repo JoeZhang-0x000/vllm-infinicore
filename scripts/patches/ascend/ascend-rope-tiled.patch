@@ -1,0 +1,156 @@
+--- a/src/infiniop/ops/rope/ascend/rope_ascend_kernel.cpp
++++ b/src/infiniop/ops/rope/ascend/rope_ascend_kernel.cpp
+@@ -2,6 +2,8 @@
+ #include <type_traits>
+ 
+ using namespace AscendC;
++
++#include "rope_neox_tiled.h"
+ 
+ template <typename T, typename U>
+ class RoPEKernel {
+@@ -671,6 +673,17 @@
+ 
+ #define CASE_NEOX_POSTYPE(POS_TYPE_ENUM, TYPE, POS_T) \
+     case POS_TYPE_ENUM: {                             \
++        if constexpr (std::is_same<TYPE, bfloat16_t>::value) { \
++            if (seq_len >= 32 && dhead == 128 && nhead <= 32 \
++                && x_stride_nhead == 128 && y_stride_nhead == 128) { \
++                RoPENeoxBF16Tiled<POS_T> tiled; \
++                tiled.init(y, x, pos, sin, cos, nhead, batch, \
++                           y_stride_seqlen, y_stride_batch, \
++                           x_stride_seqlen, x_stride_batch, sin_stride, cos_stride); \
++                tiled.process(seq_len); \
++                break; \
++            } \
++        } \
+         RoPEKernelNeox<TYPE, POS_T> op;               \
+         op.init(ROPE_NEOX_KERNEL_INIT_ARGS);          \
+         op.process(seq_len);                          \
+@@ -797,7 +810,9 @@
+     ptrdiff_t sin_stride,
+     ptrdiff_t cos_stride,
+     void *stream) {
+-    const size_t work = batch * nhead * seq_len;
++    const bool tiled = dtype == INFINI_DTYPE_BF16 && seq_len >= 32 && dhead == 128
++                       && nhead <= 32 && x_stride_nhead == 128 && y_stride_nhead == 128;
++    const size_t work = batch * seq_len * (tiled ? 1 : nhead);
+     const size_t block_dim = work < 64 ? work : 64;
+     if (work == 0) return INFINI_STATUS_SUCCESS;
+ 
+--- /dev/null
++++ b/src/infiniop/ops/rope/ascend/rope_neox_tiled.h
+@@ -0,0 +1,113 @@
++// A token's contiguous heads share one DMA transfer and one sin/cos load.
++// FP32 vector repeats broadcast the half-head tables across all heads.
++template <typename Pos>
++class RoPENeoxBF16Tiled {
++public:
++    __aicore__ inline void init(GM_ADDR y, GM_ADDR x, GM_ADDR pos,
++                               GM_ADDR sin, GM_ADDR cos, size_t heads, size_t batch,
++                               ptrdiff_t y_token, ptrdiff_t y_batch,
++                               ptrdiff_t x_token, ptrdiff_t x_batch,
++                               ptrdiff_t sin_stride, ptrdiff_t cos_stride) {
++        _heads = heads;
++        _batch = batch;
++        _x_token = x_token;
++        _y_token = y_token;
++        _x_batch = x_batch;
++        _y_batch = y_batch;
++        _sin_stride = sin_stride;
++        _cos_stride = cos_stride;
++        _x.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(x));
++        _y.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(y));
++        _sin.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(sin));
++        _cos.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(cos));
++        _positions.SetGlobalBuffer(reinterpret_cast<__gm__ Pos *>(pos));
++        const size_t elements = _heads * 128;
++        _pipe.InitBuffer(_input, 2, elements * sizeof(bfloat16_t));
++        _pipe.InitBuffer(_output, 2, elements * sizeof(bfloat16_t));
++        _pipe.InitBuffer(_sin_input, 2, 64 * sizeof(bfloat16_t));
++        _pipe.InitBuffer(_cos_input, 2, 64 * sizeof(bfloat16_t));
++        _pipe.InitBuffer(_input_f, elements * sizeof(float));
++        _pipe.InitBuffer(_output_f, elements * sizeof(float));
++        _pipe.InitBuffer(_sin_f, 64 * sizeof(float));
++        _pipe.InitBuffer(_cos_f, 64 * sizeof(float));
++        _pipe.InitBuffer(_first, _heads * 64 * sizeof(float));
++        _pipe.InitBuffer(_second, _heads * 64 * sizeof(float));
++        _pipe.InitBuffer(_product1, _heads * 64 * sizeof(float));
++        _pipe.InitBuffer(_product2, _heads * 64 * sizeof(float));
++        _pipe.InitBuffer(_result1, _heads * 64 * sizeof(float));
++        _pipe.InitBuffer(_result2, _heads * 64 * sizeof(float));
++    }
++
++    __aicore__ inline void process(size_t tokens) {
++        for (size_t work = GetBlockIdx(); work < _batch * tokens; work += GetBlockNum()) {
++            const size_t batch = work / tokens;
++            const size_t token = work % tokens;
++            const size_t position = static_cast<size_t>(_positions.GetValue(token));
++            LocalTensor<bfloat16_t> input = _input.AllocTensor<bfloat16_t>();
++            LocalTensor<bfloat16_t> sin = _sin_input.AllocTensor<bfloat16_t>();
++            LocalTensor<bfloat16_t> cos = _cos_input.AllocTensor<bfloat16_t>();
++            DataCopy(input, _x[batch * _x_batch + token * _x_token], _heads * 128);
++            DataCopy(sin, _sin[position * _sin_stride], 64);
++            DataCopy(cos, _cos[position * _cos_stride], 64);
++            _input.EnQue(input);
++            _sin_input.EnQue(sin);
++            _cos_input.EnQue(cos);
++            input = _input.DeQue<bfloat16_t>();
++            sin = _sin_input.DeQue<bfloat16_t>();
++            cos = _cos_input.DeQue<bfloat16_t>();
++            LocalTensor<bfloat16_t> output = _output.AllocTensor<bfloat16_t>();
++            LocalTensor<float> x = _input_f.Get<float>();
++            LocalTensor<float> out = _output_f.Get<float>();
++            LocalTensor<float> sf = _sin_f.Get<float>();
++            LocalTensor<float> cf = _cos_f.Get<float>();
++            LocalTensor<float> first = _first.Get<float>();
++            LocalTensor<float> second = _second.Get<float>();
++            LocalTensor<float> p1 = _product1.Get<float>();
++            LocalTensor<float> p2 = _product2.Get<float>();
++            LocalTensor<float> r1 = _result1.Get<float>();
++            LocalTensor<float> r2 = _result2.Get<float>();
++            Cast(x, input, RoundMode::CAST_NONE, _heads * 128);
++            Cast(sf, sin, RoundMode::CAST_NONE, 64);
++            Cast(cf, cos, RoundMode::CAST_NONE, 64);
++            PipeBarrier<PIPE_V>();
++            DataCopyParams split{static_cast<uint16_t>(_heads), 8, 8, 0};
++            DataCopy(first, x, split);
++            DataCopy(second, x[64], split);
++            PipeBarrier<PIPE_V>();
++            BinaryRepeatParams broadcast{1, 1, 1, 8, 8, 0};
++            Mul(p1, first, cf, uint64_t(64), static_cast<uint8_t>(_heads), broadcast);
++            Mul(p2, second, sf, uint64_t(64), static_cast<uint8_t>(_heads), broadcast);
++            PipeBarrier<PIPE_V>();
++            Sub(r1, p1, p2, _heads * 64);
++            PipeBarrier<PIPE_V>();
++            Mul(p1, first, sf, uint64_t(64), static_cast<uint8_t>(_heads), broadcast);
++            Mul(p2, second, cf, uint64_t(64), static_cast<uint8_t>(_heads), broadcast);
++            PipeBarrier<PIPE_V>();
++            Add(r2, p1, p2, _heads * 64);
++            PipeBarrier<PIPE_V>();
++            DataCopyParams merge{static_cast<uint16_t>(_heads), 8, 0, 8};
++            DataCopy(out, r1, merge);
++            DataCopy(out[64], r2, merge);
++            PipeBarrier<PIPE_V>();
++            Cast(output, out, RoundMode::CAST_RINT, _heads * 128);
++            _output.EnQue(output);
++            _input.FreeTensor(input);
++            _sin_input.FreeTensor(sin);
++            _cos_input.FreeTensor(cos);
++            output = _output.DeQue<bfloat16_t>();
++            DataCopy(_y[batch * _y_batch + token * _y_token], output, _heads * 128);
++            _output.FreeTensor(output);
++        }
++    }
++
++private:
++    TPipe _pipe;
++    TQue<QuePosition::VECIN, 2> _input, _sin_input, _cos_input;
++    TQue<QuePosition::VECOUT, 2> _output;
++    TBuf<QuePosition::VECCALC> _input_f, _output_f, _sin_f, _cos_f;
++    TBuf<QuePosition::VECCALC> _first, _second, _product1, _product2, _result1, _result2;
++    GlobalTensor<bfloat16_t> _x, _y, _sin, _cos;
++    GlobalTensor<Pos> _positions;
++    size_t _heads, _batch;
++    ptrdiff_t _x_token, _y_token, _x_batch, _y_batch, _sin_stride, _cos_stride;
++};

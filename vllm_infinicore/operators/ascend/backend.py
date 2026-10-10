@@ -121,6 +121,22 @@ def attention_library():
     return lib
 
 
+@lru_cache(maxsize=1)
+def ascend_features():
+    """Additive kernel capabilities; original ABI-1 libraries advertise none."""
+    feature = getattr(library(), "vllmInfinicoreAscendFeatures", None)
+    if feature is None:
+        return 0
+    feature.argtypes = []
+    feature.restype = C.c_int
+    return feature()
+
+
+def strided_rope_tables():
+    """New kernels read cache views directly; ABI-1 libraries still need copies."""
+    return bool(ascend_features() & 1)
+
+
 def fallback(name, reason, native):
     # Trace the original tensor program without Python counter side effects.
     # These calls are not runtime InfiniCore launches and must not be counted.
@@ -373,8 +389,22 @@ def launch(op, tensors, scalar=()):
 
 
 def rms_norm(x, weight, eps):
-    x, weight = nd(x).contiguous(), nd(weight).contiguous()
-    return launch("RMSNorm", [torch.empty_like(x), x, weight], (float(eps),))
+    x, weight = nd(x), nd(weight).contiguous()
+    heads = x.shape[1] if x.ndim == 3 else 1
+    tiled = (
+        ascend_features() & 2
+        and x.dtype == weight.dtype == torch.bfloat16
+        and x.ndim in (2, 3)
+        and x.shape[-1] == 128
+        and 0 < heads <= 32
+        and x.stride(-1) == 1
+        and (x.ndim == 2 or x.stride(1) == 128)
+        and x.stride(0) >= heads * 128
+    )
+    if not tiled:
+        x = x.contiguous()
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    return launch("RMSNorm", [out, x, weight], (float(eps),))
 
 
 def supports_silu_and_mul(x):
@@ -448,13 +478,17 @@ def rotary_embedding(positions, query, key, head_size, rotary_dim, cache, neox):
         raise Unsupported(reason)
     positions = nd(positions).contiguous()
     cache = nd(cache.to(device=query.device, dtype=query.dtype))
-    cos, sin = (t.contiguous() for t in cache.chunk(2, dim=-1))
+    cos, sin = cache.chunk(2, dim=-1)
+    if not strided_rope_tables():
+        cos, sin = cos.contiguous(), sin.contiguous()
 
     def apply(x):
         if x is None:
             return None
-        shaped = nd(x).contiguous().reshape(positions.numel(), -1, head_size)
-        out = torch.empty_like(shaped)
+        shaped = nd(x).reshape(positions.numel(), -1, head_size)
+        if shaped.stride(-1) != 1:
+            shaped = shaped.contiguous()
+        out = torch.empty(shaped.shape, dtype=shaped.dtype, device=shaped.device)
         launch("RoPE", [out, shaped, positions, sin, cos], (int(neox),))
         return out.reshape(x.shape)
 

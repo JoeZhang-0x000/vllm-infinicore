@@ -85,3 +85,39 @@ def prepare_ops_source(
         (staging / marker_name).write_text(json.dumps(manifest, indent=2) + "\n")
         staging.replace(copied)
     return copied, manifest
+
+
+def prepare_ascend_source(
+    source: Path, build: Path, patch_dir: Path, revision: str, mode: str
+) -> tuple[Path, dict | None]:
+    """Apply pinned Ascend fixes without modifying the verified base checkout."""
+    if mode == "none":
+        return source, None
+    manifest = json.loads((patch_dir / "manifest.json").read_text())
+    if manifest["base_revision"] != revision or not manifest["patches"]:
+        raise RuntimeError("Ascend patch manifest does not match the locked revision")
+    patches = [_patch_file(p, "local", patch_dir, build) for p in manifest["patches"]]
+    sources = build / "sources"
+    copied = sources / "InfiniCore"
+    marker_name = ".vllm-infinicore-ascend-patches.json"
+    if copied.exists():
+        marker = copied / marker_name
+        if not marker.is_file() or json.loads(marker.read_text()) != manifest:
+            raise RuntimeError("Use a fresh build directory for a different Ascend patch set")
+        _verify_patched_files(copied, manifest["files"])
+        return copied, manifest
+    sources.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".ascend-", dir=sources) as temporary:
+        staging = Path(temporary) / "InfiniCore"
+        for name in ("include", "src"):
+            shutil.copytree(source / name, staging / name)
+        for patch in patches:
+            subprocess.run(
+                ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(patch)],
+                cwd=staging,
+                check=True,
+            )
+        _verify_patched_files(staging, manifest["files"])
+        (staging / marker_name).write_text(json.dumps(manifest, indent=2) + "\n")
+        staging.replace(copied)
+    return copied, manifest
