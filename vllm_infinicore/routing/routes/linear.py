@@ -9,7 +9,7 @@ import torch
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-from ..custom_ops import LINEAR_OP, LM_HEAD_OP, load_custom_ops
+from ...operators.custom_ops import LINEAR_OP, LM_HEAD_OP, load_custom_ops
 
 VLLM_LINEAR_ROUTE_NAMES = ("MatMul", "LMHead")
 
@@ -108,7 +108,7 @@ def _patched_linear_apply(
     try:
         return torch.ops.vllm_infinicore.linear(x, layer.weight, bias)
     except Exception:
-        from ..backend import strict_backend_enabled
+        from ...operators.common.backend import strict_backend_enabled
 
         if strict_backend_enabled():
             raise
@@ -134,7 +134,7 @@ def _patched_logits_processor_get_logits(
             logits = logits[..., : self.org_vocab_size]
         return logits
     except Exception:
-        from ..backend import strict_backend_enabled
+        from ...operators.common.backend import strict_backend_enabled
 
         if strict_backend_enabled():
             raise

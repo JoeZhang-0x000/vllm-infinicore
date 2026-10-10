@@ -16,6 +16,14 @@ def _git(source: Path, *arguments: str) -> str:
     return subprocess.check_output(["git", "-C", str(source), *arguments], text=True).strip()
 
 
+def verify_git_source(source: Path, revision: str) -> None:
+    """Verify a locked revision and reject tracked changes before copying sources."""
+    if _git(source, "rev-parse", "HEAD") != revision:
+        raise RuntimeError(f"Source revision does not match the lock: {source}")
+    if _git(source, "status", "--porcelain", "--untracked-files=no"):
+        raise RuntimeError(f"Source checkout has tracked modifications: {source}")
+
+
 def verify_source(source: Path, lock: dict, manifest_path: Path | None) -> None:
     if manifest_path:
         # Fingerprinted archives support experiment containers without git.
@@ -36,7 +44,4 @@ def verify_source(source: Path, lock: dict, manifest_path: Path | None) -> None:
         for name, component in lock["components"].items()
     ]
     for path, revision in revisions:
-        if _git(path, "rev-parse", "HEAD") != revision:
-            raise RuntimeError(f"Source revision does not match the lock: {path}")
-        if _git(path, "status", "--porcelain", "--untracked-files=no"):
-            raise RuntimeError(f"Source checkout has tracked modifications: {path}")
+        verify_git_source(path, revision)

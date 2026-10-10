@@ -13,7 +13,7 @@ from functools import wraps
 
 import torch
 
-from ...routing.patching import PatchInstallResult, PatchUninstallResult
+from ....routing.patching import PatchInstallResult, PatchUninstallResult
 from . import backend, graph_ops
 
 _TARGETS = {
@@ -230,7 +230,7 @@ def _wrapper(route, original):
 
 
 def install(route):
-    from .. import attention
+    from ....routing.routes import attention
 
     if route in attention.ROUTES:
         return attention.install(route, "ascend")
@@ -251,7 +251,7 @@ def install(route):
 
 
 def uninstall(route):
-    from .. import attention
+    from ....routing.routes import attention
 
     if route in attention.ROUTES:
         return attention.uninstall(route, "ascend")

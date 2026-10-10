@@ -9,7 +9,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from .selection import OPERATOR_BACKEND_ENV, selected_backend
+from ..selection import OPERATOR_BACKEND_ENV, selected_backend
 
 CPP_BRIDGE_ENABLE_ENV = "VLLM_INFINICORE_ENABLE_CPP_BRIDGE"
 CPP_BRIDGE_ROUTES_ENV = "VLLM_INFINICORE_CPP_BRIDGE_ROUTES"
@@ -67,7 +67,7 @@ def bridge_target() -> str:
 
 
 def _backend_config() -> Any:
-    return import_module(f".{bridge_target()}.bridge", __package__)
+    return import_module(f"..platforms.{bridge_target()}.bridge", __package__)
 
 
 def _infini_root() -> Path:
@@ -149,7 +149,7 @@ def _parse_selected_routes() -> tuple[str, ...]:
 
     routes = tuple(route.strip() for route in raw.split(",") if route.strip())
     if "recommended" in routes:
-        from ..routing.policy import recommended_routes
+        from ...routing.policy import recommended_routes
 
         routes = tuple(
             dict.fromkeys(

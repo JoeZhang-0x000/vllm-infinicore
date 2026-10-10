@@ -16,7 +16,7 @@ from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbedding as VllmRotaryEmbedding,
 )
 
-from ..custom_ops import ROTARY_EMBEDDING_OP, load_custom_ops
+from ...operators.custom_ops import ROTARY_EMBEDDING_OP, load_custom_ops
 
 VLLM_ROTARY_EMBEDDING_CLASS = "RotaryEmbedding"
 
@@ -107,7 +107,7 @@ class InfiniCoreRotaryEmbedding(VllmRotaryEmbedding):
                 self.is_neox_style,
             )
         except Exception:
-            from ..backend import strict_backend_enabled
+            from ...operators.common.backend import strict_backend_enabled
 
             if strict_backend_enabled():
                 raise

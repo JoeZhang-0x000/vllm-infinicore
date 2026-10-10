@@ -1,6 +1,6 @@
 """NVIDIA CUDA vLLM operator routes."""
 
-from ..routes import install_shared_route, uninstall_shared_route
+from ....routing.routes import install_shared_route, uninstall_shared_route
 from . import SUPPORTED_ROUTES
 
 

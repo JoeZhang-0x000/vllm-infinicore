@@ -1,4 +1,4 @@
-"""Fetch pinned upstream patches and apply them to an independent source copy."""
+"""Platform-independent patch fetching, verification and isolated source preparation."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _patch_file(patch: dict, mode: str, local: Path, cache: Path) -> Path:
                 data = response.read()
         except (urllib.error.URLError, TimeoutError) as exc:
             raise RuntimeError(
-                f"Cannot fetch {patch['name']}; use --metax-patches local for offline builds"
+                f"Cannot fetch {patch['name']}; select local patches for an offline build"
             ) from exc
         # Validate before exposing a downloaded file to the source preparation.
         with tempfile.NamedTemporaryFile(dir=cache, delete=False) as temporary:
@@ -46,24 +46,33 @@ def _verify_patched_files(source: Path, fingerprints: dict[str, str]) -> None:
             raise RuntimeError(f"Patched source fingerprint mismatch: {name}")
 
 
-def prepare_ops_source(
-    source: Path, build: Path, patch_dir: Path, revision: str, mode: str
+def prepare_patched_source(
+    source: Path,
+    build: Path,
+    patch_dir: Path,
+    revision: str,
+    mode: str,
+    *,
+    component: str,
+    marker_name: str,
+    directories: tuple[str, ...] = (),
 ) -> tuple[Path, dict | None]:
-    original = source / "submodules" / "InfiniOps"
+    """Apply a manifest to a verified source copy, preserving cached build markers."""
+    if mode not in {"local", "upstream", "none"}:
+        raise ValueError(f"Unsupported patch mode: {mode}")
     if mode == "none":
-        return original, None
+        return source, None
 
     manifest = json.loads((patch_dir / "manifest.json").read_text())
     if manifest["base_revision"] != revision:
-        raise RuntimeError("Patch manifest does not match the locked InfiniOps revision")
+        raise RuntimeError(f"Patch manifest does not match the locked {component} revision")
     patches = manifest["patches"]
     if not patches:
         raise RuntimeError("Patch manifest is empty")
     files = [_patch_file(patch, mode, patch_dir, build / "patch-cache") for patch in patches]
 
     sources = build / "sources"
-    copied = sources / "InfiniOps"
-    marker_name = ".vllm-infinicore-patches.json"
+    copied = sources / component
     if copied.exists():
         marker = copied / marker_name
         if not marker.is_file() or json.loads(marker.read_text()) != manifest:
@@ -72,48 +81,16 @@ def prepare_ops_source(
         return copied, manifest
 
     sources.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".infiniops-", dir=sources) as temporary:
-        staging = Path(temporary) / "InfiniOps"
-        shutil.copytree(original, staging, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+    with tempfile.TemporaryDirectory(prefix=f".{component.lower()}-", dir=sources) as temporary:
+        staging = Path(temporary) / component
+        if directories:
+            for name in directories:
+                shutil.copytree(source / name, staging / name)
+        else:
+            shutil.copytree(source, staging, ignore=shutil.ignore_patterns(".git", "__pycache__"))
         for path in files:
             subprocess.run(
                 ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(path)],
-                cwd=staging,
-                check=True,
-            )
-        _verify_patched_files(staging, manifest["files"])
-        (staging / marker_name).write_text(json.dumps(manifest, indent=2) + "\n")
-        staging.replace(copied)
-    return copied, manifest
-
-
-def prepare_ascend_source(
-    source: Path, build: Path, patch_dir: Path, revision: str, mode: str
-) -> tuple[Path, dict | None]:
-    """Apply pinned Ascend fixes without modifying the verified base checkout."""
-    if mode == "none":
-        return source, None
-    manifest = json.loads((patch_dir / "manifest.json").read_text())
-    if manifest["base_revision"] != revision or not manifest["patches"]:
-        raise RuntimeError("Ascend patch manifest does not match the locked revision")
-    patches = [_patch_file(p, "local", patch_dir, build) for p in manifest["patches"]]
-    sources = build / "sources"
-    copied = sources / "InfiniCore"
-    marker_name = ".vllm-infinicore-ascend-patches.json"
-    if copied.exists():
-        marker = copied / marker_name
-        if not marker.is_file() or json.loads(marker.read_text()) != manifest:
-            raise RuntimeError("Use a fresh build directory for a different Ascend patch set")
-        _verify_patched_files(copied, manifest["files"])
-        return copied, manifest
-    sources.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".ascend-", dir=sources) as temporary:
-        staging = Path(temporary) / "InfiniCore"
-        for name in ("include", "src"):
-            shutil.copytree(source / name, staging / name)
-        for patch in patches:
-            subprocess.run(
-                ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(patch)],
                 cwd=staging,
                 check=True,
             )

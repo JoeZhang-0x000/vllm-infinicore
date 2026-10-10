@@ -14,7 +14,7 @@ except ImportError:
 
 from vllm.model_executor.layers.layernorm import RMSNorm as VllmRMSNorm
 
-from ..custom_ops import FUSED_ADD_RMS_NORM_OP, RMS_NORM_OP, load_custom_ops
+from ...operators.custom_ops import FUSED_ADD_RMS_NORM_OP, RMS_NORM_OP, load_custom_ops
 
 VLLM_RMS_NORM_CLASS = "RMSNorm"
 

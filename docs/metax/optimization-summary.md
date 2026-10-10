@@ -53,7 +53,7 @@ TP=2 中途新增的融合 RMSNorm kernel 在大 prefill 上出现性能退化�
 
 融合 RMSNorm 微基准包含用于重置输入的两次 clone，优化前后口径相同；该耗时包含这些复制，不能作为纯 kernel 延迟。Q/K 的线程块调优主要改善大批次和 prefill，小批次耗时变化很小。各微基准收益不能直接相加成模型 TPS 收益。
 
-实现分别提交到 InfiniOps 的 [Embedding PR #997](https://github.com/InfiniTensor/InfiniOps/pull/997)、[融合 RMSNorm PR #998](https://github.com/InfiniTensor/InfiniOps/pull/998) 和 [Q/K RMSNorm PR #999](https://github.com/InfiniTensor/InfiniOps/pull/999)。[构建脚本](../scripts/build_infinicore.py) 按固定提交及 SHA256 拉取标准补丁，在独立源码副本中应用；[本地补丁清单](../scripts/patches/manifest.json) 暂时保留离线副本。MetaX 专用路径之外仍使用通用实现。
+实现分别提交到 InfiniOps 的 [Embedding PR #997](https://github.com/InfiniTensor/InfiniOps/pull/997)、[融合 RMSNorm PR #998](https://github.com/InfiniTensor/InfiniOps/pull/998) 和 [Q/K RMSNorm PR #999](https://github.com/InfiniTensor/InfiniOps/pull/999)。[构建脚本](../../scripts/build_infinicore.py) 按固定提交及 SHA256 拉取标准补丁，在独立源码副本中应用；[本地补丁清单](../../scripts/patches/metax/manifest.json) 暂时保留离线副本。MetaX 专用路径之外仍使用通用实现。
 
 ## 插件桥接优化
 
@@ -67,7 +67,7 @@ TP=2 中途新增的融合 RMSNorm kernel 在大 prefill 上出现性能退化�
 | 接入 TP Embedding | 将 vLLM 已转换的本地词表分片索引传给 InfiniOps；mask 和 all-reduce 继续由 vLLM 负责 |
 | 编译与运行时适配 | 使用 TensorView 包装 PyTorch 张量，并在当前 PyTorch stream 调用 InfiniOps；缓存 API 与路由检测，TP Embedding 的 API 判断移到安装阶段，避免 forward 中的文件系统查询打断 Dynamo 编译；显式选择 InfiniOps 的实现编号 0，避免图捕获时触发在线调优同步 |
 
-实现位于 [C++ 桥接](../vllm_infinicore/operators/csrc/infiniops_bridge.cpp)、[MetaX 算子路由](../vllm_infinicore/operators/metax/routes.py)、[TP Embedding 路由](../vllm_infinicore/operators/routes/embedding.py) 和 [桥接配置缓存](../vllm_infinicore/operators/cpp_bridge.py)。前三项对应单卡前后对照，16.41%～43.98% 是这些桥接改动的整体收益。TP 路由及运行时适配未分别量化 TPS 收益。
+实现位于 [C++ 桥接](../../vllm_infinicore/operators/common/csrc/infiniops_bridge.cpp)、[MetaX 算子路由](../../vllm_infinicore/operators/platforms/metax/routes.py)、[TP Embedding 路由](../../vllm_infinicore/routing/routes/embedding.py) 和 [桥接配置缓存](../../vllm_infinicore/operators/common/cpp_bridge.py)。前三项对应单卡前后对照，16.41%～43.98% 是这些桥接改动的整体收益。TP 路由及运行时适配未分别量化 TPS 收益。
 
 ## 多模型 TP 验证
 
@@ -86,6 +86,6 @@ TP=4/8 共 80 组成对配置、480 个计时样本，所有 TP rank 的 Graph �
 
 测试采用 BF16，输入→输出长度为 128→128 和 2048→512，batch 为 1、4、16、32、64。每个配置预热后计时三次，TPS 为总输出 token 数除以完整 generate 耗时，包含 prefill。单卡及 TP=2 的显存利用率参数为 0.85，TP=4/8 为 0.70；开启和关闭插件的成对参数一致。
 
-运行环境为 MACA 3.8.0.23、PyTorch 2.10.0+metax3.8.0.7、vLLM 0.22.0。InfiniCore 基于锁定提交 `8254d3b`，InfiniOps 基于 `8c2f70a` 加本地 MetaX 优化补丁，详见 [版本锁文件](../vllm_infinicore/infinicore.lock.json)。
+运行环境为 MACA 3.8.0.23、PyTorch 2.10.0+metax3.8.0.7、vLLM 0.22.0。InfiniCore 基于锁定提交 `8254d3b`，InfiniOps 基于 `8c2f70a` 加本地 MetaX 优化补丁，详见 [版本锁文件](../../vllm_infinicore/infinicore.lock.json)。
 
 原始评测、微基准和 TP=4/8 对照记录保存在 MetaX-2 的 `/root/infinicore-mixed-20261008`、`/root/infinicore-optimize-20261008/final1`、`/root/infinicore-tp-optimize-20261009` 和 `/root/infinicore-tp48-20261009`。

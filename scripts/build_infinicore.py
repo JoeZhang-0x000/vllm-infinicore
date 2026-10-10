@@ -13,7 +13,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from infinicore_build.patches import prepare_ops_source
+from infinicore_build.metax import prepare_ops_source
 from infinicore_build.sources import sha256, verify_source
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,7 +71,7 @@ def main() -> None:
     ops_source, patches = prepare_ops_source(
         source,
         build,
-        ROOT / "scripts/patches",
+        ROOT / "scripts/patches/metax",
         lock["components"]["InfiniOps"]["revision"],
         patch_mode,
     )

@@ -3,8 +3,8 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ...routing.patching import PatchInstallResult, PatchUninstallResult
-from ..routes import install_shared_route, uninstall_shared_route
+from ....routing.patching import PatchInstallResult, PatchUninstallResult
+from ....routing.routes import install_shared_route, uninstall_shared_route
 from . import SUPPORTED_ROUTES
 
 _METHODS = ("forward_oot", "forward_native")
@@ -48,7 +48,7 @@ def _install_silu_and_mul():
     import torch
     from vllm_metax.customized.ops.activation import MacaSiluAndMul
 
-    from ..custom_ops import SILU_AND_MUL_OP, load_custom_ops
+    from ...custom_ops import SILU_AND_MUL_OP, load_custom_ops
 
     if "SiluAndMul" in _PATCHES:
         return PatchInstallResult(True, "MetaX SiLU adapter already installed")
@@ -68,8 +68,8 @@ def _install_rms_norm():
     import torch
     from vllm_metax.customized.ops.layernorm import MacaRMSNorm
 
-    from ..cpp_bridge import uses_modular_api
-    from ..custom_ops import (
+    from ...common.cpp_bridge import uses_modular_api
+    from ...custom_ops import (
         FUSED_ADD_RMS_NORM_INPLACE_OP,
         FUSED_ADD_RMS_NORM_OP,
         RMS_NORM_OP,
@@ -116,8 +116,8 @@ def _install_rope():
     import torch
     from vllm_metax.customized.ops.rotary_embedding import MacaRotaryEmbedding
 
-    from ..cpp_bridge import uses_modular_api
-    from ..custom_ops import ROTARY_EMBEDDING_INPLACE_OP, ROTARY_EMBEDDING_OP, load_custom_ops
+    from ...common.cpp_bridge import uses_modular_api
+    from ...custom_ops import ROTARY_EMBEDDING_INPLACE_OP, ROTARY_EMBEDDING_OP, load_custom_ops
 
     if "RoPE" in _PATCHES:
         return PatchInstallResult(True, "MetaX RoPE adapter already installed")
@@ -147,8 +147,8 @@ def _install_rope():
 
 
 def install(name: str):
-    from .. import attention
-    from ..cpp_bridge import uses_modular_api
+    from ....routing.routes import attention
+    from ...common.cpp_bridge import uses_modular_api
 
     if name in attention.ROUTES:
         return attention.install(name, "metax")
@@ -164,7 +164,7 @@ def install(name: str):
 
 
 def uninstall(name: str):
-    from .. import attention
+    from ....routing.routes import attention
 
     if name in attention.ROUTES:
         return attention.uninstall(name, "metax")

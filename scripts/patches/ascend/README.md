@@ -4,4 +4,4 @@
 
 对应优化已适配当前算子接口，提交至 [InfiniOps #1000](https://github.com/InfiniTensor/InfiniOps/pull/1000)：packed Q/K RMSNorm、NeoX RoPE、strided KV 写入和 padded 输出的 SwiGLU。现代 InfiniOps 的连续输出 SwiGLU 继续使用现有 ACLNN；legacy 内核保留本次已验证的 token 并行改动。
 
-本目录补丁与锁定版本保持一致，复现本仓库性能结果时继续使用这些本地补丁。整模型优化与测量口径见 [NPU 优化记录](../../../docs/npu-optimization-summary.md)。
+本目录补丁与锁定版本保持一致，复现本仓库性能结果时继续使用这些本地补丁。整模型优化与测量口径见 [NPU 优化记录](../../../docs/ascend/optimization-summary.md)。

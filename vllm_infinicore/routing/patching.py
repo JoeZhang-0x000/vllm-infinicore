@@ -531,7 +531,7 @@ def get_default_registry() -> PatchRegistry:
 
     backend_name = selected_backend()
     adapter = (
-        import_module(f"..operators.{backend_name}", __package__)
+        import_module(f"..operators.platforms.{backend_name}", __package__)
         if backend_name is not None
         else None
     )
@@ -559,7 +559,7 @@ def get_default_registry() -> PatchRegistry:
 
     def installer(name: str) -> PatchInstaller:
         def install() -> PatchInstallResult:
-            routes = import_module(f"..operators.{backend_name}.routes", __package__)
+            routes = import_module(f"..operators.platforms.{backend_name}.routes", __package__)
             status = routes.install(name)
             return PatchInstallResult(status.installed, status.reason)
 
@@ -567,7 +567,7 @@ def get_default_registry() -> PatchRegistry:
 
     def uninstaller(name: str) -> PatchUninstaller:
         def uninstall() -> PatchUninstallResult:
-            routes = import_module(f"..operators.{backend_name}.routes", __package__)
+            routes = import_module(f"..operators.platforms.{backend_name}.routes", __package__)
             status = routes.uninstall(name)
             return PatchUninstallResult(status.uninstalled, status.reason)
 

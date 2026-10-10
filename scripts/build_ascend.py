@@ -8,29 +8,17 @@ No InfiniRT, device management, Python InfiniCore or optional submodules are bui
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import subprocess
 import tempfile
 from pathlib import Path
 
-from infinicore_build.patches import prepare_ascend_source
+from infinicore_build.ascend import prepare_ascend_source
+from infinicore_build.sources import sha256, verify_git_source
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / "vllm_infinicore/infinicore.lock.json"
-
-
-def run(*args: str) -> str:
-    return subprocess.check_output(args, text=True).strip()
-
-
-def verify_source(source: Path, revision: str) -> None:
-    actual = run("git", "-C", str(source), "rev-parse", "HEAD")
-    if actual != revision:
-        raise RuntimeError(f"InfiniCore revision mismatch: {actual} != {revision}")
-    if run("git", "-C", str(source), "status", "--porcelain", "--untracked-files=no"):
-        raise RuntimeError("InfiniCore checkout has tracked modifications")
 
 
 def main() -> None:
@@ -63,7 +51,7 @@ def main() -> None:
             check=True,
         )
         subprocess.run(["git", "-C", str(source), "checkout", "--detach", "FETCH_HEAD"], check=True)
-    verify_source(source, lock["revision"])
+    verify_git_source(source, lock["revision"])
     operator_source, patches = prepare_ascend_source(
         source, build, ROOT / "scripts/patches/ascend", lock["revision"], args.ascend_patches
     )
@@ -74,7 +62,7 @@ def main() -> None:
         [
             "cmake",
             "-S",
-            str(ROOT / "vllm_infinicore/operators/ascend/csrc"),
+            str(ROOT / "vllm_infinicore/operators/platforms/ascend/csrc"),
             "-B",
             str(cmake_dir),
             f"-DINFINICORE_SOURCE={operator_source}",
@@ -101,7 +89,7 @@ def main() -> None:
         source=str(source),
         operator_source=str(operator_source),
         ascend_patches=patches,
-        sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
+        sha256=sha256(library),
     )
     (build / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"VLLM_INFINICORE_ASCEND_LIBRARY={library}")

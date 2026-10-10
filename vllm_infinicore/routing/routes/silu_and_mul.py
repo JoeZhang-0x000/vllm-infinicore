@@ -14,7 +14,7 @@ except ImportError:
 
 from vllm.model_executor.layers.activation import SiluAndMul as VllmSiluAndMul
 
-from ..custom_ops import SILU_AND_MUL_OP, load_custom_ops
+from ...operators.custom_ops import SILU_AND_MUL_OP, load_custom_ops
 
 VLLM_SILU_AND_MUL_CLASS = "SiluAndMul"
 
@@ -55,7 +55,7 @@ class InfiniCoreSiluAndMul(VllmSiluAndMul):
         try:
             return torch.ops.vllm_infinicore.silu_and_mul(x)
         except Exception:
-            from ..backend import strict_backend_enabled
+            from ...operators.common.backend import strict_backend_enabled
 
             if strict_backend_enabled():
                 raise

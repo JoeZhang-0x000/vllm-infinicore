@@ -23,7 +23,7 @@ vllm_infinicore = "vllm_infinicore:register"
 packages = ["vllm_infinicore"]
 
 [tool.hatch.build.targets.sdist]
-include = ["vllm_infinicore", "scripts", "docs", "README.md", "pyproject.toml", ".clang-format"]
+include = ["vllm_infinicore", "scripts", "docs", "tests", "README.md", "pyproject.toml", ".clang-format"]
 
 [tool.ruff]
 target-version = "py310"

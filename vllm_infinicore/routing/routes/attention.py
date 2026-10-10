@@ -13,9 +13,9 @@ from functools import wraps
 
 import torch
 
-from ..routing.patching import PatchInstallResult, PatchUninstallResult
-from ..routing.policy import store_token_limit
-from . import attention_ops as ops
+from ...operators import attention_ops as ops
+from ..patching import PatchInstallResult, PatchUninstallResult
+from ..policy import store_token_limit
 
 ROUTES = frozenset({"StoreKVCache", "PagedAttentionPrefill", "PagedAttentionDecode"})
 _TARGETS = {

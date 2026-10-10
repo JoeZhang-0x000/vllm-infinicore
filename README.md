@@ -31,7 +31,7 @@ python -m pip install -e .
 | 小批次 Fused Add+RMSNorm | [#998](https://github.com/InfiniTensor/InfiniOps/pull/998) | `465ff90169f59cb0345a4af427f6ff83ab1eb98a` |
 | 小维度 Q/K RMSNorm 线程块 | [#999](https://github.com/InfiniTensor/InfiniOps/pull/999) | `10ad53399aaf0dcba1d2f3d1d9164e9c61da7833` |
 
-MetaX 默认按 [补丁清单](scripts/patches/manifest.json) 从 GitHub 固定提交下载标准 Git 补丁，校验 SHA256 后缓存到构建目录。上游 PR 合入前即可使用。`scripts/patches/*.patch` 暂时保留为相同内容的离线副本，使用 `--metax-patches local`；`--metax-patches none` 构建未优化版本。CUDA 默认不应用这些补丁。切换补丁集时使用新的构建目录。
+MetaX 默认按 [补丁清单](scripts/patches/metax/manifest.json) 从 GitHub 固定提交下载标准 Git 补丁，校验 SHA256 后缓存到构建目录。上游 PR 合入前即可使用。`scripts/patches/metax/*.patch` 暂时保留为相同内容的离线副本，使用 `--metax-patches local`；`--metax-patches none` 构建未优化版本。CUDA 默认不应用这些补丁。切换补丁集时使用新的构建目录。
 
 上游合入并更新本项目的组件锁后，可移除对应补丁及离线副本。构建流程不再依赖 Python 字符串插入算子源码。
 
@@ -81,7 +81,7 @@ export VLLM_INFINICORE_ASCEND_LIBRARY=/path/to/ascend-build/libvllm_infinicore_a
 
 Ascend 使用锁文件的 legacy_ascend 提交和 ABI 1。默认在独立源码副本中应用 [算子补丁](scripts/patches/ascend/README.md)：KV launch 越界与向量搬运、RoPE token/head 并行和表 stride、SwiGLU token 并行，以及 128 维 BF16 Q/K RMSNorm。补丁、源码文件及动态库 SHA256 记录在构建目录的 manifest.json；`--ascend-patches none` 构建未修复版本。切换补丁集时使用新的构建目录。
 
-插件通过动态库能力位选择直接读取 cos/sin cache 视图，并让 Q/K RMSNorm 保留 packed QKV stride；旧动态库使用连续输入和连续表兼容路径。Attention、集合通信与请求调度由 vllm-ascend 提供，融合 Add+RMSNorm 及不支持尺寸的 SwiGLU 保留 native。算子与插件的消融结果见 [NPU 优化记录](docs/npu-optimization-summary.md)。
+插件通过动态库能力位选择直接读取 cos/sin cache 视图，并让 Q/K RMSNorm 保留 packed QKV stride；旧动态库使用连续输入和连续表兼容路径。Attention、集合通信与请求调度由 vllm-ascend 提供，融合 Add+RMSNorm 及不支持尺寸的 SwiGLU 保留 native。算子与插件的消融结果见 [NPU 优化记录](docs/ascend/optimization-summary.md)。
 
 ## 其他入口与兼容范围
 
@@ -91,10 +91,12 @@ Ascend 使用锁文件的 legacy_ascend 提交和 ABI 1。默认在独立源码�
 
 ## 项目结构
 
-- `vllm_infinicore/routing/`：路由策略、安装和卸载管理。
-- `vllm_infinicore/operators/`：统一调用入口、custom ops、C++ 桥接及各平台适配。`legacy.py` 集中旧版 Python API 兼容逻辑，`torch_ops.py` 集中原生回退实现。
+- `vllm_infinicore/routing/`：路由策略、安装和卸载管理；`routes/` 按算子组织共享的 vLLM 适配。
+- `vllm_infinicore/operators/`：统一调用入口、custom ops 和 Attention/KV 调用。
+- `vllm_infinicore/operators/common/`：共享执行逻辑、C++ 桥接及 `csrc/`；`legacy.py` 集中旧版 Python API 兼容逻辑，`torch_ops.py` 集中原生回退实现。
+- `vllm_infinicore/operators/platforms/`：`ascend/`、`cuda/`、`kunlun/`、`metax/` 的能力声明、桥接配置与平台专用路由。
 - `vllm_infinicore/benchmarks/`：可安装的 GSM8K 评测入口与评分逻辑。
-- `scripts/`：组件构建和启动入口；`infinicore_build/` 负责源码校验、补丁获取和应用。
-- `docs/`：性能优化记录；[MetaX 优化小结](docs/metax-optimization-summary.md) 区分算子优化与插件桥接收益。
+- `scripts/`：保留现有组件构建和启动入口；`infinicore_build/` 分离共享源码校验、补丁应用与平台策略，`patches/<平台>/` 各自保存补丁和清单。用法见 [脚本说明](scripts/README.md)。
+- `docs/ascend/`、`docs/metax/`：各平台性能记录；目录边界与维护规则见 [文档索引](docs/README.md)。
 
-实验临时脚本和历史测试不属于发布包；构建缓存、库文件与评测结果均由 `.gitignore` 排除。Python 源码格式与检查使用 `ruff format vllm_infinicore scripts` 和 `ruff check vllm_infinicore scripts`，C++ 桥接使用项目的 `.clang-format`。
+实验临时脚本和历史测试不属于发布包；构建缓存、库文件与评测结果均由 `.gitignore` 排除。Python 源码格式与检查使用 `ruff format vllm_infinicore scripts tests` 和 `ruff check vllm_infinicore scripts tests`，C++ 桥接使用项目的 `.clang-format`。不依赖厂商 SDK 的补丁准备与延迟注册回归测试使用 `python -m unittest discover -s tests -v`。

@@ -27,7 +27,7 @@ def _count(name: str) -> None:
     the recorded kernels without re-entering Python, so replay-only steps do not
     add counts; capture and every eager or prefill step still do.
     """
-    from .. import backend as counters
+    from ...common import backend as counters
 
     counters._CALL_COUNTS[name] = counters._CALL_COUNTS.get(name, 0) + 1
 

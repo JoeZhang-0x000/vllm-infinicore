@@ -10,7 +10,7 @@ Qwen3-8B BF16 的 TP1/2/4 共 **30 个配置全部达到 native 的 90%以上**�
 | 2 | 10 | 92.62%–98.78% | 10/10 |
 | 4 | 10 | 94.55%–103.84% | 10/10 |
 
-范围仅覆盖本次 Qwen3-8B、两组长度和五档 batch；按用户调整后的范围测试到 TP4。优化前测量与完整热点数据见 [性能差距报告](npu-performance-gap.md)。
+范围仅覆盖本次 Qwen3-8B、两组长度和五档 batch；按用户调整后的范围测试到 TP4。优化前测量与完整热点数据见 [性能差距报告](performance-gap.md)。
 
 ## 算子修复
 
@@ -19,16 +19,16 @@ Qwen3-8B BF16 的 TP1/2/4 共 **30 个配置全部达到 native 的 90%以上**�
 - **SwiGLU**：在原来的八个 hidden tiles 上增加 token 行分组，改善 TP2/4 的并行度。原有尺寸检查保持有效；TP1 intermediate=12288 仍使用 native，TP2/4 的 6144/3072 实际调用 InfiniCore。
 - **Q/K RMSNorm**：128 维 BF16 的同 token heads 合并搬运、归约和广播，直接读取 packed QKV stride，workspace 为 0；其他 dtype、权重组合与布局继续使用原 ACLNN 实现。平方根再除法与 native QK 融合路径对齐，避免倒平方根估算后的舍入差异。
 
-六个标准补丁及应用后十个文件的 SHA256 位于 [Ascend 补丁清单](../scripts/patches/ascend/manifest.json)。[构建脚本](../scripts/build_ascend.py) 校验锁定提交，复制 src/include 后应用并校验补丁，不修改共享 InfiniCore checkout；默认使用本地补丁，`--ascend-patches none` 可构建原版本。切换补丁集必须使用新的构建目录。
+六个标准补丁及应用后十个文件的 SHA256 位于 [Ascend 补丁清单](../../scripts/patches/ascend/manifest.json)。[构建脚本](../../scripts/build_ascend.py) 校验锁定提交，复制 src/include 后应用并校验补丁，不修改共享 InfiniCore checkout；默认使用本地补丁，`--ascend-patches none` 可构建原版本。切换补丁集必须使用新的构建目录。
 
 对应优化已适配当前 InfiniOps 接口并提交 [InfiniOps #1000](https://github.com/InfiniTensor/InfiniOps/pull/1000)，通过 230 项算子回归和 87 项 Ascend smoke 测试。上游 SwiGLU 根据独立对照，仅在 padded 输出启用新核；本仓库保留已验证的 legacy 临时补丁独立提交，补丁及清单指纹保持不变。本报告整模型数据对应本仓库 legacy 后端与插件的联合优化，上游新接口的验证及算子延迟见该 PR。
 
 ## 插件调度与布局修复
 
-- [Ascend backend](../vllm_infinicore/operators/ascend/backend.py) 直接传入 cos/sin cache 视图，省去每层每步复制整个表。
+- [Ascend backend](../../vllm_infinicore/operators/platforms/ascend/backend.py) 直接传入 cos/sin cache 视图，省去每层每步复制整个表。
 - Q/K RMSNorm 与 RoPE 保留 packed QKV 的 token/head stride，减少归一化前复制；输出独立分配，保持非原地 custom-op 契约。
 - 动态库通过可选能力查询选择新路径。旧 ABI-1 库没有查询符号时，继续使用连续 RMSNorm 输入和连续 sin/cos 表，桥接 ABI 与锁定提交保持不变。
-- [Graph fake 实现](../vllm_infinicore/operators/ascend/graph_ops.py) 的 RMSNorm/RoPE 输出布局与真实连续输出一致，避免转置输入时编译器采用错误 stride。
+- [Graph fake 实现](../../vllm_infinicore/operators/platforms/ascend/graph_ops.py) 的 RMSNorm/RoPE 输出布局与真实连续输出一致，避免转置输入时编译器采用错误 stride。
 
 本轮未修改 vLLM 请求调度策略。profile 的逐步请求数与 token 数匹配，优化集中在算子并行、调用布局和额外设备工作。
 

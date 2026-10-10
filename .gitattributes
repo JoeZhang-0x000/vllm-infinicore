@@ -1,2 +1,2 @@
 # Keep upstream patch bytes intact for SHA256 verification.
-scripts/patches/*.patch -text -whitespace
+scripts/patches/**/*.patch -text -whitespace

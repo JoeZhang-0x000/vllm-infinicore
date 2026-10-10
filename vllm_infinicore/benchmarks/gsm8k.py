@@ -236,7 +236,9 @@ def worker_state(worker):
     state["graph_captures"] = compilation_counter.num_cudagraph_captured
     if os.getenv("VLLM_INFINICORE_ENABLE_PATCHES") == "1":
         from .. import plugin
-        from ..operators import attention, attention_ops, backend, cpp_bridge
+        from ..operators import attention_ops
+        from ..operators.common import backend, cpp_bridge
+        from ..routing.routes import attention
 
         state.update(
             registration=dataclasses.asdict(plugin._REGISTRATION_RESULT),
@@ -396,7 +398,7 @@ def run_mode(args, dataset_path: Path) -> int:
         device_api = torch.npu if args.platform == "ascend" else torch.cuda
         result["device_name"] = device_api.get_device_name(0)
         if args.platform == "ascend":
-            from ..operators.ascend import backend as ascend_backend
+            from ..operators.platforms.ascend import backend as ascend_backend
 
             if os.environ.get(ascend_backend.LIBRARY_ENV):
                 library = Path(os.environ[ascend_backend.LIBRARY_ENV])

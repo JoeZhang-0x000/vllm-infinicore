@@ -10,7 +10,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from ..custom_ops import EMBEDDING_OP, load_custom_ops
+from ...operators.custom_ops import EMBEDDING_OP, load_custom_ops
 
 VLLM_EMBEDDING_ROUTE_NAME = "Embedding"
 
@@ -50,7 +50,7 @@ def install_vllm_unquantized_embedding_route() -> VllmEmbeddingInstallStatus:
             reason="InfiniCore unquantized embedding patch already active",
         )
 
-    from ..cpp_bridge import uses_modular_api
+    from ...operators.common.cpp_bridge import uses_modular_api
 
     # Resolve the API once, before Dynamo traces the model. Filesystem queries
     # in forward would break vLLM's full-graph compilation on TP workers.
@@ -97,7 +97,7 @@ def _patched_embedding(
     try:
         return torch.ops.vllm_infinicore.embedding(input_, layer.weight)
     except Exception:
-        from ..backend import strict_backend_enabled
+        from ...operators.common.backend import strict_backend_enabled
 
         if strict_backend_enabled():
             raise

@@ -281,7 +281,7 @@ def _set_default_device_index(tensor: torch.Tensor) -> None:
 
 
 def _should_use_infinicore(tensor: torch.Tensor) -> bool:
-    from .selection import selected_backend
+    from ..selection import selected_backend
 
     return (
         selected_backend() in {"cuda", "metax", "kunlun"}

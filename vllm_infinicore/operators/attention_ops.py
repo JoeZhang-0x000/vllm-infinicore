@@ -23,11 +23,11 @@ def _record(name):
 
 def initialize():
     if selected_backend() == "ascend":
-        from .ascend.backend import attention_library
+        from .platforms.ascend.backend import attention_library
 
         attention_library()
     else:
-        from .cpp_bridge import module
+        from .common.cpp_bridge import module
 
         bridge = module()
         for name in (
@@ -58,11 +58,11 @@ def store(k, v, key, value, slots):
     if not n:
         return
     if selected_backend() == "ascend":
-        from .ascend.backend import launch
+        from .platforms.ascend.backend import launch
 
         launch("PagedCaching", (k, v, key, value, slots))
     else:
-        from .cpp_bridge import module
+        from .common.cpp_bridge import module
 
         module().store_kv_cache_current_stream(k, v, key, value, slots)
     _record("StoreKVCache")
@@ -75,7 +75,7 @@ def compute(query, k, v, blocks, lengths, starts, scale, output, *, decode):
     lengths = lengths.to(device=query.device, dtype=torch.int32, non_blocking=True)
     starts = starts.to(dtype=torch.int32) if starts is not None else None
     if selected_backend() == "ascend":
-        from .ascend.backend import launch
+        from .platforms.ascend.backend import launch
 
         if decode:
             launch("PagedAttention", (output, query, k, v, blocks, lengths, None), (scale,))
@@ -86,7 +86,7 @@ def compute(query, k, v, blocks, lengths, starts, scale, output, *, decode):
                 (scale,),
             )
     else:
-        from .cpp_bridge import module
+        from .common.cpp_bridge import module
 
         if decode:
             n = query.shape[0]

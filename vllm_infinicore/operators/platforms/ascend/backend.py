@@ -22,7 +22,7 @@ from pathlib import Path
 import torch
 
 LIBRARY_ENV = "VLLM_INFINICORE_ASCEND_LIBRARY"
-_LOCK = Path(__file__).resolve().parents[2] / "infinicore.lock.json"
+_LOCK = Path(__file__).resolve().parents[3] / "infinicore.lock.json"
 _DTYPES = {
     torch.float16: 12,
     torch.float32: 13,
@@ -142,7 +142,7 @@ def fallback(name, reason, native):
     # These calls are not runtime InfiniCore launches and must not be counted.
     if torch.compiler.is_compiling():
         return native()
-    from .. import backend as counters
+    from ...common import backend as counters
 
     counters._FALLBACK_COUNTS[name] = counters._FALLBACK_COUNTS.get(name, 0) + 1
     counters._FALLBACK_REASONS[name] = reason
@@ -175,7 +175,7 @@ def execute(name, tensor, operation, native):
     except Unsupported as exc:
         return fallback(name, str(exc), native)
         # Never retry a failed device launch: a runtime failure is not a capability miss.
-    from .. import backend as counters
+    from ...common import backend as counters
 
     counters._CALL_COUNTS[name] = counters._CALL_COUNTS.get(name, 0) + 1
     return result

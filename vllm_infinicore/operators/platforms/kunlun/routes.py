@@ -1,11 +1,11 @@
 """Kunlun vLLM operator routes."""
 
-from ..routes import install_shared_route, uninstall_shared_route
+from ....routing.routes import install_shared_route, uninstall_shared_route
 from . import SUPPORTED_ROUTES
 
 
 def install(name: str):
-    from .. import attention
+    from ....routing.routes import attention
 
     if name in attention.ROUTES:
         return attention.install(name, "kunlun")
@@ -15,7 +15,7 @@ def install(name: str):
 
 
 def uninstall(name: str):
-    from .. import attention
+    from ....routing.routes import attention
 
     if name in attention.ROUTES:
         return attention.uninstall(name, "kunlun")
