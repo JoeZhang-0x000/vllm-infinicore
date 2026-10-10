@@ -1,0 +1,43 @@
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -1,5 +1,4 @@
+ add_rules("mode.debug", "mode.release")
+-add_requires("boost", {configs = {stacktrace = true}})
+ add_requires("pybind11")
+ 
+ -- Define color codes
+@@ -722,6 +721,7 @@
+ 
+ target("infinicore_cpp_api")
+     set_kind("shared")
++    add_shflags("-Wl,--version-script=" .. path.join(os.projectdir(), "infinicore-symbols.map"), {force = true})
+     add_deps("infiniop", "infinirt", "infiniccl")
+     set_languages("cxx17")
+     set_symbols("visibility")
+--- a/src/infinicore/context/context_impl.cc
++++ b/src/infinicore/context/context_impl.cc
+@@ -66,7 +66,9 @@
+ 
+     // Reserve runtime slot for all devices.
+     runtime_table_[0].resize(device_counter[0]);
++#ifdef ENABLE_CPU_API
+     runtime_table_[0][0] = std::unique_ptr<Runtime>(new Runtime(Device(Device::Type::CPU, 0)));
++#endif
+ 
+     // Context will try to use the first non-cpu available device as the default runtime.
+     for (int i = int(Device::Type::COUNT) - 1; i > 0; i--) {
+--- a/xmake/kunlun.lua
++++ b/xmake/kunlun.lua
+@@ -11,6 +11,8 @@
+ add_includedirs(path.join(XDNN_DIR, "include"), {public = true})
+ add_includedirs(path.join(XTDK_DIR, "include"), {public = true})
+ add_includedirs(path.join(XBLAS_DIR, "include"), {public = true})
++-- CUDA helper types must follow the vendor XBLAS compatibility headers.
++add_includedirs(path.join(os.getenv("CUDA_HOME") or "/usr/local/cuda", "include"))
+ 
+ -- Add link dirs
+ add_linkdirs(path.join(XRE_DIR, "so"))
+--- /dev/null
++++ b/infinicore-symbols.map
+@@ -0,0 +1 @@
++{ global: *infinicore*; local: *; };

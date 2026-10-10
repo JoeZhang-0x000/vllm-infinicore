@@ -56,6 +56,7 @@ def prepare_patched_source(
     component: str,
     marker_name: str,
     directories: tuple[str, ...] = (),
+    ignored_names: tuple[str, ...] = (),
 ) -> tuple[Path, dict | None]:
     """Apply a manifest to a verified source copy, preserving cached build markers."""
     if mode not in {"local", "upstream", "none"}:
@@ -87,7 +88,11 @@ def prepare_patched_source(
             for name in directories:
                 shutil.copytree(source / name, staging / name)
         else:
-            shutil.copytree(source, staging, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            shutil.copytree(
+                source,
+                staging,
+                ignore=shutil.ignore_patterns(".git", "__pycache__", *ignored_names),
+            )
         for path in files:
             subprocess.run(
                 ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(path)],

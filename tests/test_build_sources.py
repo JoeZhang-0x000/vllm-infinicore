@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from scripts.infinicore_build.ascend import prepare_ascend_source
+from scripts.infinicore_build.kunlun import prepare_kunlun_source
 from scripts.infinicore_build.metax import prepare_ops_source
 
 REVISION = "0" * 40
@@ -45,11 +46,15 @@ class PatchPreparationTests(unittest.TestCase):
         }
         (patch_dir / "manifest.json").write_text(json.dumps(manifest))
         build = self.root / platform / "build"
-        prepare = prepare_ops_source if platform == "metax" else prepare_ascend_source
+        prepare = {
+            "metax": prepare_ops_source,
+            "ascend": prepare_ascend_source,
+            "kunlun": prepare_kunlun_source,
+        }[platform]
         return prepare, source, original, build, patch_dir, manifest
 
     def test_local_patches_preserve_checkout_and_reuse_verified_copy(self):
-        for platform in ("metax", "ascend"):
+        for platform in ("metax", "ascend", "kunlun"):
             with self.subTest(platform=platform):
                 prepare, source, original, build, patch_dir, manifest = self.fixture(platform)
                 copied, applied = prepare(source, build, patch_dir, REVISION, "local")
@@ -57,13 +62,13 @@ class PatchPreparationTests(unittest.TestCase):
                 self.assertEqual((original / "src/value.txt").read_text(), "before\n")
                 self.assertEqual((copied / "src/value.txt").read_text(), "after\n")
                 self.assertTrue((copied / "include").is_dir())
-                self.assertEqual((copied / "tests").exists(), platform == "metax")
+                self.assertEqual((copied / "tests").exists(), platform in {"metax", "kunlun"})
                 self.assertEqual(
                     prepare(source, build, patch_dir, REVISION, "local"), (copied, manifest)
                 )
 
     def test_none_uses_original_without_loading_manifest(self):
-        for platform in ("metax", "ascend"):
+        for platform in ("metax", "ascend", "kunlun"):
             with self.subTest(platform=platform):
                 prepare, source, original, build, _, _ = self.fixture(platform)
                 self.assertEqual(
@@ -72,8 +77,18 @@ class PatchPreparationTests(unittest.TestCase):
                 )
                 self.assertFalse(build.exists())
 
+    def test_kunlun_copy_excludes_previous_build_cache(self):
+        prepare, source, original, build, patch_dir, _ = self.fixture("kunlun")
+        for name in (".xmake", "build", "dist"):
+            (original / name).mkdir()
+            (original / name / "old-sdk.txt").write_text("previous SDK\n")
+        copied, _ = prepare(source, build, patch_dir, REVISION, "local")
+        for name in (".xmake", "build", "dist"):
+            self.assertFalse((copied / name).exists())
+            self.assertTrue((original / name / "old-sdk.txt").is_file())
+
     def test_wrong_revision_and_patch_bytes_are_rejected_before_copy(self):
-        for platform in ("metax", "ascend"):
+        for platform in ("metax", "ascend", "kunlun"):
             with self.subTest(platform=platform):
                 prepare, source, original, build, patch_dir, _ = self.fixture(platform)
                 with self.assertRaisesRegex(RuntimeError, "locked .* revision"):
@@ -85,7 +100,7 @@ class PatchPreparationTests(unittest.TestCase):
                 self.assertEqual((original / "src/value.txt").read_text(), "before\n")
 
     def test_cached_sources_reject_mutations_and_changed_patch_set(self):
-        for platform in ("metax", "ascend"):
+        for platform in ("metax", "ascend", "kunlun"):
             with self.subTest(platform=platform):
                 prepare, source, _, build, patch_dir, manifest = self.fixture(platform)
                 copied, _ = prepare(source, build, patch_dir, REVISION, "local")

@@ -25,6 +25,10 @@
 #include <string>
 #include <vector>
 
+#if defined(ENABLE_KUNLUN_API)
+extern "C" uint32_t infinicoreKunlunRoPECapabilities() __attribute__((weak));
+#endif
+
 namespace {
 
 void check_infini_status(infiniStatus_t status, const char *op_name) {
@@ -468,6 +472,14 @@ at::Tensor rope_current_stream(at::Tensor input, at::Tensor positions, at::Tenso
     return out;
 }
 
+bool rope_supports_native_positions() {
+#if defined(ENABLE_KUNLUN_API)
+    return infinicoreKunlunRoPECapabilities && (infinicoreKunlunRoPECapabilities() & 1u);
+#else
+    return false;
+#endif
+}
+
 void store_kv_cache_current_stream(at::Tensor key_cache, at::Tensor value_cache, at::Tensor key,
                                    at::Tensor value, at::Tensor slot_mapping) {
     auto flat_slots = slot_mapping.flatten();
@@ -649,5 +661,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("swiglu_current_stream", &swiglu_current_stream);
     m.def("silu_and_mul_current_stream", &silu_and_mul_current_stream);
     m.def("rope_current_stream", &rope_current_stream);
+    m.def("rope_supports_native_positions", &rope_supports_native_positions);
     m.def("lm_head", &lm_head);
 }
